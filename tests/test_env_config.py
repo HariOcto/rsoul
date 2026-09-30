@@ -112,3 +112,68 @@ def test_cleanup_removes_only_own_transfers():
 
     assert Client.transfers.removed == [("peer", "x1", True), ("peer", "x2", True)]
     assert Client.transfers.cleared_all is False
+
+
+# ---------------------------------------------------------------------------
+# Transfers cleared by another tool (e.g. Soularr's "remove all completed")
+# ---------------------------------------------------------------------------
+
+
+class ListClient:
+    def __init__(self, records):
+        class T:
+            def get_downloads(self_inner, username):
+                return {"directories": [{"directory": "d", "files": records}]}
+
+            def get_all_downloads(self_inner):
+                return [{"username": "other", "directories": [{"directory": "@@o\\Mistborn", "files": records}]}]
+
+        self.transfers = T()
+
+
+def slskd_task(tmp_path, client, size=10):
+    config = configparser.ConfigParser()
+    config["Slskd"] = {"download_dir": str(tmp_path)}
+    backend = SlskdBackend(Context(config=config, slskd=client, readarr=None))
+    task = DownloadTask("t", "slskd", DownloadStatus.DOWNLOADING, "b", "a", 1, "f", local_dir="B")
+    task.extra = {"files": [{"filename": "@@p\\B\\01.mp3", "id": "gone", "size": size, "username": "peer"}]}
+    return backend, task
+
+
+def test_cleared_transfer_not_on_disk_fails_instead_of_waiting(tmp_path):
+    backend, task = slskd_task(tmp_path, ListClient([]))
+    task = backend.get_status(task)
+    assert task.status == DownloadStatus.FAILED
+    assert task.poll_failed is False  # a definite answer, not an outage
+
+
+def test_cleared_transfer_on_disk_completes(tmp_path):
+    (tmp_path / "B").mkdir()
+    (tmp_path / "B" / "01.mp3").write_bytes(b"x" * 10)
+    backend, task = slskd_task(tmp_path, ListClient([]))
+    assert backend.get_status(task).status == DownloadStatus.COMPLETED
+
+
+def test_empty_404_body_is_unknown_not_a_crash(tmp_path):
+    class T:
+        def get_downloads(self, username):
+            raise RuntimeError("list unavailable")
+
+        def get_download(self, username, id):
+            return {}  # what slskd-api returns for an unknown ID once the body is parsed
+
+    class C:
+        transfers = T()
+
+    backend, task = slskd_task(tmp_path, C())
+    task = backend.get_status(task)
+    assert task.status != DownloadStatus.COMPLETED
+    assert task.poll_failed
+
+
+def test_folder_with_unfinished_foreign_download_is_avoided(tmp_path):
+    # Another tool is downloading different files into the same local folder name
+    records = [{"id": "s1", "filename": "@@o\\Mistborn\\cover.jpg", "state": "InProgress"}]
+    backend, _ = slskd_task(tmp_path, ListClient(records))
+    clashes = backend._local_clashes("@@p\\Mistborn", [{"filename": "@@p\\Mistborn\\01.mp3"}])
+    assert clashes == ["cover.jpg"]

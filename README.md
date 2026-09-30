@@ -174,7 +174,10 @@ How audiobooks are handled:
 - **Failed downloads are cleared away**: whatever a failed download left behind (e.g. finished chapters) is moved to `<download_dir>/failed_downloads/`, so it can't mix with a later attempt.
 - **Time limits** are progress-based (see [Download timeouts](#download-timeouts)), so a large audiobook from a slow but steady peer is not cancelled.
 
-**Sharing slskd with other tools.** R:soul removes only its own records from slskd's transfer list once a download has finished or failed; it no longer clears every finished transfer, so tools such as Soularr can share the same slskd.
+**Sharing slskd with other tools.** R:soul removes only its own records from slskd's transfer list once a download has finished or failed; it no longer clears every finished transfer, so tools such as Soularr can share the same slskd. The reverse is handled too:
+
+- **Transfers cleared by another tool.** Soularr clears all finished transfers after each of its runs, R:soul's included. A cleared file that is in the download folder at its full size counts as finished; one that isn't counts as failed, so R:soul doesn't wait for it until `max_download_time`.
+- **Unfinished downloads in the same folder.** R:soul won't start a download into a local folder that any unfinished download is still writing into. When Soularr gives up on an album, it deletes that album's whole local folder.
 
 **slskd download folder layout.** R:soul expects slskd's default layout, where each file lands in `<download_dir>/<name of the peer's folder>/`, i.e. `transfers.download.destination.subdirectory` left at `${SOURCE_DIRECTORY}`. Downloads from different peers whose folders have the same name share one local folder, and slskd renames a new file if its name is taken. R:soul therefore won't start a download whose files already exist in, or are still downloading into, the same local folder; it retries on a later run.
 

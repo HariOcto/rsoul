@@ -43,3 +43,11 @@ def test_stalled_peer_then_retry_end_to_end():
     assert "book 1 staged files: 12 of 12" in out  # the retry in run 2 completes the book
     assert "foreign slskd transfer kept: True" in out
     assert "R:soul transfer records left in slskd: 0" in out
+
+
+def test_other_tool_clearing_finished_transfers_end_to_end():
+    # Soularr-style "clear all finished transfers" happens repeatedly while R:soul downloads;
+    # R:soul must recognise chapters already on disk and still import the whole book
+    out = run("soularr_clears")
+    assert "book 1 staged files: 12 of 12" in out
+    assert "state file left behind: False" in out

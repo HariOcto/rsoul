@@ -355,8 +355,8 @@ class SlskdBackend(DownloadBackend):
         if clashes:
             logger.warning(
                 f"Not downloading {target.book_title} from {username}: the local folder "
-                f"'{file_dir.split(chr(92))[-1]}' already has or expects {len(clashes)} file(s) with the same "
-                f"name (e.g. {clashes[0]}). Clear it out, or wait for the other download to finish."
+                f"'{file_dir.split(chr(92))[-1]}' already has files with the same names, or another download "
+                f"is still writing into it (e.g. {clashes[0]}). It is retried on a later run."
             )
             return None
 
@@ -423,6 +423,11 @@ class SlskdBackend(DownloadBackend):
             for f in downloads:
                 if f.get("status") is None and self._finished_on_disk(task, f):
                     f["status"] = {"state": "Completed, Succeeded", "bytesTransferred": f.get("size", 0)}
+                    f.pop("missing", None)
+                elif f.get("status") is None and f.get("missing"):
+                    # Cleared from slskd's list without the finished file ever reaching the download
+                    # folder: it failed (or was cancelled), and it will never complete now
+                    f["status"] = {"state": "Completed, Errored", "bytesTransferred": 0, "exception": "Transfer disappeared from slskd without finishing"}
 
         # Still-unknown files mean this poll can't be trusted; the orchestrator pauses timeouts
         task.poll_failed = any(f.get("status") is None for f in downloads)
@@ -482,8 +487,8 @@ class SlskdBackend(DownloadBackend):
             return False
 
     def _local_clashes(self, file_dir: str, files: List[Dict[str, Any]]) -> List[str]:
-        """File names this download would share with files already in, or on their way to,
-        the same local folder."""
+        """Reasons not to download into this download's local folder: files of the same name
+        already there, or any unfinished download (from anyone) headed for the same folder."""
         leaf = file_dir.split("\\")[-1] if file_dir else ""
         names = {f["filename"].split("\\")[-1] for f in files}
         clashes = set()
@@ -492,16 +497,17 @@ class SlskdBackend(DownloadBackend):
             folder = Path(self.download_dir) / leaf
             clashes.update(n for n in names if (folder / n).exists())
 
-        # Unfinished downloads (from any peer) that will land in the same local folder
+        # Unfinished downloads (from any peer or tool) headed for the same local folder. Any such
+        # download counts, not only same-named files: Soularr deletes the whole local folder of an
+        # album it gives up on, which would take R:soul's files with it.
         try:
             for user_transfer in self.client.transfers.get_all_downloads():
                 for directory in user_transfer.get("directories", []):
                     if directory.get("directory", "").split("\\")[-1] != leaf:
                         continue
                     for f in directory.get("files", []):
-                        name = f.get("filename", "").split("\\")[-1]
-                        if name in names and not str(f.get("state", "")).startswith("Completed"):
-                            clashes.add(name)
+                        if not str(f.get("state", "")).startswith("Completed"):
+                            clashes.add(f.get("filename", "").split("\\")[-1])
         except Exception as e:
             logger.warning(f"Could not check slskd's transfer list for clashing downloads: {e}")
 

@@ -131,14 +131,23 @@ def slskd_download_status(slskd_client: Any, downloads: List[SlskdFile]) -> bool
             if by_id is not None:
                 record = by_id.get(file["id"])
                 if record is None:
-                    # slskd no longer lists this transfer (restart, "clear completed")
+                    # slskd answered but no longer lists this transfer: something cleared it
+                    # ("clear completed" in the UI, or another tool such as Soularr, which clears
+                    # all finished transfers after each run). The caller decides from the disk
+                    # whether it had finished.
                     file["status"] = None
+                    file["missing"] = True
                     ok = False
                 else:
                     file["status"] = record
+                    file.pop("missing", None)
                 continue
             try:
-                file["status"] = slskd_client.transfers.get_download(file["username"], file["id"])
+                record = slskd_client.transfers.get_download(file["username"], file["id"])
+                # An unknown ID gives no usable record (slskd sends an empty 404 body)
+                file["status"] = record if isinstance(record, dict) and "state" in record else None
+                if file["status"] is None:
+                    ok = False
             except Exception:
                 logger.exception(f"Error getting download status of {file['filename']}")
                 file["status"] = None

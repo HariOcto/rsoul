@@ -34,6 +34,7 @@ CH = {BOOK1_DIR: [(f"{i:02d} - Chapter {i}.mp3", 1000 + i) for i in range(1, 13)
 # R:soul must leave it alone
 FOREIGN = {"id": "soularr-1", "username": "musicpeer", "filename": "@@m\\Music\\Album\\01.flac", "size": 10, "state": "Completed, Succeeded", "bytesTransferred": 10}
 transfers = {"soularr-1": dict(FOREIGN)}  # id -> record
+CLEARS = {"n": 0}
 lock = threading.Lock()
 
 def user_dirs(username):
@@ -88,6 +89,13 @@ class Slskd(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/v0/transfers/downloads/([^/]+)", p)
             if m:
                 advance()
+                if os.environ.get("SCENARIO") == "soularr_clears":
+                    # Soularr runs against the same slskd and clears every finished transfer
+                    # (its own and R:soul's) at the end of each of its runs
+                    CLEARS["n"] += 1
+                    if CLEARS["n"] % 3 == 0:
+                        for k in [k for k, t in transfers.items() if t["state"].startswith("Completed")]:
+                            del transfers[k]
                 return self.send(200, {"username": m.group(1), "directories": user_dirs(m.group(1))})
             m = re.fullmatch(r"/api/v0/transfers/downloads/([^/]+)/([^/]+)", p)
             if m:

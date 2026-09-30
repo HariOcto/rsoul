@@ -8,10 +8,7 @@ enough there. Chaptarr holds both in one instance and tags every book with a
 which formats to look for.
 """
 
-import logging
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 EBOOK = "ebook"
 AUDIOBOOK = "audiobook"
@@ -25,9 +22,6 @@ DEFAULT_AUDIOBOOK_FORMATS = ["m4b", "mp3"]
 # Audio extensions Chaptarr can import (from its MediaFileExtensions). Formats outside this
 # set would download fine but then fail to import.
 AUDIO_EXTENSIONS = {"flac", "ape", "wavpack", "wav", "alac", "mp2", "mp3", "wma", "m4a", "m4p", "m4b", "mp4", "aac", "mp4a", "ogg"}
-
-_warned_missing_media_type = False
-
 
 def get_media_mode(config: Any) -> str:
     """Return the configured media mode, defaulting to 'ebook' (existing behaviour)."""
@@ -47,24 +41,14 @@ def resolve_book_media_type(book: Dict[str, Any], mode: str) -> str:
 
     In 'ebook'/'audiobook' mode the configured mode wins. In 'both' mode the
     book's own ``mediaType`` field (Chaptarr) decides. If that field is missing
-    (e.g. plain Readarr), fall back to 'ebook' rather than guessing formats.
+    (e.g. plain Readarr), fall back to 'ebook' rather than guessing formats;
+    build_targets warns about that once per run.
     """
-    global _warned_missing_media_type
-
     if mode in (EBOOK, AUDIOBOOK):
         return mode
 
     value = str(book.get("mediaType") or "").strip().lower()
-    if value in (EBOOK, AUDIOBOOK):
-        return value
-
-    if not _warned_missing_media_type:
-        logger.warning(
-            "media_mode = both, but the wanted list has no 'mediaType' field (plain Readarr?). "
-            "Treating such books as ebooks. Use media_mode = audiobook for an audiobook-only instance."
-        )
-        _warned_missing_media_type = True
-    return EBOOK
+    return value if value in (EBOOK, AUDIOBOOK) else EBOOK
 
 
 def _parse_formats(raw: str) -> List[str]:

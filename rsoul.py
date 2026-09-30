@@ -150,7 +150,10 @@ def main():
                 logger.error("Exiting...")
                 sys.exit(0)
 
-            # Construct Download Targets
+            # Construct Download Targets. Books still downloading from an earlier run (hand-off)
+            # are skipped here already, so their authors aren't fetched for nothing.
+            in_flight = {item.get("book_id") for item in state_manager.get_tasks_for_orchestrator()}
+            wanted_books = [b for b in wanted_books if b.get("id") not in in_flight]
             if len(wanted_books) > 0:
                 console.print(f"\nFound {len(wanted_books)} wanted books to process", style="bold green")
 

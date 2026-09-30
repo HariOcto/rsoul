@@ -1,8 +1,10 @@
 import logging
 import datetime
+import threading
 import time
 import os
-from typing import Any, Dict, List, TYPE_CHECKING, Optional
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Dict, List, TYPE_CHECKING
 from . import postprocess
 
 if TYPE_CHECKING:
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 
 from .display import print_section_header, print_run_summary
 from .backends import DownloadTarget, DownloadTask, DownloadStatus
-from .media import get_media_mode, resolve_book_media_type, get_formats
+from .media import get_media_mode, resolve_book_media_type, get_formats, EBOOK, BOTH
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +36,17 @@ def task_to_grab_item(task: DownloadTask, download_dir: str) -> Dict[str, Any]:
     }
 
 
-
-
 def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> List[DownloadTarget]:
     """Turn wanted books into DownloadTargets with the right media type and formats."""
     batch_targets: List[DownloadTarget] = []
     media_mode = get_media_mode(ctx.config)
+
+    missing_media_type = sum(1 for t in download_targets if not t["book"].get("mediaType"))
+    if media_mode == BOTH and missing_media_type:
+        logger.warning(
+            f"media_mode = both, but {missing_media_type} wanted book(s) have no 'mediaType' field (plain Readarr?). "
+            f"Treating them as {EBOOK}s; use media_mode = audiobook for an audiobook-only instance."
+        )
 
     for target_dict in download_targets:
         book = target_dict["book"]
@@ -73,7 +80,12 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Lis
 
 
 class _RunResults:
-    """Collects outcomes across the run and handles each finished task."""
+    """Collects outcomes across the run and handles each finished task.
+
+    Imports run on a single background thread, so the monitoring loop keeps polling the other
+    downloads while Readarr/Chaptarr imports one. Counters are guarded by a lock because
+    failures are handled on the monitoring thread and imports on the import thread.
+    """
 
     def __init__(self, ctx: "Context", targets: List[DownloadTarget]):
         self.ctx = ctx
@@ -85,25 +97,58 @@ class _RunResults:
         self.remove_wanted_on_failure = ctx.config.getboolean("Search Settings", "remove_wanted_on_failure", fallback=False)
         self.failure_file_path = os.path.join(ctx.config_dir, "failure_list.txt")
         self.slskd_download_dir = ctx.config.get("Slskd", "download_dir", fallback="")
+        self._lock = threading.Lock()
+        self._imports = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rsoul-import")
+        self._pending: List[Future] = []
 
     def on_complete(self, task: DownloadTask) -> None:
         if task.status == DownloadStatus.COMPLETED:
-            try:
-                grab_item = task_to_grab_item(task, self.slskd_download_dir)
-                postprocess.process_imports(self.ctx, [grab_item])
+            self._pending.append(self._imports.submit(self._import, task))
+            return
+
+        self._handle_failure(task)
+        if self.ctx.state:
+            self.ctx.state.remove_task(task.task_id)
+
+    def wait_for_imports(self) -> None:
+        """Block until every queued import has finished."""
+        for future in self._pending:
+            future.result()
+        self._imports.shutdown(wait=True)
+
+    def _import(self, task: DownloadTask) -> None:
+        try:
+            grab_item = task_to_grab_item(task, self.slskd_download_dir)
+            imported = postprocess.process_imports(self.ctx, [grab_item]).get(task.book_id, False)
+        except Exception as e:
+            logger.error(f"Error importing task {task.filename}: {e}")
+            imported = False
+
+        with self._lock:
+            if imported:
                 self.completed_tasks.append(task)
-            except Exception as e:
-                logger.error(f"Error importing task {task.filename}: {e}")
+            else:
+                # Not unmonitored even with remove_wanted_on_failure: the download itself worked,
+                # and the peer is already recorded in the failure history, so the next search
+                # tries other peers for the same book.
+                logger.error(f"Downloaded but not imported: {task.book_title} by {task.author_name}")
                 self.failed_download += 1
                 self.failed_imports.append((task.author_name, task.book_title))
-        else:
-            self._handle_failure(task)
 
-        # Remove from state regardless of success/failure
+        # Remove from state once the import is done (successful or not)
         if self.ctx.state:
             self.ctx.state.remove_task(task.task_id)
 
     def _handle_failure(self, task: DownloadTask) -> None:
+        # Clear away what the failed download left behind (e.g. finished chapters), so it can't
+        # mix with a later attempt that lands in the same local folder
+        backend = self.ctx.orchestrator.get_backend(task.backend_name) if self.ctx.orchestrator else None
+        if backend:
+            try:
+                backend.discard(task)
+            except Exception as e:
+                logger.warning(f"Could not clean up after failed download of {task.book_title}: {e}")
+
         if self.remove_wanted_on_failure:
             failed_target = self.targets_by_id.get(task.book_id)
             if failed_target:
@@ -131,8 +176,9 @@ class _RunResults:
         else:
             logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
 
-        self.failed_download += 1
-        self.failed_books.append((task.author_name, task.book_title))
+        with self._lock:
+            self.failed_download += 1
+            self.failed_books.append((task.author_name, task.book_title))
 
 
 def unmonitor_book(ctx: "Context", book: Dict[str, Any], media_type: str) -> None:
@@ -204,9 +250,19 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
     targets: List[DownloadTarget] = []
     if monitor_window > 0 or not resumed:
         in_flight = {t.book_id for t in resumed}
-        targets = [t for t in build_targets(ctx, download_targets) if t.book_id not in in_flight]
+        wanted = [t for t in download_targets if t["book"]["id"] not in in_flight]
         if in_flight:
             logger.info(f"Skipping {len(in_flight)} book(s) that are still downloading from an earlier run")
+
+        # Optional cap on downloads running at once (resumed ones included)
+        max_active = ctx.config.getint("Download Settings", "max_active_downloads", fallback=0)
+        if max_active > 0:
+            room = max(0, max_active - len(resumed))
+            if len(wanted) > room:
+                logger.info(f"max_active_downloads = {max_active}: {len(resumed)} running, starting {room} of {len(wanted)} wanted book(s)")
+                wanted = wanted[:room]
+
+        targets = build_targets(ctx, wanted)
 
     results = _RunResults(ctx, targets)
 
@@ -214,9 +270,12 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         print_section_header("STARTING BATCH SEARCH PHASE")
         active = ctx.orchestrator.start_targets(targets, on_complete=results.on_complete)
 
-    # 3. Monitor everything in parallel
+    # 3. Monitor everything in parallel (imports run alongside on their own thread)
     deadline = time.time() + monitor_window if monitor_window > 0 else None
-    _, unfinished = ctx.orchestrator.monitor_until(resumed + active, on_complete=results.on_complete, deadline=deadline)
+    try:
+        _, unfinished = ctx.orchestrator.monitor_until(resumed + active, on_complete=results.on_complete, deadline=deadline)
+    finally:
+        results.wait_for_imports()
 
     # 4. Hand unfinished downloads to the next run
     for task in unfinished:

@@ -3,7 +3,7 @@ import logging
 import re
 from typing import Any, Optional, Dict, List
 from .display import print_match_details
-from .utils import normalize_for_matching, title_contained_in_filename, jaccard_similarity, length_ratio, extract_author_title
+from .utils import normalize_for_matching, title_contained_in_filename, jaccard_similarity, length_ratio, extract_author_title, STOP_WORDS
 
 logger = logging.getLogger(__name__)
 
@@ -286,19 +286,34 @@ def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[
     return candidates
 
 
-_STOP_WORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "by", "with"}
-
-
 def _meaningful_words(text: str) -> List[str]:
-    return [w for w in normalize_for_matching(text).split() if w not in _STOP_WORDS]
+    return [w for w in normalize_for_matching(text).split() if w not in STOP_WORDS]
+
+
+# Folders holding one disc or part of a multi-disc audiobook ("CD1", "Disc 02", "Part 3",
+# "Mistborn - CD1"). Downloading one of them would import an incomplete book.
+_DISC_FOLDER = re.compile(r"^(?:cd|disc|disk|part|teil|vol|volume)\s*[-_.]?\s*\d{1,3}$|\b(?:cd|disc|disk)\s*[-_.]?\s*\d{1,3}\b", re.IGNORECASE)
+
+# Name suffixes that are not a surname
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "phd"}
+
+
+def is_disc_folder(directory: str) -> bool:
+    """True if the folder's own name marks it as one disc/part of a larger audiobook."""
+    leaf = directory.split("\\")[-1].strip() if directory else ""
+    return bool(leaf) and bool(_DISC_FOLDER.search(leaf))
 
 
 def title_variants(title: str) -> List[str]:
     """The full title plus shorter forms that folders are often named after.
 
-    "Mistborn: The Final Empire" also gives "The Final Empire" (but not "Mistborn" alone),
-    and "The Final Empire (Mistborn #1)" also gives "The Final Empire". A shortened form is
-    only used if it has at least two meaningful words, so it can't match on one common word.
+    - A trailing "(...)" or "[...]" is dropped: "The Final Empire (Mistborn #1)" also gives
+      "The Final Empire", and "Dune (Dune Chronicles, #1)" also gives "Dune".
+    - Either side of a colon is used if it has at least two meaningful words:
+      "Mistborn: The Final Empire" also gives "The Final Empire", but not "Mistborn" alone,
+      which would match every book in the series.
+
+    Audiobook matching requires the author in the folder path for every variant.
     """
     variants = [title]
     no_suffix = re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", title).strip()
@@ -314,9 +329,9 @@ def title_variants(title: str) -> List[str]:
 
 
 def author_in_name(author_name: str, candidate: str) -> bool:
-    """True if the author's surname appears in the candidate name."""
-    words = [w for w in normalize_for_matching(author_name).split() if len(w) > 1]
-    return bool(words) and words[-1] in normalize_for_matching(candidate).split()
+    """True if the author's surname appears in the candidate name (or path)."""
+    words = [w for w in normalize_for_matching(author_name).split() if len(w) > 1 and w not in _NAME_SUFFIXES]
+    return bool(words) and words[-1] in normalize_for_matching(candidate.replace("\\", " ")).split()
 
 
 def audiobook_folder_match(
@@ -336,8 +351,9 @@ def audiobook_folder_match(
 
     Audiobooks usually arrive as a folder of chapter files ("01.mp3", "02.mp3"...)
     whose names say nothing about the book, so the folder name is matched instead.
-    Files are grouped by (folder, extension); every group scoring at least
-    minimum_match_ratio is returned, best first per extension.
+    Files are grouped by (folder, extension). Disc/part subfolders are skipped, and the
+    author's surname must appear in the folder path. The best folder per extension that
+    scores at least minimum_match_ratio is returned, best match first.
 
     Returns:
         List of dicts: directory, extension, files, score, total_size.
@@ -360,12 +376,20 @@ def audiobook_folder_match(
 
     best_per_ext: Dict[str, Dict[str, Any]] = {}
     for (directory, ext), files in groups.items():
+        if is_disc_folder(directory):
+            logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
+            continue
+
+        # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
+        # authors, so the author's surname must appear somewhere in the path (or, for a
+        # single-file book, the filename). This also rules out other books with the same title.
+        path_text = directory + (" " + split_slskd_path(files[0]["filename"])[1] if len(files) == 1 else "")
+        if not author_in_name(author_name, path_text):
+            continue
+
         best_score = None
         for name in folder_name_candidates(directory, files):
-            for i, title in enumerate(titles):
-                # Shortened titles are easier to match by accident, so they need the author too
-                if i > 0 and not author_in_name(author_name, name):
-                    continue
+            for title in titles:
                 score = score_name(
                     title,
                     author_name,
@@ -394,7 +418,8 @@ def audiobook_folder_match(
         if current is None or (candidate["score"], candidate["total_size"]) > (current["score"], current["total_size"]):
             best_per_ext[ext] = candidate
 
-    matches = sorted(best_per_ext.values(), key=lambda c: (allowed.index(c["extension"]), -c["score"]))
+    # Best match first; the configured format order only breaks ties
+    matches = sorted(best_per_ext.values(), key=lambda c: (-c["score"], allowed.index(c["extension"])))
     for match in matches:
         logger.info(f"Audiobook folder match: {match['directory']} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
     return matches

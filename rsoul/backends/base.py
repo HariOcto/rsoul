@@ -263,6 +263,14 @@ class DownloadBackend(ABC):
         """
         pass
 
+    def discard(self, task: DownloadTask) -> None:
+        """Optional: clear away whatever a failed download left behind.
+
+        Override if partial downloads stay on disk (e.g. finished chapters of an
+        audiobook whose remaining chapters failed), so they can't mix with a retry.
+        """
+        pass
+
     def cleanup(self, task: DownloadTask) -> None:
         """Optional cleanup after successful import.
 

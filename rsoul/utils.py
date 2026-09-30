@@ -2,6 +2,10 @@ import os
 import re
 
 
+# Words ignored when checking whether a title appears in a file or folder name
+STOP_WORDS = frozenset({"the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "by", "with"})
+
+
 def sanitize_folder_name(folder_name):
     valid_characters = re.sub(r'[<>:."/\\|?*]', "", folder_name)
     return valid_characters.strip()
@@ -130,8 +134,7 @@ def title_contained_in_filename(target_title: str, filename: str) -> bool:
     filename_words = set(normalized_filename.split())
 
     # Filter out common stop words to avoid false positives on "The", "A", etc.
-    stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "by", "with"}
-    filtered_target_words = {w for w in target_words if w not in stop_words}
+    filtered_target_words = {w for w in target_words if w not in STOP_WORDS}
 
     # If all words were stop words (unlikely), revert to full set
     if not filtered_target_words:

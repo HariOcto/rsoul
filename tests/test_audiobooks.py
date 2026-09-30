@@ -212,6 +212,9 @@ class FakeTransfers:
     def cancel_download(self, username, id):
         self.cancelled.append(id)
 
+    def get_all_downloads(self):
+        return []
+
 
 class FakeSlskd:
     def __init__(self, responses=None, listings=None, register_count=None):

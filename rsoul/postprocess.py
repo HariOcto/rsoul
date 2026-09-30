@@ -395,6 +395,36 @@ def organize_file(source_path: str, target_folder: str, filename: str, original_
         return False
 
 
+def move_files_aside(base_dir: str, folder: str, names: list, bucket: str = "failed_imports") -> str:
+    """Move just these files from <base_dir>/<folder> into <base_dir>/<bucket>/<folder>[_n].
+
+    Only the named files are moved: slskd puts downloads from different peers that share a
+    folder name into the same local folder, so moving the whole folder could take other
+    books' files with it. Returns the destination folder ("" if nothing was moved).
+    """
+    source_dir = os.path.join(base_dir, folder)
+    present = [n for n in names if os.path.isfile(os.path.join(source_dir, n))]
+    if not present:
+        return ""
+
+    target_dir = os.path.join(base_dir, bucket, os.path.basename(folder.rstrip(os.sep)) or "unknown")
+    counter = 1
+    while os.path.exists(target_dir):
+        target_dir = os.path.join(base_dir, bucket, f"{os.path.basename(folder.rstrip(os.sep)) or 'unknown'}_{counter}")
+        counter += 1
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        for name in present:
+            shutil.move(os.path.join(source_dir, name), os.path.join(target_dir, name))
+        logger.info(f"Moved {len(present)} file(s) to {target_dir}")
+        if os.path.abspath(source_dir) != os.path.abspath(base_dir) and os.path.isdir(source_dir) and not os.listdir(source_dir):
+            shutil.rmtree(source_dir)
+    except Exception as e:
+        logger.error(f"Failed to move files to {target_dir}: {e}")
+    return target_dir
+
+
 # Audiobooks are staged in their own subfolder of the download dir, one folder per book,
 # so an ebook import scan of an author folder never picks up a half-organised audiobook.
 AUDIOBOOK_STAGING_DIR = "rsoul_audiobooks"
@@ -462,6 +492,7 @@ def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folde
             logger.info(f"Importing from: {download_dir}")
 
             command = readarr_client.post_command(name="DownloadedBooksScan", path=download_dir)
+            command["_rsoul_folder"] = author_folder  # lets process_imports map results back to books
             commands.append(command)
             logger.info(f"Import command created - ID: {command['id']} for folder: {author_folder}")
 
@@ -489,74 +520,88 @@ def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str)
     return path
 
 
-def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: str = "", local_download_dir: str = "") -> None:
-    """Monitor progress of Readarr import commands and report results."""
+IMPORT_TIMEOUT_SECONDS = 3600
+
+
+def _import_succeeded(command: dict) -> bool:
+    """Whether a finished DownloadedBooksScan command actually imported something.
+
+    Readarr and Chaptarr finish the command with status "completed" even when nothing was
+    imported; they report that through result = "unsuccessful" (message "Failed to import").
+    The message check covers older versions without a result field.
+    """
+    if command.get("status") != "completed":
+        return False
+    if str(command.get("result", "")).lower() == "unsuccessful":
+        return False
+    message = (command.get("message") or "").lower()
+    return "failed" not in message and "no files found" not in message
+
+
+def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: str = "", local_download_dir: str = "", timeout: float = IMPORT_TIMEOUT_SECONDS) -> dict:
+    """Wait for Readarr import commands to finish and report results.
+
+    Returns:
+        {command id: True if the import succeeded}. Failed imports are moved to failed_imports;
+        commands still running after `timeout` seconds count as failed but are left in place.
+    """
+    results: dict = {}
     if not commands:
-        return
+        return results
 
     logger.info("Monitoring import progress...")
-    while True:
-        completed_count = 0
-
+    deadline = time.time() + timeout
+    final: dict = {}
+    while len(final) < len(commands) and time.time() < deadline:
         for task in commands:
+            if task["id"] in final:
+                continue
             try:
                 current_task = readarr_client.get_command(task["id"])
-                if current_task["status"] in ["completed", "failed"]:
-                    completed_count += 1
             except Exception as e:
                 logger.error(f"Error checking task {task['id']}: {e}")
-                completed_count += 1  # Count as completed to avoid infinite loop
-
-        if completed_count == len(commands):
-            break
-
-        time.sleep(2)
+                final[task["id"]] = {"id": task["id"], "status": "unknown", "body": task.get("body", {})}
+                continue
+            if current_task.get("status") in ["completed", "failed", "aborted", "cancelled", "orphaned"]:
+                final[task["id"]] = current_task
+        if len(final) < len(commands):
+            time.sleep(2)
 
     # Report final results
     logger.info("Import Results:")
     for task in commands:
-        try:
-            current_task = readarr_client.get_command(task["id"])
-            status = current_task.get("status", "unknown")
+        current_task = final.get(task["id"])
+        if current_task is None:
+            logger.error(f"Import command {task['id']} still running after {timeout:.0f}s - not waiting any longer")
+            results[task["id"]] = False
+            continue
 
-            if "body" in current_task and "path" in current_task["body"]:
-                path = current_task["body"]["path"]
-                folder_name = os.path.basename(path)
-            else:
-                folder_name = f"Task {task['id']}"
+        body = current_task.get("body") or {}
+        path = body.get("path", "")
+        folder_name = os.path.basename(path) if path else f"Task {task['id']}"
+        message = current_task.get("message", "")
 
-            message = current_task.get("message", "")
+        results[task["id"]] = _import_succeeded(current_task)
+        if results[task["id"]]:
+            logger.info(f"{folder_name}: Import completed. Message: {message}")
+            continue
 
-            if status == "completed":
-                # Check for failure keywords in message even if status is completed
-                # "No files found" is a common message when import finds nothing
-                if "failed" in message.lower() or "no files found" in message.lower():
-                    logger.warning(f"{folder_name}: Import completed with warnings/errors: {message}")
-                    if "body" in current_task and "path" in current_task["body"]:
-                        move_failed_import(to_local_path(current_task["body"]["path"], readarr_download_dir, local_download_dir))
-                else:
-                    logger.info(f"{folder_name}: Import completed. Message: {message}")
+        logger.warning(f"{folder_name}: Import did not succeed (status: {current_task.get('status')}, result: {current_task.get('result', 'n/a')}): {message}")
+        if path and current_task.get("status") != "unknown":
+            move_failed_import(to_local_path(path, readarr_download_dir, local_download_dir))
 
-            elif status == "failed":
-                logger.error(f"{folder_name}: Import failed")
-                if "message" in current_task:
-                    logger.error(f"Error message: {current_task['message']}")
-
-                # Move failed import
-                if "body" in current_task and "path" in current_task["body"]:
-                    move_failed_import(to_local_path(current_task["body"]["path"], readarr_download_dir, local_download_dir))
-            else:
-                logger.warning(f"{folder_name}: Import status unknown - {status}")
-
-        except Exception as e:
-            logger.error(f"Error processing task result {task['id']}: {e}")
+    return results
 
 
-def process_imports(ctx: Any, grab_list: list):
+def process_imports(ctx: Any, grab_list: list) -> dict:
     """Process downloaded files, validate metadata, and trigger Readarr import.
 
     Handles items from multiple backends by grouping them and using backend-specific paths.
+
+    Returns:
+        {bookId: True if the book was imported (or sync is disabled), False otherwise}
     """
+    results = {item.get("bookId"): False for item in grab_list}
     print_section_header("METADATA VALIDATION & IMPORT PHASE")
 
     readarr_disable_sync = ctx.config.getboolean("Readarr", "disable_sync", fallback=False)
@@ -570,8 +615,8 @@ def process_imports(ctx: Any, grab_list: list):
     # Check if sync is disabled first
     if readarr_disable_sync:
         logger.warning("Readarr sync is disabled in config. Skipping import phase.")
-        logger.info(f"Files downloaded but not imported.")
-        return
+        logger.info("Files downloaded but not imported.")
+        return {book_id: True for book_id in results}
 
     # Group items by backend to handle directory switching
     items_by_backend = {}
@@ -612,6 +657,7 @@ def process_imports(ctx: Any, grab_list: list):
         items.sort(key=operator.itemgetter("author_name"))
         failed_imports = []
         author_folders = set()
+        folder_books: dict = {}  # import folder -> book IDs whose files were moved there
 
         for book_download in items:
             if book_download.get("media_type") == "audiobook":
@@ -622,11 +668,11 @@ def process_imports(ctx: Any, grab_list: list):
                 relative, reason = organize_audiobook(book_download, local_download_dir)
                 if relative:
                     author_folders.add(relative)
+                    folder_books.setdefault(relative, []).append(book_download.get("bookId"))
                 else:
                     logger.warning(f"Audiobook failed: {book_title} - {reason}")
-                    source_dir = os.path.join(local_download_dir, book_download.get("dir", ""))
-                    if book_download.get("dir") and os.path.isdir(source_dir):
-                        move_failed_import(source_dir, local_download_dir)
+                    names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
+                    move_files_aside(local_download_dir, book_download.get("dir", ""), names)
                     if ctx.history and source_id and book_title:
                         ctx.history.add_failure(source_id, book_title, reason or "Audiobook import failed")
                 continue
@@ -673,6 +719,7 @@ def process_imports(ctx: Any, grab_list: list):
                     if organize_file(source_file_path, author_name_sanitized, filename, folder, local_download_dir):
                         logger.info(f"Successfully processed {filename}")
                         author_folders.add(author_name_sanitized)
+                        folder_books.setdefault(author_name_sanitized, []).append(book_id)
                     else:
                         failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
                         if ctx.history:
@@ -730,10 +777,15 @@ def process_imports(ctx: Any, grab_list: list):
             logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
             commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
             if commands:
-                monitor_imports(readarr, commands, readarr_download_dir, local_download_dir)
+                command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir)
+                for command in commands:
+                    for book_id in folder_books.get(command.get("_rsoul_folder"), []):
+                        results[book_id] = command_results.get(command["id"], False)
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")
 
     if not items_by_backend:
         logger.warning("No author folders found to import")
+
+    return results

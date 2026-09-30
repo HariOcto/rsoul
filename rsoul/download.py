@@ -6,12 +6,13 @@ from .types import SlskdFile, SlskdDirectory
 logger = logging.getLogger(__name__)
 
 
-def _transfer_ids(slskd_client: Any, username: str) -> set:
-    """IDs of all transfers slskd currently lists for a user (empty set if unavailable)."""
+def _transfer_ids(slskd_client: Any, username: str) -> Optional[set]:
+    """IDs of all transfers slskd currently lists for a user, or None if the list is unavailable."""
     try:
         download_list = slskd_client.transfers.get_downloads(username=username)
     except Exception:
-        return set()
+        logger.error(f"Could not read slskd's transfer list for {username}", exc_info=True)
+        return None
     return {f["id"] for d in download_list.get("directories", []) for f in d.get("files", [])}
 
 
@@ -26,6 +27,10 @@ def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], f
     queued or transferring); finished old records are never mistaken for the new download.
     """
     pre_existing = _transfer_ids(slskd_client, username)
+    if pre_existing is None:
+        # Without this snapshot an old record of the same file could be mistaken for the new
+        # download, so don't queue anything; the book is retried on a later run.
+        return None
 
     try:
         enqueue = slskd_client.transfers.enqueue(username=username, files=files)
@@ -92,19 +97,52 @@ def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], f
     return downloads or None
 
 
+TERMINAL_SUCCESS = "Completed, Succeeded"
+
+
 def slskd_download_status(slskd_client: Any, downloads: List[SlskdFile]) -> bool:
     """
-    Takes a list of files and gets the status of each file and packs it into the file object.
+    Refresh the status of each file, packing it into the file object.
+
+    Uses one transfer-list request per user instead of one request per file (an audiobook can
+    have dozens of chapters), and skips files that already finished successfully. Falls back
+    to per-file requests if the list request fails. A file whose status can't be read gets
+    status None.
+
+    Returns:
+        True if every file's status is known.
     """
     ok = True
+    pending: Dict[str, List[SlskdFile]] = {}
     for file in downloads:
+        if (file.get("status") or {}).get("state") == TERMINAL_SUCCESS:
+            continue  # finished files don't change any more
+        pending.setdefault(file["username"], []).append(file)
+
+    for username, files in pending.items():
         try:
-            status = slskd_client.transfers.get_download(file["username"], file["id"])
-            file["status"] = status
+            listing = slskd_client.transfers.get_downloads(username=username)
+            by_id = {f["id"]: f for d in listing.get("directories", []) for f in d.get("files", [])}
         except Exception:
-            logger.exception(f"Error getting download status of {file['filename']}")
-            file["status"] = None
-            ok = False
+            logger.warning(f"Could not list transfers for {username}; checking files one by one")
+            by_id = None
+
+        for file in files:
+            if by_id is not None:
+                record = by_id.get(file["id"])
+                if record is None:
+                    # slskd no longer lists this transfer (restart, "clear completed")
+                    file["status"] = None
+                    ok = False
+                else:
+                    file["status"] = record
+                continue
+            try:
+                file["status"] = slskd_client.transfers.get_download(file["username"], file["id"])
+            except Exception:
+                logger.exception(f"Error getting download status of {file['filename']}")
+                file["status"] = None
+                ok = False
     return ok
 
 
@@ -124,10 +162,9 @@ def downloads_all_done(downloads: List[SlskdFile]) -> Tuple[bool, bool]:
             # Unknown (the status request failed): not proof that the file finished
             all_succeeded = False
             continue
-        if file["status"] is not None:
-            state = file["status"]["state"]
-            if state != "Completed, Succeeded":
-                all_succeeded = False
+        state = file["status"]["state"]
+        if state != TERMINAL_SUCCESS:
+            all_succeeded = False
             if state in [
                 "Completed, Cancelled",
                 "Completed, TimedOut",

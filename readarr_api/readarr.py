@@ -132,6 +132,7 @@ class ReadarrAPI(BaseArrAPI):
             page_size (int, optional): Number of items per page. Defaults to None.
             sort_key (ReadarrSortKeys, optional): id, title, ratings, bookid, or quality. (Others do not apply). Defaults to None.
             sort_dir (PyarrSortDirection, optional): Direction to sort the items. Defaults to None,
+            media_type (str, optional): Chaptarr only: "ebook" or "audiobook" to limit the list to one media type. Readarr ignores it. Defaults to None.
 
         Returns:
             JsonObject: List of dictionaries with items
@@ -169,6 +170,7 @@ class ReadarrAPI(BaseArrAPI):
             sort_key (ReadarrSortKeys, optional): id, title, ratings, bookid, or quality". (others do not apply). Defaults to None.
             sort_dir (PyarrSortDirection, optional): Direction to sort. Defaults to None.
             monitored (bool, optional): Search for monitored only. Defaults to None.
+            media_type (str, optional): Chaptarr only: "ebook" or "audiobook" to limit the list to one media type. Readarr ignores it. Defaults to None.
 
         Returns:
             JsonObject: List of dictionaries with items

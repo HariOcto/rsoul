@@ -20,9 +20,9 @@ MB = 1024 * 1024
 def make_config(**download_settings):
     config = configparser.ConfigParser(interpolation=None)
     config["Readarr"] = {"api_key": "x", "host_url": "http://chaptarr"}
-    config["Slskd"] = {"api_key": "x", "host_url": "http://slskd", "download_dir": "/downloads", "remote_queue_timeout": "3600"}
+    config["Slskd"] = {"api_key": "x", "host_url": "http://slskd", "download_dir": "/downloads"}
     config["Search Settings"] = {}
-    config["Download Settings"] = {"stall_timeout": "1800", "max_download_time": "86400", **download_settings}
+    config["Download Settings"] = {"stall_timeout": "1800", "queue_timeout": "3600", "max_download_time": "86400", **download_settings}
     config["Backends"] = {"slskd_enabled": "False"}
     return config
 
@@ -83,7 +83,7 @@ def test_remote_queue_timeout_and_queue_is_not_a_stall():
     assert orch.check_timeouts(task, now=t0) is None
     # Queued for 50 minutes: longer than stall_timeout, but queueing is not stalling
     assert orch.check_timeouts(task, now=t0 + 3000) is None
-    assert "upload queue" in orch.check_timeouts(task, now=t0 + 3600)
+    assert "queue without starting" in orch.check_timeouts(task, now=t0 + 3600)
 
 
 def test_queue_timer_resets_once_transfer_starts():
@@ -337,7 +337,11 @@ def test_handoff_persists_unfinished_and_next_run_resumes_and_searches(clock, tm
     orch2 = RecordingStartOrchestrator([backend2], ctx2, {2: make_task("t-book2", book_id=2)})
     ctx2.orchestrator = orch2
     imported = []
-    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items: imported.extend(items))
+    def fake_import(ctx, items):
+        imported.extend(items)
+        return {item["bookId"]: True for item in items}
+
+    monkeypatch.setattr(workflow.postprocess, "process_imports", fake_import)
 
     result2 = workflow.run_workflow(ctx2, wanted(1, 2))
 

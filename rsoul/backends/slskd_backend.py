@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
 from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path
 from ..display import print_search_summary
+from ..postprocess import move_files_aside
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,6 @@ class SlskdBackend(DownloadBackend):
         """Search for a book on Soulseek via slskd."""
         author_name = target.author_name
         book_title = target.book_title
-        allowed_filetypes = target.allowed_filetypes
 
         delete_searches = self.config.getboolean("Slskd", "delete_searches", fallback=True)
 
@@ -191,6 +192,7 @@ class SlskdBackend(DownloadBackend):
         """Single-file matching (original R:soul behaviour): best file per user and format."""
         book_title = target.book_title
         allowed_filetypes = target.allowed_filetypes
+        thresholds = self._match_thresholds()
         results: List[SearchResult] = []
 
         file_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
@@ -213,19 +215,7 @@ class SlskdBackend(DownloadBackend):
         # Match for each user
         for username, types in file_cache.items():
             for ext, files in types.items():
-                match = book_match(
-                    target_dict,
-                    files,
-                    username,
-                    ext,
-                    ignored_users=self.config.get("Search Settings", "ignored_users", fallback="").split(","),
-                    minimum_match_ratio=self.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
-                    min_length_ratio=self.config.getfloat("Search Settings", "min_length_ratio", fallback=0.4),
-                    min_jaccard_ratio=self.config.getfloat("Search Settings", "min_jaccard_ratio", fallback=0.25),
-                    min_word_overlap=self.config.getint("Search Settings", "min_word_overlap", fallback=2),
-                    min_title_jaccard=self.config.getfloat("Search Settings", "min_title_jaccard", fallback=0.3),
-                    min_author_jaccard=self.config.getfloat("Search Settings", "min_author_jaccard", fallback=0.5),
-                )
+                match = book_match(target_dict, files, username, ext, **thresholds)
 
                 if match:
                     file_dir = match["filename"].rsplit("\\", 1)[0] if "\\" in match["filename"] else ""
@@ -247,7 +237,6 @@ class SlskdBackend(DownloadBackend):
                         },
                     )
                     results.append(sr)
-
 
         return results
 
@@ -294,19 +283,25 @@ class SlskdBackend(DownloadBackend):
             for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, **thresholds):
                 candidates.append((username, match))
 
-        # Preferred format first, then best name match, then largest folder
-        candidates.sort(key=lambda c: (allowed.index(c[1]["extension"]), -c[1]["score"], -c[1]["total_size"]))
+        # Best name match first, then the configured format order, then the largest folder
+        candidates.sort(key=lambda c: (-c[1]["score"], allowed.index(c[1]["extension"]), -c[1]["total_size"]))
 
-        results: List[SearchResult] = []
+        # Browse candidates in order and stop at the first usable folder: the orchestrator only
+        # downloads the first result, and each browse is a slow round trip to the peer.
         for username, match in candidates[:browse_limit]:
             directory = match["directory"]
             ext = match["extension"]
 
             browsed = self._browse_directory(username, directory) if directory else None
-            source_files = browsed if browsed is not None else match["files"]
+            if browsed is None:
+                # Search results list only the files that matched the query, so without the full
+                # listing we can't know the folder is complete. Try the next candidate instead.
+                logger.info(f"Skipping {directory or '(share root)'} from {username}: could not list the full folder")
+                continue
+
             files = [
                 {"filename": f["filename"], "size": f.get("size", 0)}
-                for f in source_files
+                for f in browsed
                 if split_slskd_path(f["filename"])[1].lower().endswith(f".{ext}")
                 # Only this folder's own files, not ones from subfolders
                 and split_slskd_path(f["filename"])[0] == directory
@@ -320,12 +315,12 @@ class SlskdBackend(DownloadBackend):
                 logger.info(f"Skipping {directory} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
                 continue
 
-            first_name = split_slskd_path(files[0]["filename"])[1]
-            results.append(
+            logger.info(f"Audiobook candidate: {directory} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
+            return [
                 SearchResult(
                     title=target.book_title,
                     author=target.author_name,
-                    filename=first_name,
+                    filename=split_slskd_path(files[0]["filename"])[1],
                     size_bytes=total_size,
                     extension=ext,
                     backend_name=self.name,
@@ -339,10 +334,9 @@ class SlskdBackend(DownloadBackend):
                         "media_type": "audiobook",
                     },
                 )
-            )
-            logger.info(f"Audiobook candidate: {directory} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
+            ]
 
-        return results
+        return []
 
     def download(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
         """Initiate download of a Soulseek file."""
@@ -354,6 +348,17 @@ class SlskdBackend(DownloadBackend):
         for i in range(len(files)):
             if "\\" not in files[i]["filename"]:
                 files[i]["filename"] = file_dir + "\\" + files[i]["filename"]
+
+        # slskd saves into <download_dir>/<remote folder name>/ and renames a new file whose name
+        # is already taken, so R:soul would then pick up the wrong (old or other) file.
+        clashes = self._local_clashes(file_dir, files)
+        if clashes:
+            logger.warning(
+                f"Not downloading {target.book_title} from {username}: the local folder "
+                f"'{file_dir.split(chr(92))[-1]}' already has or expects {len(clashes)} file(s) with the same "
+                f"name (e.g. {clashes[0]}). Clear it out, or wait for the other download to finish."
+            )
+            return None
 
         downloads = slskd_do_enqueue(self.client, username, files, file_dir)
 
@@ -467,14 +472,50 @@ class SlskdBackend(DownloadBackend):
         return task
 
     def _finished_on_disk(self, task: DownloadTask, file: Dict[str, Any]) -> bool:
-        """True if the file is already in the local download folder at its full size."""
-        if not self.download_dir:
-            return False
+        """True if the file is already in the local download folder at its expected size."""
+        if not self.download_dir or not file.get("size"):
+            return False  # without a known size, an old file of the same name could be mistaken for it
         path = Path(self.download_dir) / (task.local_dir or "") / file["filename"].split("\\")[-1]
         try:
-            return path.is_file() and (not file.get("size") or path.stat().st_size == file["size"])
+            return path.is_file() and path.stat().st_size == file["size"]
         except OSError:
             return False
+
+    def _local_clashes(self, file_dir: str, files: List[Dict[str, Any]]) -> List[str]:
+        """File names this download would share with files already in, or on their way to,
+        the same local folder."""
+        leaf = file_dir.split("\\")[-1] if file_dir else ""
+        names = {f["filename"].split("\\")[-1] for f in files}
+        clashes = set()
+
+        if self.download_dir and os.path.isdir(self.download_dir):
+            folder = Path(self.download_dir) / leaf
+            clashes.update(n for n in names if (folder / n).exists())
+
+        # Unfinished downloads (from any peer) that will land in the same local folder
+        try:
+            for user_transfer in self.client.transfers.get_all_downloads():
+                for directory in user_transfer.get("directories", []):
+                    if directory.get("directory", "").split("\\")[-1] != leaf:
+                        continue
+                    for f in directory.get("files", []):
+                        name = f.get("filename", "").split("\\")[-1]
+                        if name in names and not str(f.get("state", "")).startswith("Completed"):
+                            clashes.add(name)
+        except Exception as e:
+            logger.warning(f"Could not check slskd's transfer list for clashing downloads: {e}")
+
+        return sorted(clashes)
+
+    def discard(self, task: DownloadTask) -> None:
+        """Move files a failed download left in the local folder (e.g. finished chapters)
+        into <download_dir>/failed_downloads/, so a retry starts from a clean folder."""
+        if not self.download_dir or not task.local_dir:
+            return
+        names = task.extra.get("expected_files") or [f["filename"].split("\\")[-1] for f in task.extra.get("files", [])]
+        moved_to = move_files_aside(self.download_dir, task.local_dir, names, bucket="failed_downloads")
+        if moved_to:
+            logger.info(f"Moved leftovers of the failed download of {task.book_title} to {moved_to}")
 
     def cancel(self, task: DownloadTask) -> bool:
         """Cancel the download in slskd."""
@@ -511,36 +552,51 @@ class SlskdBackend(DownloadBackend):
         if not username or not filename:
             return None
 
+        # The transfer ID saved when the download was queued identifies it exactly; slskd keeps
+        # old records of earlier attempts with the same filename, so names alone are ambiguous.
+        saved_ids = {f.get("id") for f in task_data.get("extra", {}).get("files", []) if f.get("id")}
+
         try:
             # Query slskd for all downloads to find matching transfer
             all_downloads = self.client.transfers.get_all_downloads()
 
+            candidates = []
             for user_transfer in all_downloads:
                 if user_transfer["username"] == username:
                     for directory in user_transfer["directories"]:
                         for file in directory["files"]:
                             slskd_filename = file["filename"]
                             if slskd_filename == filename or slskd_filename.split("\\")[-1] == filename:
-                                # Found it! Re-create task with updated data
-                                new_files = [{"filename": file["filename"], "id": file["id"], "size": file["size"], "username": username, "file_dir": directory["directory"]}]
+                                candidates.append((directory, file))
 
-                                task_data["extra"]["files"] = new_files
-                                task_data["extra"]["slskd_id"] = file["id"]
-                                task_data["extra"]["file_dir"] = directory["directory"]
+            if saved_ids:
+                candidates = [c for c in candidates if c[1]["id"] in saved_ids]
+            else:
+                # Old state file without IDs: prefer a record that is still active
+                candidates.sort(key=lambda c: str(c[1].get("state", "")).startswith("Completed"))
 
-                                task = DownloadTask(
-                                    task_id=task_data["task_id"],
-                                    backend_name=self.name,
-                                    status=DownloadStatus.PENDING,
-                                    book_title=task_data["book_title"],
-                                    author_name=task_data["author_name"],
-                                    book_id=task_data["book_id"],
-                                    filename=task_data["filename"],
-                                    series_title=task_data.get("series_title", ""),
-                                    local_dir=task_data.get("local_dir", ""),
-                                    extra=task_data["extra"],
-                                )
-                                return self.get_status(task)
+            if candidates:
+                directory, file = candidates[0]
+                # Found it! Re-create task with updated data
+                new_files = [{"filename": file["filename"], "id": file["id"], "size": file["size"], "username": username, "file_dir": directory["directory"]}]
+
+                task_data["extra"]["files"] = new_files
+                task_data["extra"]["slskd_id"] = file["id"]
+                task_data["extra"]["file_dir"] = directory["directory"]
+
+                task = DownloadTask(
+                    task_id=task_data["task_id"],
+                    backend_name=self.name,
+                    status=DownloadStatus.PENDING,
+                    book_title=task_data["book_title"],
+                    author_name=task_data["author_name"],
+                    book_id=task_data["book_id"],
+                    filename=task_data["filename"],
+                    series_title=task_data.get("series_title", ""),
+                    local_dir=task_data.get("local_dir", ""),
+                    extra=task_data["extra"],
+                )
+                return self.get_status(task)
 
             # If not found in slskd, check if it's already on disk in the download dir
             if self.download_dir and local_dir:
@@ -582,6 +638,9 @@ class SlskdBackend(DownloadBackend):
             return None
 
         leaf = file_dir.split("\\")[-1] if file_dir else ""
+        # Chapters are matched by the transfer IDs saved when they were queued: slskd keeps old
+        # records of earlier attempts with the same names (e.g. "Completed, Errored").
+        saved_ids = {f["id"] for f in extra.get("files", []) if f.get("id")}
         tracked: Dict[str, Dict[str, Any]] = {}
         try:
             for user_transfer in self.client.transfers.get_all_downloads():
@@ -592,17 +651,26 @@ class SlskdBackend(DownloadBackend):
                         continue
                     for file in directory["files"]:
                         basename = file["filename"].split("\\")[-1]
-                        if basename in expected:
+                        if basename not in expected:
+                            continue
+                        if saved_ids and file["id"] not in saved_ids:
+                            continue  # an older (or unrelated) record with the same name
+                        previous = tracked.get(basename)
+                        # Without saved IDs (old state file), prefer a record that is still active
+                        if previous is None or str(previous.get("state", "")).startswith("Completed"):
                             tracked[basename] = {
                                 "filename": file["filename"],
                                 "id": file["id"],
                                 "size": file["size"],
                                 "username": username,
                                 "file_dir": file_dir,
+                                "state": file.get("state", ""),
                             }
         except Exception as e:
             logger.error(f"Error reconciling slskd audiobook task: {e}")
             return None
+        for f in tracked.values():
+            f.pop("state", None)
 
         on_disk = set()
         if self.download_dir and local_dir:

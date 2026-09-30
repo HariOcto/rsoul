@@ -177,6 +177,11 @@ class DownloadOrchestrator:
             logger.warning(f"Failed to start download from {backend.name}")
             return None
 
+        # Timers start when the download is queued, not at the first status poll (which only
+        # happens after every other book in the batch has been searched)
+        now = time.time()
+        task.extra.setdefault("monitor", {}).update({"started_at": now, "last_progress_at": now})
+
         # Add to state for resume functionality
         if self.ctx.state:
             self.ctx.state.add_task(task)
@@ -197,6 +202,7 @@ class DownloadOrchestrator:
         m.setdefault("started_at", now)
         m.setdefault("last_progress_at", now)
         m.setdefault("last_bytes", 0)
+        m.setdefault("last_percent", 0.0)
 
         if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
             return f"Exceeded max_download_time ({self.max_download_time}s)"
@@ -219,21 +225,22 @@ class DownloadOrchestrator:
             if m.get("queued_since") is None:
                 m["queued_since"] = now
             if self.queue_timeout > 0 and now - m["queued_since"] >= self.queue_timeout:
-                return f"Waited more than {self.queue_timeout}s in the peer's upload queue"
+                return f"Waited more than {self.queue_timeout}s in a queue without starting"
             # Waiting in a queue is not a stall
             m["last_progress_at"] = now
             return None
 
         m["queued_since"] = None
-        if task.bytes_transferred < m["last_bytes"]:
-            # The counter went backwards (resumed task tracking fewer files, or slskd restarted a
-            # transfer): treat it as a fresh baseline, not as a stall
-            m["last_bytes"] = task.bytes_transferred
-            m["last_progress_at"] = now
+        # Progress is measured in bytes where the backend reports them (slskd) and in percent
+        # otherwise (Stacks reports only a percentage)
+        bytes_now, percent_now = task.bytes_transferred, task.progress_percent or 0.0
+        if bytes_now < m["last_bytes"] or percent_now < m["last_percent"]:
+            # A counter went backwards (resumed task tracking fewer files, or a transfer was
+            # restarted): treat it as a fresh baseline, not as a stall
+            m["last_bytes"], m["last_percent"], m["last_progress_at"] = bytes_now, percent_now, now
             return None
-        if task.bytes_transferred > m["last_bytes"]:
-            m["last_bytes"] = task.bytes_transferred
-            m["last_progress_at"] = now
+        if bytes_now > m["last_bytes"] or percent_now > m["last_percent"]:
+            m["last_bytes"], m["last_percent"], m["last_progress_at"] = bytes_now, percent_now, now
             return None
 
         if self.stall_timeout > 0 and now - m["last_progress_at"] >= self.stall_timeout:

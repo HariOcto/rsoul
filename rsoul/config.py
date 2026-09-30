@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Dict
 
 from .display import console
+from .media import get_media_mode, unsupported_audiobook_formats, EBOOK
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +144,6 @@ def validate_config(config: configparser.ConfigParser) -> None:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Stacks'")
 
     # Validate media mode early so a typo fails at startup, not mid-run
-    from .media import get_media_mode, unsupported_audiobook_formats, EBOOK
-
     if get_media_mode(config) != EBOOK:
         unsupported = unsupported_audiobook_formats(config)
         if unsupported:

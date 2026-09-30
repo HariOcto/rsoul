@@ -91,7 +91,7 @@ This project is a fork of [Soularr](https://github.com/mrusse/soularr) (original
 | `preferred_formats` | `epub,azw3,mobi` | Preferred ebook formats in priority order |
 | `audiobook_formats` | `m4b,mp3` | Preferred audiobook formats in priority order |
 | `audiobook_min_size_mb` | 10 | Skip audiobook folders smaller than this (filters out samples) |
-| `audiobook_browse_limit` | 5 | Best-matching audiobook folders to browse per search |
+| `audiobook_browse_limit` | 5 | Most audiobook folders tried, best match first, until one can be listed in full |
 | `minimum_filename_match_ratio` | 0.7 | Minimum fuzzy match ratio for filenames |
 | `min_length_ratio` | 0.4 | Reject if string lengths differ too much |
 | `min_jaccard_ratio` | 0.25 | Minimum word overlap ratio |
@@ -130,11 +130,15 @@ Set `media_mode` in `[Search Settings]`:
 How audiobooks are handled:
 
 - **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A single-file audiobook (`.m4b`) can also match on its filename.
-- **Grabbing**: the best-matching folders are browsed so every audio file in the folder is queued, not just the ones that appeared in the search results. If not all files can be queued, the download is cancelled rather than importing an incomplete book.
+- **The author must appear in the folder path** (e.g. `Brandon Sanderson\The Final Empire` or `Brandon Sanderson - The Final Empire`). Titles repeat across authors, so a folder named only after the title is not trusted.
+- **Title forms**: besides the full title, a shorter form can match, such as "The Final Empire" for "Mistborn: The Final Empire". Ebook matching is unchanged.
+- **Only complete folders are downloaded.** Candidates are tried best match first; each is listed in full on the peer's share, and every audio file in it is queued. A folder that can't be listed is skipped, because search results only show some of its files. If not every file can be queued, the download is cancelled.
+- **Multi-disc audiobooks are skipped.** Folders named like `CD1`, `Disc 2` or `Part 3` are one part of a larger book, so they are not downloaded.
 - **Import**: files are moved to `<download_dir>/rsoul_audiobooks/<Author>/<Title>/` and imported with one `DownloadedBooksScan` per book folder. Chaptarr decides from the file extension that they are an audiobook. Ebook metadata validation is not applied to audio files. Use formats Chaptarr can import (e.g. `m4b`, `mp3`, `m4a`, `flac`); R:soul warns at startup about others.
-- **Title matching**: besides the full title, folders may match a shorter form, such as "The Final Empire" for "Mistborn: The Final Empire", but only if the author's surname is in the folder name. Ebook matching is unchanged.
+- **Failed downloads are cleared away**: whatever a failed download left behind (e.g. finished chapters) is moved to `<download_dir>/failed_downloads/`, so it can't mix with a later attempt.
 - **Time limits** are progress-based (see [Download timeouts](#download-timeouts)), so a large audiobook from a slow but steady peer is not cancelled.
-- **Not handled yet**: audiobooks split across subfolders (`CD1`, `CD2`, ...). Only the files directly in the matched folder are downloaded.
+
+**slskd download folder layout.** R:soul expects slskd's default layout, where each file lands in `<download_dir>/<name of the peer's folder>/`, i.e. `transfers.download.destination.subdirectory` left at `${SOURCE_DIRECTORY}`. Downloads from different peers whose folders have the same name share one local folder, and slskd renames a new file if its name is taken. R:soul therefore won't start a download whose files already exist in, or are still downloading into, the same local folder; it retries on a later run.
 
 ## Download timeouts
 
@@ -146,23 +150,29 @@ Downloads are judged on their own progress, and all of them run in parallel:
 | `queue_timeout` | `[Download Settings]` | 3600 | The download waited this long in the peer's upload queue |
 | `max_download_time` | `[Download Settings]` | 86400 | Overall safety cap, including queue time |
 
-`0` disables a limit. Two situations pause the stall and queue timers, because they aren't the peer's fault:
+Progress means new bytes (slskd) or a higher percentage (Stacks, which reports only a percentage). `0` disables a limit. Two situations pause the stall and queue timers, because they aren't the peer's fault:
 
 - waiting for your own slskd download slots ("Queued, Locally");
 - slskd not answering (for example while it restarts).
 
-The overall cap still applies in both cases.
+The overall cap still applies in both cases. Timers start when a download is queued.
+
+Imports run on a background thread, so the other downloads keep being monitored while Readarr or Chaptarr imports a finished one. A download only counts as successful in the run summary once its import succeeded.
 
 ### Hand-off between runs
 
 By default a run waits until every download has finished, so one slow download holds up the next search. Set `monitor_window` in `[Download Settings]` (seconds) to cap how long a run monitors: unfinished downloads keep going in slskd, their progress timers are saved, and the next run continues monitoring them while also searching for new books. Books still downloading are not searched again.
+
+Each run can add up to `number_of_books_to_grab` new downloads. To keep slow downloads from piling up, set `max_active_downloads`: the most downloads running at once, including the ones handed over from earlier runs.
 
 ## Upgrading from earlier versions
 
 - **Timeouts changed.** `stalled_timeout` (a fixed total time per download) and `remote_queue_timeout` are no longer used; R:soul logs a warning if they are still in your `config.ini`. Remove them and, if needed, set `stall_timeout`, `queue_timeout` and `max_download_time` in `[Download Settings]`. `remote_queue_timeout` was never actually applied before, so it is ignored rather than switched on: the old sample value of 300 would otherwise cancel most queued downloads after five minutes.
 - **Downloads can now run longer.** A download that keeps receiving data is no longer cancelled after an hour; only the 24-hour cap applies.
 - **Resume drops unrecoverable downloads.** Saved downloads that can't be found in slskd or on disk are removed from the resume state instead of staying there forever.
-- **Everything else is opt-in.** `media_mode` defaults to `ebook` and `monitor_window` to `0`.
+- **The run summary is stricter.** A download whose import fails is now reported as failed instead of successful.
+- **Busy local folders are left alone.** A download is not started if files with the same names are already in, or still downloading into, its local slskd folder.
+- **Everything else is opt-in.** `media_mode` defaults to `ebook`, `monitor_window` to `0` and `max_active_downloads` to `0` (no limit).
 
 ## Resume Functionality
 

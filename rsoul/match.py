@@ -346,8 +346,11 @@ def audiobook_folder_match(
     min_word_overlap: int = 2,
     min_title_jaccard: float = 0.3,
     min_author_jaccard: float = 0.5,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Match an audiobook against one user's search results, folder by folder.
+
+    If `stats` is given, counts of what was found and why folders were rejected are added to it.
 
     Audiobooks usually arrive as a folder of chapter files ("01.mp3", "02.mp3"...)
     whose names say nothing about the book, so the folder name is matched instead.
@@ -373,11 +376,19 @@ def audiobook_folder_match(
         ext = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
         if ext in allowed:
             groups.setdefault((directory, ext), []).append(slskd_file)
+        elif stats is not None:
+            stats["files in other formats"] = stats.get("files in other formats", 0) + 1
+
+    def note(reason: str, directory: str) -> None:
+        if stats is not None:
+            stats[reason] = stats.get(reason, 0) + 1
+        logger.debug(f"Audiobook folder rejected ({reason}): {directory} from {username}")
 
     best_per_ext: Dict[str, Dict[str, Any]] = {}
     for (directory, ext), files in groups.items():
         if is_disc_folder(directory):
             logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
+            note("disc/part folders", directory)
             continue
 
         # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
@@ -385,6 +396,7 @@ def audiobook_folder_match(
         # single-file book, the filename). This also rules out other books with the same title.
         path_text = directory + (" " + split_slskd_path(files[0]["filename"])[1] if len(files) == 1 else "")
         if not author_in_name(author_name, path_text):
+            note("folders without the author's surname", directory)
             continue
 
         best_score = None
@@ -405,6 +417,7 @@ def audiobook_folder_match(
                     best_score = score
 
         if best_score is None or best_score < minimum_match_ratio:
+            note("folders not matching the title", directory)
             continue
 
         candidate = {

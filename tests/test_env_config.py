@@ -177,3 +177,53 @@ def test_folder_with_unfinished_foreign_download_is_avoided(tmp_path):
     backend, _ = slskd_task(tmp_path, ListClient(records))
     clashes = backend._local_clashes("@@p\\Mistborn", [{"filename": "@@p\\Mistborn\\01.mp3"}])
     assert clashes == ["cover.jpg"]
+
+
+# ---------------------------------------------------------------------------
+# Search without author initials; explain why no audiobook folder matched
+# ---------------------------------------------------------------------------
+
+
+def test_strip_initials():
+    from rsoul.backends.slskd_backend import _strip_initials
+
+    assert _strip_initials("Christopher G. Nuttall") == "Christopher Nuttall"
+    assert _strip_initials("J.R.R. Tolkien") == "Tolkien"
+    assert _strip_initials("Brandon Sanderson") == "Brandon Sanderson"
+
+
+def test_search_tries_author_without_initials(monkeypatch):
+    from rsoul.backends import slskd_backend
+    from rsoul.backends.base import DownloadTarget
+
+    queries = []
+    monkeypatch.setattr(slskd_backend, "_execute_search", lambda ctx, query, label: (queries.append(query) or ([], None)))
+    config = configparser.ConfigParser()
+    config["Slskd"] = {"download_dir": "/downloads", "delete_searches": "False"}
+    config["Search Settings"] = {"max_search_fallbacks": "1"}
+    backend = SlskdBackend(Context(config=config, slskd=object(), readarr=None))
+    target = DownloadTarget(1, "A Savage War Of Peace", "Christopher G. Nuttall", "", ["mp3"], {"title": "A Savage War Of Peace", "id": 1}, {"authorName": "Christopher G. Nuttall"}, media_type="audiobook")
+
+    backend.search(target)
+
+    assert queries[:2] == ["Christopher G. Nuttall - A Savage War Of Peace", "Christopher Nuttall - A Savage War Of Peace"]
+
+
+def test_no_match_is_explained(caplog):
+    import logging
+
+    config = configparser.ConfigParser()
+    config["Slskd"] = {"download_dir": "/downloads"}
+    config["Search Settings"] = {"minimum_filename_match_ratio": "0.7"}
+    backend = SlskdBackend(Context(config=config, slskd=object(), readarr=None))
+    from rsoul.backends.base import DownloadTarget
+
+    target = DownloadTarget(1, "A Savage War Of Peace", "Christopher G. Nuttall", "", ["m4b", "mp3"], {"title": "A Savage War Of Peace", "id": 1}, {"authorName": "Christopher G. Nuttall"}, media_type="audiobook")
+    files = [
+        {"filename": "@@u\\\\Books\\\\Christopher Nuttall - A Savage War of Peace.epub", "size": 1},
+        {"filename": "@@u\\\\Audio\\\\A Savage War of Peace\\\\01.mp3", "size": 1},
+    ]
+    with caplog.at_level(logging.INFO):
+        assert backend._match_audiobook_results(target, {"book": target.readarr_book, "author": target.readarr_author}, [{"username": "u", "files": files}]) == []
+    assert "files in other formats: 1" in caplog.text
+    assert "folders without the author's surname: 1" in caplog.text

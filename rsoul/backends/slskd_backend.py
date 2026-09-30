@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
@@ -47,6 +48,12 @@ def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks:
             queries.append(f"{first_name} - {remaining}")
 
     return queries[:max_fallbacks]
+
+
+def _strip_initials(author_name: str) -> str:
+    """"Christopher G. Nuttall" -> "Christopher Nuttall"; "J.R.R. Tolkien" -> "Tolkien"."""
+    words = [w for w in author_name.split() if not re.fullmatch(r"(?:[A-Za-z]\.)+|[A-Za-z]", w)]
+    return " ".join(words)
 
 
 def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[Dict[str, Any]], str]:
@@ -129,6 +136,12 @@ class SlskdBackend(DownloadBackend):
         # Build queries
         queries = []
         queries.append(f"{author_name} - {book_title}")
+
+        # Initials ("Christopher G. Nuttall") make a search stricter than most file and folder
+        # names, which usually leave them out: also try the name without them
+        author_no_initials = _strip_initials(author_name)
+        if author_no_initials and author_no_initials != author_name:
+            queries.append(f"{author_no_initials} - {book_title}")
 
         if ":" in book_title:
             main_title = book_title.split(":")[0].strip()
@@ -276,12 +289,19 @@ class SlskdBackend(DownloadBackend):
         allowed = [ext.split(" ")[0].lower() for ext in target.allowed_filetypes]
 
         candidates = []
+        stats: Dict[str, int] = {}
         for result in search_results:
             username = result["username"]
             if self.ctx.history and self.ctx.history.is_failed(username, book_title):
+                stats["skipped (failed before)"] = stats.get("skipped (failed before)", 0) + 1
                 continue
-            for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, **thresholds):
+            for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, stats=stats, **thresholds):
                 candidates.append((username, match))
+
+        if not candidates:
+            # Say why nothing matched; otherwise "N files found" followed by "no results" is a puzzle
+            summary = ", ".join(f"{reason}: {count}" for reason, count in sorted(stats.items())) or "no files"
+            logger.info(f"No audiobook folder matched '{book_title}' ({summary})")
 
         # Best name match first, then the configured format order, then the largest folder
         candidates.sort(key=lambda c: (-c[1]["score"], allowed.index(c[1]["extension"]), -c[1]["total_size"]))

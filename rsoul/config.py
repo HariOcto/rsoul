@@ -142,6 +142,11 @@ def validate_config(config: configparser.ConfigParser) -> None:
             if key not in config["Stacks"]:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Stacks'")
 
+    # Validate media mode early so a typo fails at startup, not mid-run
+    from .media import get_media_mode
+
+    get_media_mode(config)
+
     # Validate priority list references only known backends
     if "Backends" in config:
         priority_str = config.get("Backends", "priority", fallback="slskd")

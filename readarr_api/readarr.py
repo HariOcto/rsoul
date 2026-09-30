@@ -123,6 +123,7 @@ class ReadarrAPI(BaseArrAPI):
         page_size: Optional[int] = None,
         sort_key: Optional[ReadarrSortKeys] = None,
         sort_dir: Optional[PyarrSortDirection] = None,
+        media_type: Optional[str] = None,
     ) -> JsonObject:
         """Gets missing episode (episodes without files)
 
@@ -145,6 +146,9 @@ class ReadarrAPI(BaseArrAPI):
             params["sortDirection"] = sort_dir
         elif sort_key or sort_dir:
             raise PyarrMissingArgument("sort_key and sort_dir  must be used together")
+        if media_type:
+            # Chaptarr extension: "ebook" or "audiobook". Readarr ignores unknown query params.
+            params["mediaType"] = media_type
         return self._get("wanted/missing", self.ver_uri, params)
 
     # GET /wanted/cutoff
@@ -155,6 +159,7 @@ class ReadarrAPI(BaseArrAPI):
         sort_key: Optional[ReadarrSortKeys] = None,
         sort_dir: Optional[PyarrSortDirection] = None,
         monitored: bool | None = None,
+        media_type: Optional[str] = None,
     ) -> JsonObject:
         """Get wanted items where the cutoff is unmet
 
@@ -180,6 +185,9 @@ class ReadarrAPI(BaseArrAPI):
             raise PyarrMissingArgument("sort_key and sort_dir  must be used together")
         if monitored:
             params["monitored"] = monitored
+        if media_type:
+            # Chaptarr extension: "ebook" or "audiobook". Readarr ignores unknown query params.
+            params["mediaType"] = media_type
         return self._get("wanted/cutoff", self.ver_uri, params)
 
     ## QUEUE

@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 from .utils import get_current_page, update_current_page
 from .types import Book
+from .media import get_media_mode, api_media_filter
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,15 @@ def get_books(ctx: "Context", search_source: str, search_type: str, page_size: i
     """Get books from Readarr based on search source and type."""
     current_page_file_path = os.path.join(ctx.config_dir, ".current_page.txt")
 
-    api_method = ctx.readarr.get_missing if search_source == "missing" else ctx.readarr.get_cutoff
+    base_method = ctx.readarr.get_missing if search_source == "missing" else ctx.readarr.get_cutoff
+
+    # Chaptarr: restrict the wanted list to ebooks or audiobooks unless media_mode = both
+    media_filter = api_media_filter(get_media_mode(ctx.config))
+
+    def api_method(**kwargs):
+        if media_filter:
+            kwargs["media_type"] = media_filter
+        return base_method(**kwargs)
 
     try:
         wanted = api_method(page_size=page_size, sort_dir="ascending", sort_key="title")

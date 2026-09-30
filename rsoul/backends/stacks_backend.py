@@ -331,6 +331,10 @@ class StacksBackend(DownloadBackend):
 
     def search(self, target: DownloadTarget) -> List[SearchResult]:
         """Search Anna's Archive by ISBN13, then fallback to Author - Title search."""
+        if getattr(target, "media_type", "ebook") == "audiobook":
+            logger.debug(f"Stacks only handles ebooks - skipping audiobook: {target.book_title}")
+            return []
+
         primary_isbn = target.get_primary_isbn13()
         all_isbns = target.get_isbn13s()
 

@@ -395,6 +395,57 @@ def organize_file(source_path: str, target_folder: str, filename: str, original_
         return False
 
 
+# Audiobooks are staged in their own subfolder of the download dir, one folder per book,
+# so an ebook import scan of an author folder never picks up a half-organised audiobook.
+AUDIOBOOK_STAGING_DIR = "rsoul_audiobooks"
+
+
+def organize_audiobook(book_download: dict, local_download_dir: str) -> tuple:
+    """Move a completed audiobook folder into <staging>/<Author>/<Title>/.
+
+    Returns:
+        (relative_import_folder, None) on success, or (None, reason) on failure.
+    """
+    folder = book_download["dir"]
+    source_dir = os.path.join(local_download_dir, folder)
+    expected = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
+
+    if not expected:
+        return None, "No audiobook files recorded for this download"
+
+    missing = [name for name in expected if not os.path.exists(os.path.join(source_dir, name))]
+    if missing:
+        return None, f"{len(missing)} of {len(expected)} audiobook files missing in {source_dir}"
+
+    author_folder = sanitize_folder_name(book_download["author_name"])
+    title_folder = sanitize_folder_name(book_download["title"]) or f"book_{book_download.get('bookId', 'unknown')}"
+    relative = os.path.join(AUDIOBOOK_STAGING_DIR, author_folder, title_folder)
+
+    target_dir = os.path.join(local_download_dir, relative)
+    counter = 2
+    while os.path.exists(target_dir) and os.listdir(target_dir):
+        relative = os.path.join(AUDIOBOOK_STAGING_DIR, author_folder, f"{title_folder} ({counter})")
+        target_dir = os.path.join(local_download_dir, relative)
+        counter += 1
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        for name in expected:
+            shutil.move(os.path.join(source_dir, name), os.path.join(target_dir, name))
+        logger.info(f"Moved {len(expected)} audiobook files to {target_dir}")
+    except Exception as e:
+        return None, f"Failed to organize audiobook: {e}"
+
+    # Clean up the source folder if nothing else is left in it
+    try:
+        if os.path.abspath(source_dir) != os.path.abspath(local_download_dir) and os.path.isdir(source_dir) and not os.listdir(source_dir):
+            shutil.rmtree(source_dir)
+    except OSError as e:
+        logger.warning(f"Could not remove source directory {source_dir}: {e}")
+
+    return relative, None
+
+
 def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folders: list) -> list:
     """
     Trigger Readarr scan commands for processed author folders.
@@ -548,6 +599,23 @@ def process_imports(ctx: Any, grab_list: list):
         author_folders = set()
 
         for book_download in items:
+            if book_download.get("media_type") == "audiobook":
+                # Whole folder of audio files: no per-file metadata validation, one import per book folder
+                book_title = book_download.get("title", "")
+                source_id = book_download.get("source_id", book_download.get("username", ""))
+                logger.info(f"Processing audiobook: {book_title}")
+                relative, reason = organize_audiobook(book_download, local_download_dir)
+                if relative:
+                    author_folders.add(relative)
+                else:
+                    logger.warning(f"Audiobook failed: {book_title} - {reason}")
+                    source_dir = os.path.join(local_download_dir, book_download.get("dir", ""))
+                    if book_download.get("dir") and os.path.isdir(source_dir):
+                        move_failed_import(source_dir, local_download_dir)
+                    if ctx.history and source_id and book_title:
+                        ctx.history.add_failure(source_id, book_title, reason or "Audiobook import failed")
+                continue
+
             try:
                 author_name = book_download["author_name"]
                 author_name_sanitized = sanitize_folder_name(author_name)

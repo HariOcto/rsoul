@@ -16,6 +16,7 @@ from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
 from rsoul.workflow import run_workflow
 from rsoul.search import get_books
+from rsoul.media import get_media_mode
 from rsoul.history import HistoryManager
 from rsoul.state import StateManager
 from rsoul.backends import create_backends_from_config
@@ -98,6 +99,9 @@ def main():
             search_sources = ["missing", "cutoff_unmet"]
 
         page_size = config.getint("Search Settings", "number_of_books_to_grab", fallback=10)
+
+        media_mode = get_media_mode(config)
+        logger.info(f"Media mode: {media_mode}")
 
         # Initialize Clients
         slskd = None

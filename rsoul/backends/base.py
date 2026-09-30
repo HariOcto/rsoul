@@ -95,6 +95,13 @@ class DownloadTarget:
     # Editions from Readarr (contains ISBNs, ASINs, etc.)
     editions: List[Dict[str, Any]] = field(default_factory=list)
 
+    # "ebook" (single file) or "audiobook" (whole folder of audio files)
+    media_type: str = "ebook"
+
+    @property
+    def is_audiobook(self) -> bool:
+        return self.media_type == "audiobook"
+
     def get_isbn13s(self) -> List[str]:
         """Extract all ISBN-13s from editions.
 

@@ -87,7 +87,11 @@ This project is a fork of [Soularr](https://github.com/mrusse/soularr) (original
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `media_mode` | `ebook` | `ebook`, `audiobook`, or `both` (see [Audiobooks & Chaptarr](#audiobooks--chaptarr)) |
 | `preferred_formats` | `epub,azw3,mobi` | Preferred ebook formats in priority order |
+| `audiobook_formats` | `m4b,mp3` | Preferred audiobook formats in priority order |
+| `audiobook_min_size_mb` | 10 | Skip audiobook folders smaller than this (filters out samples) |
+| `audiobook_browse_limit` | 5 | Best-matching audiobook folders to browse per search |
 | `minimum_filename_match_ratio` | 0.7 | Minimum fuzzy match ratio for filenames |
 | `min_length_ratio` | 0.4 | Reject if string lengths differ too much |
 | `min_jaccard_ratio` | 0.25 | Minimum word overlap ratio |
@@ -108,6 +112,28 @@ This project is a fork of [Soularr](https://github.com/mrusse/soularr) (original
 | `match_ratio_loose` | 0.85 | Loose match (brackets removed) threshold |
 | `match_ratio_jaccard` | 0.5 | Jaccard token similarity threshold |
 | `skip_validation` | `False` | Skip all metadata validation (let Readarr handle it) |
+
+## Audiobooks & Chaptarr
+
+R:soul also works with [Chaptarr](https://github.com/Chaptarr/chaptarr), a Readarr fork that manages ebooks and audiobooks in one instance. Chaptarr exposes a Readarr-compatible API, so the `[Readarr]` section simply points at your Chaptarr instance.
+
+Set `media_mode` in `[Search Settings]`:
+
+| Mode | Wanted list | What gets downloaded |
+|------|-------------|----------------------|
+| `ebook` (default) | Ebooks only (Chaptarr); everything (Readarr) | One file per book, as before |
+| `audiobook` | Audiobooks only (Chaptarr); everything (Readarr) | The whole matching folder of audio files |
+| `both` | Everything | Decided per book from Chaptarr's `mediaType` field |
+
+`ebook` and `audiobook` also work with a plain Readarr instance that holds only one media type. `both` needs Chaptarr; books without a `mediaType` field are treated as ebooks.
+
+How audiobooks are handled:
+
+- **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A single-file audiobook (`.m4b`) can also match on its filename.
+- **Grabbing**: the best-matching folders are browsed so every audio file in the folder is queued, not just the ones that appeared in the search results. If not all files can be queued, the download is cancelled rather than importing an incomplete book.
+- **Import**: files are moved to `<download_dir>/rsoul_audiobooks/<Author>/<Title>/` and imported with one `DownloadedBooksScan` per book folder. Ebook metadata validation is not applied to audio files.
+- **Time limit**: whole audiobooks are large, so they use `audiobook_stalled_timeout` in `[Slskd]` (default 4 hours) instead of `stalled_timeout`.
+- **Not handled yet**: audiobooks split across subfolders (`CD1`, `CD2`, ...). Only the files directly in the matched folder are downloaded.
 
 ## Resume Functionality
 

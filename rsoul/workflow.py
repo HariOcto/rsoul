@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 from .display import print_section_header, print_run_summary
 from .backends import DownloadTarget, DownloadTask, DownloadStatus
+from .media import get_media_mode, resolve_book_media_type, get_formats
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ def task_to_grab_item(task: DownloadTask, download_dir: str) -> Dict[str, Any]:
         "files": task.extra.get("files", []),
         "seriesTitle": task.series_title,
         "backend_name": task.backend_name,  # Added to identify source backend
+        "media_type": task.extra.get("media_type", "ebook"),
+        "expected_files": task.extra.get("expected_files", []),
     }
 
 
@@ -98,18 +101,16 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         print_section_header("STARTING BATCH SEARCH PHASE")
 
         batch_targets: List[DownloadTarget] = []
+        media_mode = get_media_mode(ctx.config)
 
         # Prepare targets
         for target_dict in download_targets:
             book = target_dict["book"]
             author = target_dict["author"]
 
-            # Get allowed filetypes from config (priority order)
-            filetypes_str = ctx.config.get("Search Settings", "preferred_formats", fallback="epub,azw3,mobi")
-            filetypes = [f.strip().lower() for f in filetypes_str.split(",") if f.strip()]
-
-            if not filetypes:
-                filetypes = ["epub", "azw3", "mobi"]
+            # Ebook or audiobook decides the formats (priority order) and how results are grabbed
+            media_type = resolve_book_media_type(book, media_mode)
+            filetypes = get_formats(ctx.config, media_type)
 
             # Fetch editions for this book (contains ISBNs, ASINs, etc.)
             try:
@@ -127,6 +128,7 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
                 readarr_book=book,
                 readarr_author=author,
                 editions=editions,
+                media_type=media_type,
             )
 
             batch_targets.append(target)

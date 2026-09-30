@@ -29,6 +29,115 @@ def check_ratio(separator: str, ratio: float, book_filename: str, slskd_filename
     return ratio
 
 
+def score_name(
+    book_title: str,
+    author_name: str,
+    candidate: str,
+    minimum_match_ratio: float,
+    min_length_ratio: float = 0.4,
+    min_jaccard_ratio: float = 0.25,
+    min_word_overlap: int = 2,
+    min_title_jaccard: float = 0.3,
+    min_author_jaccard: float = 0.5,
+    display_name: Optional[str] = None,
+) -> Optional[float]:
+    """Score one candidate name (filename without extension, or a folder name) against a book.
+
+    Applies the same pre-filters and fuzzy patterns as book_match. Returns the
+    best similarity ratio, or None if a pre-filter rejects the candidate.
+    Thresholding against minimum_match_ratio is left to the caller.
+    """
+    slskd_filename = candidate
+    slskd_filename_full = display_name or candidate
+
+    # Build expected filename pattern for pre-filter comparison (without extension)
+    expected_pattern = f"{book_title} - {author_name}"
+
+    # Pre-filter 1: Length ratio gate
+    len_ratio = length_ratio(expected_pattern, slskd_filename)
+    if len_ratio < min_length_ratio:
+        logger.debug(f"Skipping {slskd_filename_full}: length ratio {len_ratio:.2f} < {min_length_ratio}")
+        return None
+
+    # Pre-filter 2: Jaccard token overlap
+    jaccard_score, overlap_count, _ = jaccard_similarity(expected_pattern, slskd_filename)
+    if jaccard_score < min_jaccard_ratio:
+        logger.debug(f"Skipping {slskd_filename_full}: Jaccard {jaccard_score:.2f} < {min_jaccard_ratio}")
+        return None
+
+    # Pre-filter 3: Minimum word overlap
+    if overlap_count < min_word_overlap:
+        logger.debug(f"Skipping {slskd_filename_full}: word overlap {overlap_count} < {min_word_overlap}")
+        return None
+
+    # Pre-filter 4: Component-wise matching (author vs author, title vs title)
+    found_part1, found_part2 = extract_author_title(slskd_filename)
+
+    if found_part2:  # Only apply if we found a separator
+        # Try both orderings: "Author - Title" and "Title - Author"
+        author_as_p1 = jaccard_similarity(author_name, found_part1)[0]
+        title_as_p2 = jaccard_similarity(book_title, found_part2)[0]
+        score_order1 = min(author_as_p1, title_as_p2)  # Author-Title order
+
+        author_as_p2 = jaccard_similarity(author_name, found_part2)[0]
+        title_as_p1 = jaccard_similarity(book_title, found_part1)[0]
+        score_order2 = min(author_as_p2, title_as_p1)  # Title-Author order
+
+        # Use the better ordering
+        if score_order1 >= score_order2:
+            author_score, title_score = author_as_p1, title_as_p2
+        else:
+            author_score, title_score = author_as_p2, title_as_p1
+
+        # Both components must meet their thresholds
+        if author_score < min_author_jaccard:
+            logger.debug(f"Skipping {slskd_filename_full}: author Jaccard {author_score:.2f} < {min_author_jaccard}")
+            return None
+
+        if title_score < min_title_jaccard:
+            logger.debug(f"Skipping {slskd_filename_full}: title Jaccard {title_score:.2f} < {min_title_jaccard}")
+            return None
+
+        logger.debug(f"Component match passed: author={author_score:.2f}, title={title_score:.2f}")
+
+    logger.info(f"Checking ratio on {slskd_filename_full} vs wanted {book_title} - {author_name}")
+
+    # Mandatory requirement: Title must be contained in the filename
+    if not title_contained_in_filename(book_title, slskd_filename):
+        logger.debug(f"Skipping {slskd_filename_full}: Title '{book_title}' not found in filename")
+        return None
+
+    # Try multiple filename patterns for matching
+    patterns_to_try = [
+        f"{book_title} - {author_name}",
+        f"{author_name} - {book_title}",
+        f"{book_title}",
+        f"{author_name} {book_title}",
+    ]
+
+    max_ratio = 0.0
+
+    for pattern in patterns_to_try:
+        # Direct ratio
+        ratio = difflib.SequenceMatcher(None, pattern, slskd_filename).ratio()
+        max_ratio = max(max_ratio, ratio)
+
+        # Try with normalized strings for better matching
+        normalized_pattern = normalize_for_matching(pattern)
+        normalized_filename = normalize_for_matching(slskd_filename)
+        normalized_ratio = difflib.SequenceMatcher(None, normalized_pattern, normalized_filename).ratio()
+        max_ratio = max(max_ratio, normalized_ratio)
+
+        # Try with different separators
+        ratio = check_ratio(" ", ratio, pattern, slskd_filename, minimum_match_ratio)
+        max_ratio = max(max_ratio, ratio)
+
+        ratio = check_ratio("_", ratio, pattern, slskd_filename, minimum_match_ratio)
+        max_ratio = max(max_ratio, ratio)
+
+    return max_ratio
+
+
 def book_match(
     target: Dict[str, Any],
     slskd_files: List[Dict[str, Any]],
@@ -89,93 +198,20 @@ def book_match(
         # Remove extension for matching to prevent "epub" from inflating scores
         slskd_filename = slskd_filename_full.rsplit(".", 1)[0] if "." in slskd_filename_full else slskd_filename_full
 
-        # Build expected filename pattern for pre-filter comparison (without extension)
-        expected_pattern = f"{book_title} - {author_name}"
-
-        # Pre-filter 1: Length ratio gate
-        len_ratio = length_ratio(expected_pattern, slskd_filename)
-        if len_ratio < min_length_ratio:
-            logger.debug(f"Skipping {slskd_filename_full}: length ratio {len_ratio:.2f} < {min_length_ratio}")
+        final_ratio = score_name(
+            book_title,
+            author_name,
+            slskd_filename,
+            minimum_match_ratio,
+            min_length_ratio=min_length_ratio,
+            min_jaccard_ratio=min_jaccard_ratio,
+            min_word_overlap=min_word_overlap,
+            min_title_jaccard=min_title_jaccard,
+            min_author_jaccard=min_author_jaccard,
+            display_name=slskd_filename_full,
+        )
+        if final_ratio is None:
             continue
-
-        # Pre-filter 2: Jaccard token overlap
-        jaccard_score, overlap_count, _ = jaccard_similarity(expected_pattern, slskd_filename)
-        if jaccard_score < min_jaccard_ratio:
-            logger.debug(f"Skipping {slskd_filename_full}: Jaccard {jaccard_score:.2f} < {min_jaccard_ratio}")
-            continue
-
-        # Pre-filter 3: Minimum word overlap
-        if overlap_count < min_word_overlap:
-            logger.debug(f"Skipping {slskd_filename_full}: word overlap {overlap_count} < {min_word_overlap}")
-            continue
-
-        # Pre-filter 4: Component-wise matching (author vs author, title vs title)
-        found_part1, found_part2 = extract_author_title(slskd_filename)
-
-        if found_part2:  # Only apply if we found a separator
-            # Try both orderings: "Author - Title" and "Title - Author"
-            # Calculate scores for both interpretations
-            author_as_p1 = jaccard_similarity(author_name, found_part1)[0]
-            title_as_p2 = jaccard_similarity(book_title, found_part2)[0]
-            score_order1 = min(author_as_p1, title_as_p2)  # Author-Title order
-
-            author_as_p2 = jaccard_similarity(author_name, found_part2)[0]
-            title_as_p1 = jaccard_similarity(book_title, found_part1)[0]
-            score_order2 = min(author_as_p2, title_as_p1)  # Title-Author order
-
-            # Use the better ordering
-            if score_order1 >= score_order2:
-                author_score, title_score = author_as_p1, title_as_p2
-            else:
-                author_score, title_score = author_as_p2, title_as_p1
-
-            # Both components must meet their thresholds
-            if author_score < min_author_jaccard:
-                logger.debug(f"Skipping {slskd_filename_full}: author Jaccard {author_score:.2f} < {min_author_jaccard}")
-                continue
-
-            if title_score < min_title_jaccard:
-                logger.debug(f"Skipping {slskd_filename_full}: title Jaccard {title_score:.2f} < {min_title_jaccard}")
-                continue
-
-            logger.debug(f"Component match passed: author={author_score:.2f}, title={title_score:.2f}")
-
-        logger.info(f"Checking ratio on {slskd_filename_full} vs wanted {book_title} - {author_name}")
-
-        # Mandatory requirement: Title must be contained in the filename
-        if not title_contained_in_filename(book_title, slskd_filename):
-            logger.debug(f"Skipping {slskd_filename_full}: Title '{book_title}' not found in filename")
-            continue
-
-        # Try multiple filename patterns for matching
-        patterns_to_try = [
-            f"{book_title} - {author_name}",
-            f"{author_name} - {book_title}",
-            f"{book_title}",
-            f"{author_name} {book_title}",
-        ]
-
-        max_ratio = 0.0
-
-        for pattern in patterns_to_try:
-            # Direct ratio
-            ratio = difflib.SequenceMatcher(None, pattern, slskd_filename).ratio()
-            max_ratio = max(max_ratio, ratio)
-
-            # Try with normalized strings for better matching
-            normalized_pattern = normalize_for_matching(pattern)
-            normalized_filename = normalize_for_matching(slskd_filename)
-            normalized_ratio = difflib.SequenceMatcher(None, normalized_pattern, normalized_filename).ratio()
-            max_ratio = max(max_ratio, normalized_ratio)
-
-            # Try with different separators
-            ratio = check_ratio(" ", ratio, pattern, slskd_filename, minimum_match_ratio)
-            max_ratio = max(max_ratio, ratio)
-
-            ratio = check_ratio("_", ratio, pattern, slskd_filename, minimum_match_ratio)
-            max_ratio = max(max_ratio, ratio)
-
-        final_ratio = max_ratio
 
         if final_ratio > best_match:
             logger.info(f"New best match found! Ratio: {final_ratio:.3f}")
@@ -195,3 +231,131 @@ def book_match(
         return current_match
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Audiobook folder matching
+# ---------------------------------------------------------------------------
+
+# Bracketed segments like "[Narrator]", "(Unabridged)", "{2006}"
+_BRACKETED = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}")
+# Release noise common in audiobook folder names
+_AUDIOBOOK_NOISE = re.compile(
+    r"\b(?:unabridged|abridged|audiobook|audio\s*book|hoerbuch|h\u00f6rbuch|retail|"
+    r"mp3|m4b|m4a|aac|flac|\d{2,3}\s?k(?:bps)?|\d{2,3}\s?kbit|vbr|cbr)\b",
+    re.IGNORECASE,
+)
+
+
+def split_slskd_path(path: str) -> tuple:
+    """Split a Soulseek path (Windows-style backslashes) into (directory, basename)."""
+    if "\\" in path:
+        directory, basename = path.rsplit("\\", 1)
+        return directory, basename
+    return "", path
+
+
+def clean_audiobook_name(name: str) -> str:
+    """Strip bracketed segments and release noise from an audiobook folder/file name."""
+    cleaned = _BRACKETED.sub(" ", name)
+    cleaned = _AUDIOBOOK_NOISE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Remove separators left dangling at either end ("Author - Title -")
+    cleaned = re.sub(r"^[\s\-_.,]+|[\s\-_.,]+$", "", cleaned)
+    return cleaned
+
+
+def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[str]:
+    """Names to match an audiobook folder on: leaf folder, parent + leaf, and the
+    file name itself when the folder holds a single file (e.g. one .m4b)."""
+    parts = [p for p in directory.split("\\") if p]
+    raw: List[str] = []
+    if parts:
+        raw.append(parts[-1])
+        if len(parts) >= 2:
+            raw.append(f"{parts[-2]} - {parts[-1]}")
+    if len(files) == 1:
+        basename = split_slskd_path(files[0]["filename"])[1]
+        raw.append(basename.rsplit(".", 1)[0] if "." in basename else basename)
+
+    candidates: List[str] = []
+    for name in raw:
+        for variant in (name, clean_audiobook_name(name)):
+            if variant and variant not in candidates:
+                candidates.append(variant)
+    return candidates
+
+
+def audiobook_folder_match(
+    target: Dict[str, Any],
+    slskd_files: List[Dict[str, Any]],
+    username: str,
+    allowed_filetypes: List[str],
+    ignored_users: List[str],
+    minimum_match_ratio: float,
+    min_length_ratio: float = 0.4,
+    min_jaccard_ratio: float = 0.25,
+    min_word_overlap: int = 2,
+    min_title_jaccard: float = 0.3,
+    min_author_jaccard: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Match an audiobook against one user's search results, folder by folder.
+
+    Audiobooks usually arrive as a folder of chapter files ("01.mp3", "02.mp3"...)
+    whose names say nothing about the book, so the folder name is matched instead.
+    Files are grouped by (folder, extension); every group scoring at least
+    minimum_match_ratio is returned, best first per extension.
+
+    Returns:
+        List of dicts: directory, extension, files, score, total_size.
+    """
+    if username in ignored_users:
+        return []
+
+    book_title = target["book"]["title"]
+    author_name = target["author"]["authorName"]
+    allowed = [ext.split(" ")[0].lower() for ext in allowed_filetypes]
+
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for slskd_file in slskd_files:
+        directory, basename = split_slskd_path(slskd_file["filename"])
+        ext = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
+        if ext in allowed:
+            groups.setdefault((directory, ext), []).append(slskd_file)
+
+    best_per_ext: Dict[str, Dict[str, Any]] = {}
+    for (directory, ext), files in groups.items():
+        best_score = None
+        for name in folder_name_candidates(directory, files):
+            score = score_name(
+                book_title,
+                author_name,
+                name,
+                minimum_match_ratio,
+                min_length_ratio=min_length_ratio,
+                min_jaccard_ratio=min_jaccard_ratio,
+                min_word_overlap=min_word_overlap,
+                min_title_jaccard=min_title_jaccard,
+                min_author_jaccard=min_author_jaccard,
+            )
+            if score is not None and (best_score is None or score > best_score):
+                best_score = score
+
+        if best_score is None or best_score < minimum_match_ratio:
+            continue
+
+        candidate = {
+            "directory": directory,
+            "extension": ext,
+            "files": files,
+            "score": best_score,
+            "total_size": sum(f.get("size", 0) for f in files),
+        }
+        current = best_per_ext.get(ext)
+        if current is None or (candidate["score"], candidate["total_size"]) > (current["score"], current["total_size"]):
+            best_per_ext[ext] = candidate
+
+    matches = sorted(best_per_ext.values(), key=lambda c: (allowed.index(c["extension"]), -c["score"]))
+    for match in matches:
+        logger.info(f"Audiobook folder match: {match['directory']} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
+    return matches

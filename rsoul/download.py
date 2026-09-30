@@ -44,16 +44,20 @@ def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], f
                                     file_details["size"] = file["size"]
                                     downloads.append(file_details)
 
-                # If we found downloads, return them immediately
-                if downloads:
+                # Return as soon as every requested file shows up in the transfer list.
+                # (Multi-file audiobook folders can take a moment to register fully.)
+                if downloads and len(downloads) >= len(files):
                     return downloads
 
             except Exception:
                 logger.error("Error getting download list after enqueue", exc_info=True)
                 if attempt == 3:
-                    return None
+                    return downloads or None
 
-        return None
+        # Partial result: some files never appeared. Callers decide whether that is acceptable.
+        if downloads:
+            logger.warning(f"Only {len(downloads)} of {len(files)} files appeared in the slskd transfer list")
+        return downloads or None
     else:
         return None
 

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ..config import Context
 
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
-from ..match import book_match, verify_filetype
+from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path
 from ..display import print_search_summary
 
 logger = logging.getLogger(__name__)
@@ -164,66 +164,184 @@ class SlskdBackend(DownloadBackend):
                     pass
 
             if search_results:
-                file_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-                for result in search_results:
-                    username = result["username"]
-                    # Skip if in history (failed previously)
-                    if self.ctx.history and self.ctx.history.is_failed(username, book_title):
-                        continue
-
-                    if username not in file_cache:
-                        file_cache[username] = {}
-
-                    for file in result["files"]:
-                        for ext in allowed_filetypes:
-                            if verify_filetype(file, ext):
-                                if ext not in file_cache[username]:
-                                    file_cache[username][ext] = []
-                                file_cache[username][ext].append(file)
-
-                # Match for each user
-                for username, types in file_cache.items():
-                    for ext, files in types.items():
-                        match = book_match(
-                            target_dict,
-                            files,
-                            username,
-                            ext,
-                            ignored_users=self.config.get("Search Settings", "ignored_users", fallback="").split(","),
-                            minimum_match_ratio=self.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
-                            min_length_ratio=self.config.getfloat("Search Settings", "min_length_ratio", fallback=0.4),
-                            min_jaccard_ratio=self.config.getfloat("Search Settings", "min_jaccard_ratio", fallback=0.25),
-                            min_word_overlap=self.config.getint("Search Settings", "min_word_overlap", fallback=2),
-                            min_title_jaccard=self.config.getfloat("Search Settings", "min_title_jaccard", fallback=0.3),
-                            min_author_jaccard=self.config.getfloat("Search Settings", "min_author_jaccard", fallback=0.5),
-                        )
-
-                        if match:
-                            file_dir = match["filename"].rsplit("\\", 1)[0] if "\\" in match["filename"] else ""
-                            filename = match["filename"].split("\\")[-1]
-
-                            sr = SearchResult(
-                                title=target.book_title,
-                                author=target.author_name,
-                                filename=filename,
-                                size_bytes=match["size"],
-                                extension=ext,
-                                backend_name=self.name,
-                                source_id=f"{username}|{match['filename']}",
-                                username=username,
-                                extra={
-                                    "username": username,
-                                    "file_dir": file_dir,
-                                    "files": [match],
-                                },
-                            )
-                            all_results.append(sr)
+                if target.is_audiobook:
+                    all_results.extend(self._match_audiobook_results(target, target_dict, search_results))
+                else:
+                    all_results.extend(self._match_ebook_results(target, target_dict, search_results))
 
                 # If we found any matches for this query, stop searching further queries
                 if all_results:
                     break
 
         return all_results
+
+    def _match_thresholds(self) -> Dict[str, Any]:
+        """Matching thresholds shared by ebook and audiobook matching."""
+        return dict(
+            ignored_users=self.config.get("Search Settings", "ignored_users", fallback="").split(","),
+            minimum_match_ratio=self.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
+            min_length_ratio=self.config.getfloat("Search Settings", "min_length_ratio", fallback=0.4),
+            min_jaccard_ratio=self.config.getfloat("Search Settings", "min_jaccard_ratio", fallback=0.25),
+            min_word_overlap=self.config.getint("Search Settings", "min_word_overlap", fallback=2),
+            min_title_jaccard=self.config.getfloat("Search Settings", "min_title_jaccard", fallback=0.3),
+            min_author_jaccard=self.config.getfloat("Search Settings", "min_author_jaccard", fallback=0.5),
+        )
+
+    def _match_ebook_results(self, target: DownloadTarget, target_dict: Dict[str, Any], search_results: List[Dict[str, Any]]) -> List[SearchResult]:
+        """Single-file matching (original R:soul behaviour): best file per user and format."""
+        book_title = target.book_title
+        allowed_filetypes = target.allowed_filetypes
+        results: List[SearchResult] = []
+
+        file_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for result in search_results:
+            username = result["username"]
+            # Skip if in history (failed previously)
+            if self.ctx.history and self.ctx.history.is_failed(username, book_title):
+                continue
+
+            if username not in file_cache:
+                file_cache[username] = {}
+
+            for file in result["files"]:
+                for ext in allowed_filetypes:
+                    if verify_filetype(file, ext):
+                        if ext not in file_cache[username]:
+                            file_cache[username][ext] = []
+                        file_cache[username][ext].append(file)
+
+        # Match for each user
+        for username, types in file_cache.items():
+            for ext, files in types.items():
+                match = book_match(
+                    target_dict,
+                    files,
+                    username,
+                    ext,
+                    ignored_users=self.config.get("Search Settings", "ignored_users", fallback="").split(","),
+                    minimum_match_ratio=self.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
+                    min_length_ratio=self.config.getfloat("Search Settings", "min_length_ratio", fallback=0.4),
+                    min_jaccard_ratio=self.config.getfloat("Search Settings", "min_jaccard_ratio", fallback=0.25),
+                    min_word_overlap=self.config.getint("Search Settings", "min_word_overlap", fallback=2),
+                    min_title_jaccard=self.config.getfloat("Search Settings", "min_title_jaccard", fallback=0.3),
+                    min_author_jaccard=self.config.getfloat("Search Settings", "min_author_jaccard", fallback=0.5),
+                )
+
+                if match:
+                    file_dir = match["filename"].rsplit("\\", 1)[0] if "\\" in match["filename"] else ""
+                    filename = match["filename"].split("\\")[-1]
+
+                    sr = SearchResult(
+                        title=target.book_title,
+                        author=target.author_name,
+                        filename=filename,
+                        size_bytes=match["size"],
+                        extension=ext,
+                        backend_name=self.name,
+                        source_id=f"{username}|{match['filename']}",
+                        username=username,
+                        extra={
+                            "username": username,
+                            "file_dir": file_dir,
+                            "files": [match],
+                        },
+                    )
+                    results.append(sr)
+
+
+        return results
+
+    def _browse_directory(self, username: str, directory: str) -> Optional[List[Dict[str, Any]]]:
+        """Fetch the full listing of a remote folder.
+
+        Search responses only contain the files that matched the query, which for
+        a folder of chapters is not guaranteed to be all of them. Returns files with
+        full remote paths, or None if browsing fails.
+        """
+        try:
+            listing = self.client.users.directory(username=username, directory=directory)
+        except Exception as e:
+            logger.warning(f"Could not browse folder '{directory}' from {username}: {e}")
+            return None
+
+        # slskd > 0.22.2 returns a list with one entry; older versions return the entry itself
+        if isinstance(listing, list):
+            listing = listing[0] if listing else None
+        if not isinstance(listing, dict):
+            return None
+
+        files = []
+        for f in listing.get("files", []):
+            name = f.get("filename", "")
+            full = name if "\\" in name else f"{directory}\\{name}"
+            files.append({"filename": full, "size": f.get("size", 0)})
+        return files
+
+    def _match_audiobook_results(self, target: DownloadTarget, target_dict: Dict[str, Any], search_results: List[Dict[str, Any]]) -> List[SearchResult]:
+        """Folder matching for audiobooks: pick the best-matching folder and grab every audio file in it."""
+        book_title = target.book_title
+        thresholds = self._match_thresholds()
+        min_size_bytes = int(self.config.getfloat("Search Settings", "audiobook_min_size_mb", fallback=10) * 1024 * 1024)
+        browse_limit = self.config.getint("Search Settings", "audiobook_browse_limit", fallback=5)
+        allowed = [ext.split(" ")[0].lower() for ext in target.allowed_filetypes]
+
+        candidates = []
+        for result in search_results:
+            username = result["username"]
+            if self.ctx.history and self.ctx.history.is_failed(username, book_title):
+                continue
+            for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, **thresholds):
+                candidates.append((username, match))
+
+        # Preferred format first, then best name match, then largest folder
+        candidates.sort(key=lambda c: (allowed.index(c[1]["extension"]), -c[1]["score"], -c[1]["total_size"]))
+
+        results: List[SearchResult] = []
+        for username, match in candidates[:browse_limit]:
+            directory = match["directory"]
+            ext = match["extension"]
+
+            browsed = self._browse_directory(username, directory) if directory else None
+            source_files = browsed if browsed is not None else match["files"]
+            files = [
+                {"filename": f["filename"], "size": f.get("size", 0)}
+                for f in source_files
+                if split_slskd_path(f["filename"])[1].lower().endswith(f".{ext}")
+                # Only this folder's own files, not ones from subfolders
+                and split_slskd_path(f["filename"])[0] == directory
+            ]
+            if not files:
+                continue
+
+            files.sort(key=lambda f: f["filename"].lower())
+            total_size = sum(f["size"] for f in files)
+            if total_size < min_size_bytes:
+                logger.info(f"Skipping {directory} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
+                continue
+
+            first_name = split_slskd_path(files[0]["filename"])[1]
+            results.append(
+                SearchResult(
+                    title=target.book_title,
+                    author=target.author_name,
+                    filename=first_name,
+                    size_bytes=total_size,
+                    extension=ext,
+                    backend_name=self.name,
+                    source_id=f"{username}|{directory}",
+                    score=match["score"],
+                    username=username,
+                    extra={
+                        "username": username,
+                        "file_dir": directory,
+                        "files": files,
+                        "media_type": "audiobook",
+                    },
+                )
+            )
+            logger.info(f"Audiobook candidate: {directory} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
+
+        return results
 
     def download(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
         """Initiate download of a Soulseek file."""
@@ -242,6 +360,17 @@ class SlskdBackend(DownloadBackend):
             logger.warning(f"Failed to enqueue download for {target.book_title} from {username}")
             return None
 
+        is_audiobook = result.extra.get("media_type") == "audiobook"
+        if is_audiobook and len(downloads) < len(files):
+            # An audiobook with missing chapters is worse than none: cancel and let the run report a failure
+            logger.warning(f"Only {len(downloads)} of {len(files)} audiobook files were enqueued from {username} - cancelling")
+            for d in downloads:
+                try:
+                    self.client.transfers.cancel_download(username=username, id=d["id"])
+                except Exception:
+                    pass
+            return None
+
         # Log what was enqueued
         short_filename = result.filename.split("\\")[-1] if "\\" in result.filename else result.filename
         logger.info(f"Enqueued: {short_filename} from {username}")
@@ -249,8 +378,16 @@ class SlskdBackend(DownloadBackend):
         # local_dir should be the flattened directory name (bottom-most folder)
         local_dir = file_dir.split("\\")[-1] if file_dir else ""
 
-        # Use (username, filename) as task_id
-        task_id = f"{username}|{result.filename}"
+        # Use (username, filename) as task_id; audiobooks are one task per folder
+        task_id = f"{username}|{file_dir}" if is_audiobook else f"{username}|{result.filename}"
+
+        extra = {"username": username, "file_dir": file_dir, "files": downloads, "slskd_id": downloads[0]["id"] if downloads else None}
+        if is_audiobook:
+            extra["media_type"] = "audiobook"
+            # Whole audiobooks take much longer than a single ebook; the orchestrator honours this per task
+            extra["stalled_timeout"] = self.config.getint("Slskd", "audiobook_stalled_timeout", fallback=14400)
+            extra["expected_files"] = [f["filename"].split("\\")[-1] for f in files]
+            logger.info(f"Enqueued audiobook folder: {local_dir} ({len(downloads)} files) from {username}")
 
         return DownloadTask(
             task_id=task_id,
@@ -262,7 +399,7 @@ class SlskdBackend(DownloadBackend):
             filename=result.filename,
             series_title=target.series_title,
             local_dir=local_dir,
-            extra={"username": username, "file_dir": file_dir, "files": downloads, "slskd_id": downloads[0]["id"] if downloads else None},
+            extra=extra,
         )
 
     def get_status(self, task: DownloadTask) -> DownloadTask:
@@ -338,6 +475,9 @@ class SlskdBackend(DownloadBackend):
 
     def reconcile_task(self, task_data: Dict[str, Any]) -> Optional[DownloadTask]:
         """Reconcile a persisted task with live slskd state."""
+        if task_data.get("extra", {}).get("media_type") == "audiobook":
+            return self._reconcile_audiobook_task(task_data)
+
         username = task_data.get("extra", {}).get("username")
         filename = task_data.get("filename")
         local_dir = task_data.get("local_dir", "")
@@ -400,3 +540,69 @@ class SlskdBackend(DownloadBackend):
         except Exception as e:
             logger.error(f"Error reconciling slskd task: {e}")
             return None
+
+    def _reconcile_audiobook_task(self, task_data: Dict[str, Any]) -> Optional[DownloadTask]:
+        """Reconcile a persisted audiobook folder task.
+
+        Files still in the slskd transfer list are tracked again; files already on
+        disk count as done (slskd drops completed transfers from its list).
+        """
+        extra = task_data.get("extra", {})
+        username = extra.get("username")
+        file_dir = extra.get("file_dir", "")
+        expected = extra.get("expected_files") or []
+        local_dir = task_data.get("local_dir", "")
+        if not username or not expected:
+            return None
+
+        leaf = file_dir.split("\\")[-1] if file_dir else ""
+        tracked: Dict[str, Dict[str, Any]] = {}
+        try:
+            for user_transfer in self.client.transfers.get_all_downloads():
+                if user_transfer["username"] != username:
+                    continue
+                for directory in user_transfer["directories"]:
+                    if directory["directory"] not in (file_dir, leaf):
+                        continue
+                    for file in directory["files"]:
+                        basename = file["filename"].split("\\")[-1]
+                        if basename in expected:
+                            tracked[basename] = {
+                                "filename": file["filename"],
+                                "id": file["id"],
+                                "size": file["size"],
+                                "username": username,
+                                "file_dir": file_dir,
+                            }
+        except Exception as e:
+            logger.error(f"Error reconciling slskd audiobook task: {e}")
+            return None
+
+        on_disk = set()
+        if self.download_dir and local_dir:
+            on_disk = {name for name in expected if name not in tracked and (Path(self.download_dir) / local_dir / name).exists()}
+
+        missing = [name for name in expected if name not in tracked and name not in on_disk]
+        if missing:
+            logger.warning(f"Cannot resume audiobook {task_data.get('book_title')}: {len(missing)} of {len(expected)} files are neither queued nor on disk")
+            return None
+
+        extra["files"] = list(tracked.values())
+        task = DownloadTask(
+            task_id=task_data["task_id"],
+            backend_name=self.name,
+            status=DownloadStatus.PENDING,
+            book_title=task_data["book_title"],
+            author_name=task_data["author_name"],
+            book_id=task_data["book_id"],
+            filename=task_data["filename"],
+            series_title=task_data.get("series_title", ""),
+            local_dir=local_dir,
+            extra=extra,
+        )
+        if not tracked:
+            # Everything already downloaded
+            task.status = DownloadStatus.COMPLETED
+            task.progress_percent = 100.0
+            return task
+        return self.get_status(task)

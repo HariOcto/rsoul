@@ -187,7 +187,7 @@ class DownloadOrchestrator:
         while True:
             # Check timeout
             elapsed = time.time() - start_time
-            if elapsed >= self.stalled_timeout:
+            if elapsed >= task.extra.get("stalled_timeout", self.stalled_timeout):
                 logger.error(f"Download timed out after {elapsed:.0f}s: {task.filename}")
                 backend.cancel(task)
                 task.status = DownloadStatus.FAILED
@@ -337,7 +337,7 @@ class DownloadOrchestrator:
 
                 # Check timeout
                 elapsed = time.time() - start_times[task_id]
-                if elapsed >= self.stalled_timeout:
+                if elapsed >= task.extra.get("stalled_timeout", self.stalled_timeout):
                     logger.error(f"Download timed out after {elapsed:.0f}s: {task.filename}")
                     backend = self.get_backend(task.backend_name)
                     if backend:

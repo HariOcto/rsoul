@@ -113,6 +113,17 @@ class StateManager:
         self.items.append(state_item)
         self._save()
 
+    def update_task(self, task: Any) -> None:
+        """Refresh a persisted task (current files, timers) before handing it to the next run."""
+        for item in self.items:
+            if item.get("task_id") == task.task_id:
+                item["extra"] = task.extra
+                item["local_dir"] = getattr(task, "local_dir", item.get("local_dir", ""))
+                item["filename"] = task.filename
+                self._save()
+                return
+        self.add_task(task)
+
     def remove_task(self, task_id: str) -> None:
         """Remove a task by its task_id.
 

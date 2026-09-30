@@ -384,8 +384,6 @@ class SlskdBackend(DownloadBackend):
         extra = {"username": username, "file_dir": file_dir, "files": downloads, "slskd_id": downloads[0]["id"] if downloads else None}
         if is_audiobook:
             extra["media_type"] = "audiobook"
-            # Whole audiobooks take much longer than a single ebook; the orchestrator honours this per task
-            extra["stalled_timeout"] = self.config.getint("Slskd", "audiobook_stalled_timeout", fallback=14400)
             extra["expected_files"] = [f["filename"].split("\\")[-1] for f in files]
             logger.info(f"Enqueued audiobook folder: {local_dir} ({len(downloads)} files) from {username}")
 
@@ -435,17 +433,23 @@ class SlskdBackend(DownloadBackend):
         # Map remaining slskd states to DownloadStatus
         states = [f.get("status", {}).get("state", "") for f in downloads if f.get("status")]
 
-        if any(s == "Downloading" for s in states):
+        # Aggregate progress across all files (completed files count in full)
+        total_size = sum(f.get("size", 0) for f in downloads)
+        bytes_transferred = sum(f.get("status", {}).get("bytesTransferred", 0) for f in downloads if f.get("status"))
+        task.bytes_transferred = bytes_transferred
+        if total_size > 0:
+            task.progress_percent = (bytes_transferred / total_size) * 100
+
+        # slskd reports transfer states such as "InProgress", "Initializing", "Queued, Remotely",
+        # "Queued, Locally" and "Requested"
+        if any(s in ("InProgress", "Initializing", "Downloading") for s in states):
             task.status = DownloadStatus.DOWNLOADING
-            # Calculate aggregate progress
-            total_size = sum(f.get("size", 0) for f in downloads)
-            bytes_transferred = sum(f.get("status", {}).get("bytesTransferred", 0) for f in downloads if f.get("status"))
-            if total_size > 0:
-                task.progress_percent = (bytes_transferred / total_size) * 100
         elif any(s == "Queued, Remotely" for s in states):
             task.status = DownloadStatus.QUEUED
+        elif any(s == "Queued, Locally" for s in states):
+            task.status = DownloadStatus.QUEUED_LOCALLY
         else:
-            # Pending/initializing states
+            # Requested / pending states
             task.status = DownloadStatus.PENDING
 
         return task

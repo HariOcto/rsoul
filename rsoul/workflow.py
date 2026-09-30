@@ -1,5 +1,6 @@
 import logging
 import datetime
+import time
 import os
 from typing import Any, Dict, List, TYPE_CHECKING, Optional
 from . import postprocess
@@ -35,91 +36,28 @@ def task_to_grab_item(task: DownloadTask, download_dir: str) -> Dict[str, Any]:
 
 
 
-def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict[str, int]:
-    """
-    Main workflow: Search, Monitor, Import, and Cleanup using DownloadOrchestrator.
+def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> List[DownloadTarget]:
+    """Turn wanted books into DownloadTargets with the right media type and formats."""
+    batch_targets: List[DownloadTarget] = []
+    media_mode = get_media_mode(ctx.config)
 
-    Supports resume functionality - if a saved state exists, it will resume
-    monitoring those downloads instead of starting new searches.
-    """
-    if not ctx.orchestrator:
-        logger.error("Download Orchestrator not available. Check your backend configuration.")
-        return {"failed_download": 0, "grabbed_count": 0}
+    for target_dict in download_targets:
+        book = target_dict["book"]
+        author = target_dict["author"]
 
-    completed_tasks: List[DownloadTask] = []
-    failed_books: List[tuple] = []  # (author, title) — not found across all backends
-    failed_imports: List[tuple] = []  # (author, title) — downloaded but import failed
-    failed_download = 0
-    resumed = False
+        # Ebook or audiobook decides the formats (priority order) and how results are grabbed
+        media_type = resolve_book_media_type(book, media_mode)
+        filetypes = get_formats(ctx.config, media_type)
 
-    remove_wanted_on_failure = ctx.config.getboolean("Search Settings", "remove_wanted_on_failure", fallback=False)
-    failure_file_path = os.path.join(ctx.config_dir, "failure_list.txt")
-    slskd_download_dir = ctx.config.get("Slskd", "download_dir", fallback="")
+        # Fetch editions for this book (contains ISBNs, ASINs, etc.)
+        try:
+            editions = ctx.readarr.get_edition(book["id"])
+        except Exception as e:
+            logger.warning(f"Could not get editions for {book['title']}: {e}")
+            editions = []
 
-    # 1. Resume Logic
-    if ctx.state and ctx.state.has_pending_state():
-        logger.info("Found saved state - attempting to resume previous session")
-        print_section_header("RESUMING PREVIOUS SESSION")
-
-        persisted_tasks = ctx.state.get_tasks_for_orchestrator()
-        if persisted_tasks:
-            tasks = ctx.orchestrator.resume_tasks(persisted_tasks)
-            if tasks:
-                logger.info(f"Resuming {len(tasks)} downloads from previous session")
-
-                def on_resume_complete(task: DownloadTask) -> None:
-                    nonlocal failed_download
-                    if task.status == DownloadStatus.COMPLETED:
-                        # Trigger import immediately
-                        try:
-                            grab_item = task_to_grab_item(task, slskd_download_dir)
-                            postprocess.process_imports(ctx, [grab_item])
-                            completed_tasks.append(task)
-                        except Exception as e:
-                            logger.error(f"Error importing resumed task {task.filename}: {e}")
-                            failed_download += 1
-                            failed_imports.append((task.author_name, task.book_title))
-                    else:
-                        failed_download += 1
-                        failed_books.append((task.author_name, task.book_title))
-
-                    # Remove from state regardless of success/failure
-                    if ctx.state:
-                        ctx.state.remove_task(task.task_id)
-
-                ctx.orchestrator.monitor_resumed_tasks(tasks, on_complete=on_resume_complete)
-                resumed = True
-            else:
-                logger.info("No items could be resumed - starting fresh")
-                ctx.state.clear()
-        else:
-            logger.info("No orchestrator tasks found in state - clearing stale state")
-            ctx.state.clear()
-
-    # 2. Search Phase
-    if not resumed:
-        print_section_header("STARTING BATCH SEARCH PHASE")
-
-        batch_targets: List[DownloadTarget] = []
-        media_mode = get_media_mode(ctx.config)
-
-        # Prepare targets
-        for target_dict in download_targets:
-            book = target_dict["book"]
-            author = target_dict["author"]
-
-            # Ebook or audiobook decides the formats (priority order) and how results are grabbed
-            media_type = resolve_book_media_type(book, media_mode)
-            filetypes = get_formats(ctx.config, media_type)
-
-            # Fetch editions for this book (contains ISBNs, ASINs, etc.)
-            try:
-                editions = ctx.readarr.get_edition(book["id"])
-            except Exception as e:
-                logger.warning(f"Could not get editions for {book['title']}: {e}")
-                editions = []
-
-            target = DownloadTarget(
+        batch_targets.append(
+            DownloadTarget(
                 book_id=book["id"],
                 book_title=book["title"],
                 author_name=author["authorName"],
@@ -130,82 +68,156 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
                 editions=editions,
                 media_type=media_type,
             )
+        )
+    return batch_targets
 
-            batch_targets.append(target)
 
-        # Batch Process
-        if batch_targets:
+class _RunResults:
+    """Collects outcomes across the run and handles each finished task."""
 
-            def on_search_complete(task: DownloadTask) -> None:
-                nonlocal failed_download
+    def __init__(self, ctx: "Context", targets: List[DownloadTarget]):
+        self.ctx = ctx
+        self.targets_by_id = {t.book_id: t for t in targets}
+        self.completed_tasks: List[DownloadTask] = []
+        self.failed_books: List[tuple] = []  # (author, title) - not found / download failed
+        self.failed_imports: List[tuple] = []  # (author, title) - downloaded but import failed
+        self.failed_download = 0
+        self.remove_wanted_on_failure = ctx.config.getboolean("Search Settings", "remove_wanted_on_failure", fallback=False)
+        self.failure_file_path = os.path.join(ctx.config_dir, "failure_list.txt")
+        self.slskd_download_dir = ctx.config.get("Slskd", "download_dir", fallback="")
 
-                if task.status == DownloadStatus.COMPLETED:
-                    try:
-                        # Success
-                        grab_item = task_to_grab_item(task, slskd_download_dir)
-                        postprocess.process_imports(ctx, [grab_item])
-                        completed_tasks.append(task)
-                    except Exception as e:
-                        logger.error(f"Error importing task {task.filename}: {e}")
-                        failed_download += 1
-                        failed_imports.append((task.author_name, task.book_title))
-                else:
-                    # Failure handling
-                    # Simple matching by book_id
-                    failed_target = next((t for t in batch_targets if t.book_id == task.book_id), None)
+    def on_complete(self, task: DownloadTask) -> None:
+        if task.status == DownloadStatus.COMPLETED:
+            try:
+                grab_item = task_to_grab_item(task, self.slskd_download_dir)
+                postprocess.process_imports(self.ctx, [grab_item])
+                self.completed_tasks.append(task)
+            except Exception as e:
+                logger.error(f"Error importing task {task.filename}: {e}")
+                self.failed_download += 1
+                self.failed_imports.append((task.author_name, task.book_title))
+        else:
+            self._handle_failure(task)
 
-                    if failed_target and remove_wanted_on_failure:
-                        book = failed_target.readarr_book
-                        author = failed_target.readarr_author
+        # Remove from state regardless of success/failure
+        if self.ctx.state:
+            self.ctx.state.remove_task(task.task_id)
 
-                        logger.error(f"Failed to grab book: {book['title']} for author: {author['authorName']}." + ' Failed book removed from wanted list and added to "failure_list.txt"')
-                        book["monitored"] = False
-                        try:
-                            edition = ctx.readarr.get_edition(book["id"])
-                            ctx.readarr.upd_book(book=book, editions=edition)
-                        except Exception as e:
-                            logger.error(f"Failed to unmonitor book: {e}")
+    def _handle_failure(self, task: DownloadTask) -> None:
+        failed_target = self.targets_by_id.get(task.book_id)
 
-                        current_datetime = datetime.datetime.now()
-                        current_datetime_str = current_datetime.strftime("%d/%m/%Y %H:%M:%S")
-                        failure_string = current_datetime_str + " - " + author["authorName"] + ", " + book["title"] + "\n"
+        if failed_target and self.remove_wanted_on_failure:
+            book = failed_target.readarr_book
+            author = failed_target.readarr_author
 
-                        with open(failure_file_path, "a") as file:
-                            file.write(failure_string)
-                    else:
-                        logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
+            logger.error(f"Failed to grab book: {book['title']} for author: {author['authorName']}." + ' Failed book removed from wanted list and added to "failure_list.txt"')
+            book["monitored"] = False
+            try:
+                edition = self.ctx.readarr.get_edition(book["id"])
+                self.ctx.readarr.upd_book(book=book, editions=edition)
+            except Exception as e:
+                logger.error(f"Failed to unmonitor book: {e}")
 
-                    failed_download += 1
-                    failed_books.append((task.author_name, task.book_title))
+            current_datetime_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            failure_string = current_datetime_str + " - " + author["authorName"] + ", " + book["title"] + "\n"
+            with open(self.failure_file_path, "a") as file:
+                file.write(failure_string)
+        else:
+            logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
 
-                # Remove from state regardless of success/failure
-                if ctx.state:
-                    ctx.state.remove_task(task.task_id)
+        self.failed_download += 1
+        self.failed_books.append((task.author_name, task.book_title))
 
-            results = ctx.orchestrator.batch_process_targets(batch_targets, on_complete=on_search_complete)
 
-        # 3. Import Phase (Deprecated - Handled incrementally via callbacks)
-        # if completed_tasks:
-        #     grab_list = [task_to_grab_item(task, slskd_download_dir) for task in completed_tasks]
-        #     postprocess.process_imports(ctx, grab_list)
+def _resume_persisted(ctx: "Context") -> List[DownloadTask]:
+    """Reconcile saved downloads with the backends; drop the ones that can no longer be resumed."""
+    persisted = ctx.state.get_tasks_for_orchestrator() if ctx.state else []
+    if not persisted:
+        return []
 
-    # 4. Final Cleanup
+    tasks = ctx.orchestrator.resume_tasks(persisted)
+    resumed_ids = {t.task_id for t in tasks}
+    for item in persisted:
+        if item["task_id"] not in resumed_ids:
+            logger.warning(f"Dropping download that can no longer be resumed: {item.get('book_title', item['task_id'])}")
+            ctx.state.remove_task(item["task_id"])
+    return tasks
+
+
+def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Main workflow: Search, Monitor, Import, and Cleanup using DownloadOrchestrator.
+
+    Two modes, set by [Download Settings] monitor_window (seconds):
+    - 0 (default): resume saved downloads if any, otherwise search; wait until every download finishes.
+    - > 0 (hand-off): resume saved downloads AND search for new books in the same run, monitor
+      everything in parallel for at most monitor_window seconds, then save the unfinished
+      downloads so the next run picks them up. slskd keeps downloading in between.
+    """
+    if not ctx.orchestrator:
+        logger.error("Download Orchestrator not available. Check your backend configuration.")
+        return {"failed_download": 0, "grabbed_count": 0}
+
+    monitor_window = ctx.config.getint("Download Settings", "monitor_window", fallback=0)
+    active: List[DownloadTask] = []
+    unfinished: List[DownloadTask] = []
+
+    has_saved = bool(ctx.state and ctx.state.has_pending_state())
+
+    # 1. Resume saved downloads
+    resumed: List[DownloadTask] = []
+    if has_saved:
+        logger.info("Found saved state - attempting to resume previous session")
+        print_section_header("RESUMING PREVIOUS SESSION")
+        resumed = _resume_persisted(ctx)
+        if resumed:
+            logger.info(f"Resuming {len(resumed)} downloads from previous session")
+        else:
+            logger.info("No items could be resumed - starting fresh")
+            ctx.state.clear()
+
+    # 2. Search & enqueue new books (legacy mode only when nothing was resumed)
+    targets: List[DownloadTarget] = []
+    if monitor_window > 0 or not resumed:
+        in_flight = {t.book_id for t in resumed}
+        targets = [t for t in build_targets(ctx, download_targets) if t.book_id not in in_flight]
+        if in_flight:
+            logger.info(f"Skipping {len(in_flight)} book(s) that are still downloading from an earlier run")
+
+    results = _RunResults(ctx, targets)
+
+    if targets:
+        print_section_header("STARTING BATCH SEARCH PHASE")
+        active = ctx.orchestrator.start_targets(targets, on_complete=results.on_complete)
+
+    # 3. Monitor everything in parallel
+    deadline = time.time() + monitor_window if monitor_window > 0 else None
+    _, unfinished = ctx.orchestrator.monitor_until(resumed + active, on_complete=results.on_complete, deadline=deadline)
+
+    # 4. Hand unfinished downloads to the next run
+    for task in unfinished:
+        if ctx.state:
+            ctx.state.update_task(task)
+    if unfinished:
+        logger.info(f"{len(unfinished)} download(s) still running in slskd; the next run will continue monitoring them")
+
+    # 5. Final Cleanup
     if ctx.state and not ctx.state.has_pending_state():
         ctx.state.clear()
 
-    # Cleanup backend transfers
+    # Cleanup backend transfers (unfinished audiobooks keep their finished files on disk; resume accounts for that)
     if ctx.slskd and ctx.config.getboolean("Backends", "slskd_enabled", fallback=True):
         try:
             ctx.slskd.transfers.remove_completed_downloads()
         except Exception as e:
             logger.warning(f"Failed to cleanup slskd transfers: {e}")
 
-    # 5. Run Summary
+    # 6. Run Summary
     print_run_summary(
-        len(completed_tasks),
-        failed_download,
-        failed_books if failed_books else None,
-        failed_imports if failed_imports else None,
+        len(results.completed_tasks),
+        results.failed_download,
+        results.failed_books if results.failed_books else None,
+        results.failed_imports if results.failed_imports else None,
     )
 
-    return {"failed_download": failed_download, "grabbed_count": len(completed_tasks)}
+    return {"failed_download": results.failed_download, "grabbed_count": len(results.completed_tasks), "still_running": len(unfinished)}

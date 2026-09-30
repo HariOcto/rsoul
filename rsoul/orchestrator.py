@@ -7,7 +7,7 @@ It handles the search → download → monitor lifecycle.
 
 import time
 import logging
-from typing import List, Optional, Dict, Any, TYPE_CHECKING, Callable
+from typing import List, Optional, Dict, Any, TYPE_CHECKING, Callable, Tuple
 
 from .backends.base import (
     DownloadBackend,
@@ -39,11 +39,17 @@ class DownloadOrchestrator:
         self.ctx = ctx
         self.active_tasks: List[DownloadTask] = []
 
-        # Timeouts from config
-        self.stalled_timeout = ctx.config.getint(
-            "General", "stalled_timeout",
-            fallback=ctx.config.getint("Slskd", "stalled_timeout", fallback=3600)
-        )
+        # Progress-based timeouts (seconds, 0 = disabled). A download is only given up on when it
+        # stops moving, waits too long in the peer's queue, or exceeds the overall safety cap.
+        cfg = ctx.config
+        self.stall_timeout = cfg.getint("Download Settings", "stall_timeout", fallback=1800)
+        self.queue_timeout = cfg.getint("Slskd", "remote_queue_timeout", fallback=3600)
+        self.max_download_time = cfg.getint("Download Settings", "max_download_time", fallback=86400)
+        if cfg.has_option("Slskd", "stalled_timeout") or cfg.has_option("General", "stalled_timeout"):
+            logger.warning(
+                "'stalled_timeout' is no longer used: downloads now time out on lack of progress "
+                "(stall_timeout, remote_queue_timeout) with max_download_time as an overall cap."
+            )
         self.poll_interval = 10  # seconds between status checks
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
@@ -172,8 +178,51 @@ class DownloadOrchestrator:
 
         return task
 
+    def check_timeouts(self, task: DownloadTask, now: Optional[float] = None) -> Optional[str]:
+        """Apply progress-based timeouts to a freshly polled, still-active task.
+
+        Timer state lives in task.extra["monitor"] (wall-clock timestamps), so it
+        survives being handed from one run to the next.
+
+        Returns:
+            A failure reason if the task should be given up on, else None.
+        """
+        now = time.time() if now is None else now
+        m = task.extra.setdefault("monitor", {})
+        m.setdefault("started_at", now)
+        m.setdefault("last_progress_at", now)
+        m.setdefault("last_bytes", 0)
+
+        if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
+            return f"Exceeded max_download_time ({self.max_download_time}s)"
+
+        if task.status == DownloadStatus.QUEUED_LOCALLY:
+            # Waiting for our own slskd download slots: not the peer's fault, so no timer runs
+            m["queued_since"] = None
+            m["last_progress_at"] = now
+            return None
+
+        if task.status == DownloadStatus.QUEUED:
+            if not m.get("queued_since"):
+                m["queued_since"] = now
+            if self.queue_timeout > 0 and now - m["queued_since"] >= self.queue_timeout:
+                return f"Waited more than {self.queue_timeout}s in the peer's upload queue"
+            # Waiting in a queue is not a stall
+            m["last_progress_at"] = now
+            return None
+
+        m["queued_since"] = None
+        if task.bytes_transferred > m["last_bytes"]:
+            m["last_bytes"] = task.bytes_transferred
+            m["last_progress_at"] = now
+            return None
+
+        if self.stall_timeout > 0 and now - m["last_progress_at"] >= self.stall_timeout:
+            return f"No data received for {self.stall_timeout}s"
+        return None
+
     def _monitor_task(self, backend: DownloadBackend, task: DownloadTask) -> DownloadTask:
-        """Monitor a download until completion or timeout.
+        """Monitor a download until completion or timeout (blocking).
 
         Args:
             backend: Backend that owns the task
@@ -182,34 +231,26 @@ class DownloadOrchestrator:
         Returns:
             Updated task with final status
         """
-        start_time = time.time()
-
         while True:
-            # Check timeout
-            elapsed = time.time() - start_time
-            if elapsed >= task.extra.get("stalled_timeout", self.stalled_timeout):
-                logger.error(f"Download timed out after {elapsed:.0f}s: {task.filename}")
-                backend.cancel(task)
-                task.status = DownloadStatus.FAILED
-                task.error_message = "Stalled timeout"
-                return task
-
-            # Poll status
             task = backend.get_status(task)
-
             if task.status == DownloadStatus.COMPLETED:
                 logger.info(f"Download completed: {task.filename}")
                 return task
-
             if task.status == DownloadStatus.FAILED:
                 logger.warning(f"Download failed: {task.filename} - {task.error_message}")
                 return task
-
             if task.status == DownloadStatus.CANCELLED:
                 logger.info(f"Download cancelled: {task.filename}")
                 return task
 
-            # Still in progress
+            reason = self.check_timeouts(task)
+            if reason:
+                logger.error(f"Giving up on {task.filename}: {reason}")
+                backend.cancel(task)
+                task.status = DownloadStatus.FAILED
+                task.error_message = reason
+                return task
+
             logger.debug(f"Download progress: {task.filename} - {task.progress_percent:.1f}%")
             time.sleep(self.poll_interval)
 
@@ -241,26 +282,17 @@ class DownloadOrchestrator:
             "tasks": completed_tasks,
         }
 
-    def batch_process_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> Dict[str, Any]:
-        """Process a list of download targets using batch workflow.
+    def start_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> List[DownloadTask]:
+        """Search and enqueue every target (with rate limiting), without waiting for downloads.
 
-        Phase 1: Search & Enqueue all targets (with rate limiting)
-        Phase 2: Monitor all active tasks concurrently
-        Phase 3: Return results
-
-        Args:
-            targets: Books to download
-            on_complete: Callback for completed tasks
+        Targets that no backend could start are reported through on_complete as a FAILED task.
 
         Returns:
-            Dict with stats: succeeded, failed, tasks
+            Started tasks, all downloading in parallel from here on.
         """
         active_tasks: List[DownloadTask] = []
-        failed_targets: List[DownloadTarget] = []
+        failed_count = 0
 
-        logger.info(f"Starting batch processing for {len(targets)} targets")
-
-        # Phase 1: Search & Enqueue
         batch_delay = self.ctx.config.getfloat("General", "batch_delay", fallback=3.0)
         last_target_time = 0.0
 
@@ -270,140 +302,146 @@ class DownloadOrchestrator:
                 elapsed = time.time() - last_target_time
                 if elapsed < batch_delay:
                     time.sleep(batch_delay - elapsed)
-
             last_target_time = time.time()
 
             task = self.start_download(target)
             if task:
                 active_tasks.append(task)
-            else:
-                failed_targets.append(target)
-                # Fire callback with synthetic FAILED task so caller can handle
-                # (summary, unmonitor, failure_list.txt)
-                if on_complete:
-                    failed_task = DownloadTask(
-                        task_id=f"not_found_{target.book_id}",
-                        backend_name="none",
-                        status=DownloadStatus.FAILED,
-                        book_title=target.book_title,
-                        author_name=target.author_name,
-                        book_id=target.book_id,
-                        series_title=target.series_title,
-                        filename="",
-                        error_message="No backend could find or start download",
-                    )
-                    try:
-                        on_complete(failed_task)
-                    except Exception as e:
-                        logger.error(f"Error in on_complete callback for failed target: {e}")
+                continue
 
-        logger.info(f"Batch Enqueue Complete. Active: {len(active_tasks)}, Failed to start: {len(failed_targets)}")
+            failed_count += 1
+            # Fire callback with synthetic FAILED task so caller can handle
+            # (summary, unmonitor, failure_list.txt)
+            if on_complete:
+                failed_task = DownloadTask(
+                    task_id=f"not_found_{target.book_id}",
+                    backend_name="none",
+                    status=DownloadStatus.FAILED,
+                    book_title=target.book_title,
+                    author_name=target.author_name,
+                    book_id=target.book_id,
+                    series_title=target.series_title,
+                    filename="",
+                    error_message="No backend could find or start download",
+                )
+                try:
+                    on_complete(failed_task)
+                except Exception as e:
+                    logger.error(f"Error in on_complete callback for failed target: {e}")
 
-        # Phase 2: Monitor
+        logger.info(f"Batch Enqueue Complete. Active: {len(active_tasks)}, Failed to start: {failed_count}")
+        return active_tasks
+
+    def batch_process_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> Dict[str, Any]:
+        """Process a list of download targets using batch workflow.
+
+        Phase 1: Search & Enqueue all targets (with rate limiting)
+        Phase 2: Monitor all active tasks concurrently
+        Phase 3: Return results
+        """
+        logger.info(f"Starting batch processing for {len(targets)} targets")
+        active_tasks = self.start_targets(targets, on_complete)
         completed_tasks = self.monitor_multiple_tasks(active_tasks, on_complete)
 
-        # Phase 3: Compile results
         succeeded_tasks = [t for t in completed_tasks if t.status == DownloadStatus.COMPLETED]
         failed_tasks = [t for t in completed_tasks if t.status != DownloadStatus.COMPLETED]
-
         return {
             "succeeded": len(succeeded_tasks),
-            "failed": len(failed_targets) + len(failed_tasks),
+            "failed": (len(targets) - len(active_tasks)) + len(failed_tasks),
             "tasks": completed_tasks,
         }
 
     def monitor_multiple_tasks(self, tasks: List[DownloadTask], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> List[DownloadTask]:
-        """Monitor multiple tasks concurrently until all complete or timeout.
-
-        Args:
-            tasks: List of active tasks
-            on_complete: Callback for completed tasks
+        """Monitor multiple tasks concurrently until all complete or time out.
 
         Returns:
             List of completed tasks (including failed/cancelled)
         """
-        active_map = {t.task_id: t for t in tasks}
-        completed_map = {}
+        completed, _ = self.monitor_until(tasks, on_complete)
+        return completed
 
-        # Track start time for timeouts (relative to monitoring start)
-        start_times = {t.task_id: time.time() for t in tasks}
+    def _finish(self, task: DownloadTask, on_complete: Optional[Callable[[DownloadTask], None]]) -> None:
+        if task.status == DownloadStatus.COMPLETED:
+            logger.info(f"Task completed: {task.filename}")
+        else:
+            logger.warning(f"Task failed: {task.filename} - {task.error_message}")
+        if on_complete:
+            try:
+                on_complete(task)
+            except Exception as e:
+                logger.error(f"Error in on_complete callback: {e}")
+
+    def monitor_until(
+        self,
+        tasks: List[DownloadTask],
+        on_complete: Optional[Callable[[DownloadTask], None]] = None,
+        deadline: Optional[float] = None,
+    ) -> Tuple[List[DownloadTask], List[DownloadTask]]:
+        """Monitor tasks in parallel until they all finish, or until the deadline passes.
+
+        Each task is judged on its own progress (see check_timeouts), so one slow
+        download never causes another to be cancelled.
+
+        Args:
+            tasks: Active tasks
+            on_complete: Called as each task finishes (successfully or not)
+            deadline: Wall-clock time to stop monitoring; unfinished tasks are returned
+                      so the caller can hand them to the next run. None = wait for all.
+
+        Returns:
+            (finished tasks, still-running tasks)
+        """
+        active_map = {t.task_id: t for t in tasks}
+        completed_map: Dict[str, DownloadTask] = {}
 
         while active_map:
-            # Snapshot keys to allow modification during iteration
-            current_active_ids = list(active_map.keys())
-
-            for task_id in current_active_ids:
+            for task_id in list(active_map.keys()):
                 task = active_map[task_id]
 
-                # Check timeout
-                elapsed = time.time() - start_times[task_id]
-                if elapsed >= task.extra.get("stalled_timeout", self.stalled_timeout):
-                    logger.error(f"Download timed out after {elapsed:.0f}s: {task.filename}")
-                    backend = self.get_backend(task.backend_name)
-                    if backend:
-                        backend.cancel(task)
-                    task.status = DownloadStatus.FAILED
-                    task.error_message = "Stalled timeout"
-                    completed_map[task_id] = task
-                    del active_map[task_id]
-
-                    if on_complete:
-                        try:
-                            on_complete(task)
-                        except Exception as e:
-                            logger.error(f"Error in on_complete callback: {e}")
-
-                    continue
-
-                # Poll status
                 backend = self.get_backend(task.backend_name)
                 if not backend:
                     task.status = DownloadStatus.FAILED
                     task.error_message = "Backend unavailable"
                     completed_map[task_id] = task
                     del active_map[task_id]
-
-                    if on_complete:
-                        try:
-                            on_complete(task)
-                        except Exception as e:
-                            logger.error(f"Error in on_complete callback: {e}")
-
+                    self._finish(task, on_complete)
                     continue
 
                 try:
-                    updated_task = backend.get_status(task)
+                    task = backend.get_status(task)
                 except Exception as e:
+                    # Transient API errors: keep the task and try again next poll
                     logger.error(f"Error checking status for {task.filename}: {e}")
-                    # Don't fail immediately, wait for next poll? Or fail?
-                    # Robustness: keep checking unless it persists. For now, just log.
-                    updated_task = task
 
-                if updated_task.status in [DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED]:
-                    completed_map[task_id] = updated_task
+                if task.status in [DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED]:
+                    completed_map[task_id] = task
                     del active_map[task_id]
+                    self._finish(task, on_complete)
+                    continue
 
-                    # Log completion immediately
-                    if updated_task.status == DownloadStatus.COMPLETED:
-                        logger.info(f"Task completed: {updated_task.filename}")
-                    else:
-                        logger.warning(f"Task failed: {updated_task.filename} - {updated_task.error_message}")
+                reason = self.check_timeouts(task)
+                if reason:
+                    logger.error(f"Giving up on {task.filename}: {reason}")
+                    backend.cancel(task)
+                    task.status = DownloadStatus.FAILED
+                    task.error_message = reason
+                    completed_map[task_id] = task
+                    del active_map[task_id]
+                    self._finish(task, on_complete)
+                    continue
 
-                    if on_complete:
-                        try:
-                            on_complete(updated_task)
-                        except Exception as e:
-                            logger.error(f"Error in on_complete callback: {e}")
-                else:
-                    # Update the task object in map
-                    active_map[task_id] = updated_task
+                active_map[task_id] = task
 
-            # Log summary
-            if active_map:
-                self._log_batch_status(list(active_map.values()), list(completed_map.values()))
-                time.sleep(self.poll_interval)
+            if not active_map:
+                break
+            if deadline is not None and time.time() >= deadline:
+                logger.info(f"Monitor window over: handing {len(active_map)} unfinished download(s) to the next run")
+                break
 
-        return list(completed_map.values())
+            self._log_batch_status(list(active_map.values()), list(completed_map.values()))
+            time.sleep(self.poll_interval)
+
+        return list(completed_map.values()), list(active_map.values())
 
     def _log_batch_status(self, active: List[DownloadTask], completed: List[DownloadTask]) -> None:
         """Log a summary of batch progress."""

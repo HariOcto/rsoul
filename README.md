@@ -132,8 +132,24 @@ How audiobooks are handled:
 - **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A single-file audiobook (`.m4b`) can also match on its filename.
 - **Grabbing**: the best-matching folders are browsed so every audio file in the folder is queued, not just the ones that appeared in the search results. If not all files can be queued, the download is cancelled rather than importing an incomplete book.
 - **Import**: files are moved to `<download_dir>/rsoul_audiobooks/<Author>/<Title>/` and imported with one `DownloadedBooksScan` per book folder. Ebook metadata validation is not applied to audio files.
-- **Time limit**: whole audiobooks are large, so they use `audiobook_stalled_timeout` in `[Slskd]` (default 4 hours) instead of `stalled_timeout`.
+- **Time limits** are progress-based (see [Download timeouts](#download-timeouts)), so a large audiobook from a slow but steady peer is not cancelled.
 - **Not handled yet**: audiobooks split across subfolders (`CD1`, `CD2`, ...). Only the files directly in the matched folder are downloaded.
+
+## Download timeouts
+
+Downloads are judged on their own progress, and all of them run in parallel:
+
+| Option | Section | Default | Gives up when |
+|--------|---------|---------|---------------|
+| `stall_timeout` | `[Download Settings]` | 1800 | No new data arrived for this many seconds while transferring |
+| `remote_queue_timeout` | `[Slskd]` | 3600 | The download waited this long in the peer's upload queue |
+| `max_download_time` | `[Download Settings]` | 86400 | Overall safety cap, including queue time |
+
+Waiting for your own slskd download slots ("Queued, Locally") doesn't count against any limit except the overall cap. `0` disables a limit. The old `stalled_timeout` (a fixed total time) is no longer used.
+
+### Hand-off between runs
+
+By default a run waits until every download has finished, so one slow download holds up the next search. Set `monitor_window` in `[Download Settings]` (seconds) to cap how long a run monitors: unfinished downloads keep going in slskd, their progress timers are saved, and the next run continues monitoring them while also searching for new books. Books still downloading are not searched again.
 
 ## Resume Functionality
 

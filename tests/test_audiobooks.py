@@ -289,7 +289,6 @@ def test_audiobook_download_enqueues_whole_folder():
     assert len(task.extra["files"]) == 8
     assert len(task.extra["expected_files"]) == 8
     assert task.extra["media_type"] == "audiobook"
-    assert task.extra["stalled_timeout"] == 14400
     assert task.local_dir == "Mistborn - The Final Empire"
 
 
@@ -444,9 +443,12 @@ class CapturingOrchestrator:
     def __init__(self):
         self.targets = []
 
-    def batch_process_targets(self, targets, on_complete=None):
+    def start_targets(self, targets, on_complete=None):
         self.targets = targets
-        return {}
+        return []
+
+    def monitor_until(self, tasks, on_complete=None, deadline=None):
+        return [], []
 
     def get_backend(self, name):
         return None

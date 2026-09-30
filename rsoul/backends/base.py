@@ -16,7 +16,8 @@ class DownloadStatus(Enum):
     """Normalized download status across all backends."""
 
     PENDING = "pending"
-    QUEUED = "queued"
+    QUEUED = "queued"  # Waiting in the remote peer's upload queue
+    QUEUED_LOCALLY = "queued_locally"  # Waiting for a free download slot on our own side
     DOWNLOADING = "downloading"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -73,6 +74,7 @@ class DownloadTask:
     output_path: Optional[Path] = None
     error_message: Optional[str] = None
     progress_percent: float = 0.0
+    bytes_transferred: int = 0  # Across all files in the task; used for stall detection
 
     # Backend-specific data
     extra: Dict[str, Any] = field(default_factory=dict)

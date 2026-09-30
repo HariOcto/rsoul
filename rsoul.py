@@ -135,10 +135,12 @@ def main():
         if has_saved_state:
             console.print(f"\nFound saved state with {len(state_manager.get_items())} pending downloads", style="bold yellow")
 
-        # Fetch Wanted Books (skip if we only have saved state to resume)
+        # Fetch Wanted Books. Without a monitor window, a run with saved state only resumes;
+        # with one, it resumes and searches for new books in the same run.
+        monitor_window = config.getint("Download Settings", "monitor_window", fallback=0)
         wanted_books = []
         download_targets = []
-        if not has_saved_state:
+        if not has_saved_state or monitor_window > 0:
             try:
                 for source in search_sources:
                     logger.debug(f"Getting records from {source}")

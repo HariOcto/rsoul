@@ -559,8 +559,9 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
             try:
                 current_task = readarr_client.get_command(task["id"])
             except Exception as e:
-                logger.error(f"Error checking task {task['id']}: {e}")
-                final[task["id"]] = {"id": task["id"], "status": "unknown", "body": task.get("body", {})}
+                # Transient API error: keep polling until the timeout instead of giving up on an
+                # import that may still succeed
+                logger.warning(f"Error checking import command {task['id']}: {e}")
                 continue
             if current_task.get("status") in ["completed", "failed", "aborted", "cancelled", "orphaned"]:
                 final[task["id"]] = current_task
@@ -587,7 +588,7 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
             continue
 
         logger.warning(f"{folder_name}: Import did not succeed (status: {current_task.get('status')}, result: {current_task.get('result', 'n/a')}): {message}")
-        if path and current_task.get("status") != "unknown":
+        if path:
             move_failed_import(to_local_path(path, readarr_download_dir, local_download_dir))
 
     return results

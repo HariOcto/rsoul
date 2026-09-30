@@ -111,9 +111,16 @@ class _RunResults:
             self.ctx.state.remove_task(task.task_id)
 
     def wait_for_imports(self) -> None:
-        """Block until every queued import has finished."""
+        """Block until every queued import has finished.
+
+        An unexpected error in one import is logged rather than raised, so the remaining imports
+        still finish and the run can still save its unfinished downloads for the next run.
+        """
         for future in self._pending:
-            future.result()
+            try:
+                future.result()
+            except Exception:
+                logger.exception("Unexpected error in background import")
         self._imports.shutdown(wait=True)
 
     def _import(self, task: DownloadTask) -> None:

@@ -157,13 +157,13 @@ Progress means new bytes (slskd) or a higher percentage (Stacks, which reports o
 
 The overall cap still applies in both cases. Timers start when a download is queued.
 
-Imports run on a background thread, so the other downloads keep being monitored while Readarr or Chaptarr imports a finished one. A download only counts as successful in the run summary once its import succeeded.
+Imports run on a background thread, so the other downloads keep being monitored while Readarr or Chaptarr imports a finished one. A download only counts as successful in the run summary once its import succeeded; an import still running after an hour counts as failed.
 
 ### Hand-off between runs
 
 By default a run waits until every download has finished, so one slow download holds up the next search. Set `monitor_window` in `[Download Settings]` (seconds) to cap how long a run monitors: unfinished downloads keep going in slskd, their progress timers are saved, and the next run continues monitoring them while also searching for new books. Books still downloading are not searched again.
 
-Each run can add up to `number_of_books_to_grab` new downloads. To keep slow downloads from piling up, set `max_active_downloads`: the most downloads running at once, including the ones handed over from earlier runs.
+Each run can add up to `number_of_books_to_grab` new downloads. To keep slow downloads from piling up, set `max_active_downloads`: the most downloads running at once, including the ones handed over from earlier runs. Keep `number_of_books_to_grab` at or below it: with `search_type = incrementing_page`, wanted books that don't fit under the cap are skipped until the page comes round again.
 
 ## Upgrading from earlier versions
 

@@ -6,17 +6,14 @@ list of {"name", "fileCount", "files"} with basenames).
 """
 
 import configparser
-import logging
 import os
 import sys
 import threading
-import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rsoul import download as download_module
 from rsoul import postprocess, workflow
-from rsoul.backends import slskd_backend
 from rsoul.backends.base import DownloadStatus, DownloadTarget, DownloadTask
 from rsoul.backends.slskd_backend import SlskdBackend
 from rsoul.config import Context
@@ -643,3 +640,39 @@ def test_state_concurrent_updates(tmp_path):
     assert errors == []
     assert state.get_items() == []
     assert StateManager(str(tmp_path)).get_items() == []
+
+
+# ---------------------------------------------------------------------------
+# Re-review: a transient API error while waiting for an import is retried
+# ---------------------------------------------------------------------------
+
+
+def test_import_monitor_retries_transient_errors(monkeypatch):
+    calls = {"n": 0}
+
+    class Readarr:
+        def get_command(self, id_):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("blip")
+            return {"id": id_, "status": "completed", "result": "successful", "message": "Imported 1 book", "body": {}}
+
+    monkeypatch.setattr(postprocess.time, "sleep", lambda s: None)
+    assert postprocess.monitor_imports(Readarr(), [{"id": 1}]) == {1: True}
+
+
+def test_import_thread_error_does_not_abort_the_run(monkeypatch, tmp_path):
+    def broken_import(ctx, items):
+        return {items[0]["bookId"]: True}
+
+    monkeypatch.setattr(workflow.postprocess, "process_imports", broken_import)
+
+    class BrokenState:
+        def remove_task(self, task_id):
+            raise OSError("disk full")
+
+    ctx = Context(config=make_config(), slskd=None, readarr=None, config_dir=str(tmp_path), state=BrokenState())
+    results = workflow._RunResults(ctx, [])
+    results.on_complete(DownloadTask("t", "fake", DownloadStatus.COMPLETED, "b", "a", 1, "f"))
+    results.wait_for_imports()  # must not raise
+    assert len(results.completed_tasks) == 1

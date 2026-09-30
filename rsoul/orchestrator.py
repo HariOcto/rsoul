@@ -285,7 +285,7 @@ class DownloadOrchestrator:
 
             reason = self.check_timeouts(task)
             if reason:
-                logger.error(f"Giving up on {task.filename}: {reason}")
+                logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
                 backend.cancel(task)
                 task.status = DownloadStatus.FAILED
                 task.error_message = reason
@@ -402,9 +402,9 @@ class DownloadOrchestrator:
 
     def _finish(self, task: DownloadTask, on_complete: Optional[Callable[[DownloadTask], None]]) -> None:
         if task.status == DownloadStatus.COMPLETED:
-            logger.info(f"Task completed: {task.filename}")
+            logger.info(f"Task completed: {task.book_title} ({task.filename})")
         else:
-            logger.warning(f"Task failed: {task.filename} - {task.error_message}")
+            logger.warning(f"Task failed: {task.book_title} ({task.filename}) - {task.error_message}")
         if on_complete:
             try:
                 on_complete(task)
@@ -457,7 +457,7 @@ class DownloadOrchestrator:
 
                 reason = self.check_timeouts(task)
                 if reason:
-                    logger.error(f"Giving up on {task.filename}: {reason}")
+                    logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
                     backend.cancel(task)
                     task.status = DownloadStatus.FAILED
                     task.error_message = reason

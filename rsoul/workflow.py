@@ -104,29 +104,53 @@ class _RunResults:
             self.ctx.state.remove_task(task.task_id)
 
     def _handle_failure(self, task: DownloadTask) -> None:
-        failed_target = self.targets_by_id.get(task.book_id)
+        if self.remove_wanted_on_failure:
+            failed_target = self.targets_by_id.get(task.book_id)
+            if failed_target:
+                book = failed_target.readarr_book
+                media_type = failed_target.media_type
+            else:
+                # Download started in an earlier run (hand-off/resume): fetch the book again
+                book = None
+                media_type = task.extra.get("media_type", "ebook")
+                try:
+                    book = self.ctx.readarr.get_book(task.book_id)
+                except Exception as e:
+                    logger.error(f"Could not fetch book {task.book_id} to unmonitor it: {e}")
 
-        if failed_target and self.remove_wanted_on_failure:
-            book = failed_target.readarr_book
-            author = failed_target.readarr_author
+            if book:
+                logger.error(f"Failed to grab book: {book.get('title', task.book_title)} for author: {task.author_name}." + ' Failed book removed from wanted list and added to "failure_list.txt"')
+                unmonitor_book(self.ctx, book, media_type)
 
-            logger.error(f"Failed to grab book: {book['title']} for author: {author['authorName']}." + ' Failed book removed from wanted list and added to "failure_list.txt"')
-            book["monitored"] = False
-            try:
-                edition = self.ctx.readarr.get_edition(book["id"])
-                self.ctx.readarr.upd_book(book=book, editions=edition)
-            except Exception as e:
-                logger.error(f"Failed to unmonitor book: {e}")
-
-            current_datetime_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            failure_string = current_datetime_str + " - " + author["authorName"] + ", " + book["title"] + "\n"
-            with open(self.failure_file_path, "a") as file:
-                file.write(failure_string)
+                current_datetime_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                failure_string = current_datetime_str + " - " + task.author_name + ", " + book.get("title", task.book_title) + "\n"
+                with open(self.failure_file_path, "a") as file:
+                    file.write(failure_string)
+            else:
+                logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
         else:
             logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
 
         self.failed_download += 1
         self.failed_books.append((task.author_name, task.book_title))
+
+
+def unmonitor_book(ctx: "Context", book: Dict[str, Any], media_type: str) -> None:
+    """Unmonitor a book in Readarr or Chaptarr.
+
+    Chaptarr tracks monitoring per media type. When a PUT carries its audiobookMonitored /
+    ebookMonitored fields, those win over the legacy "monitored" flag, so setting only
+    "monitored" would silently change nothing. Clear the flag for this media type as well.
+    """
+    book["monitored"] = False
+    side = "audiobookMonitored" if media_type == "audiobook" else "ebookMonitored"
+    if side in book:
+        book[side] = False
+    try:
+        edition = ctx.readarr.get_edition(book["id"])
+        ctx.readarr.upd_book(book=book, editions=edition)
+    except Exception as e:
+        logger.error(f"Failed to unmonitor book: {e}")
 
 
 def _resume_persisted(ctx: "Context") -> List[DownloadTask]:

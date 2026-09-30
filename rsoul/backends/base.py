@@ -75,6 +75,7 @@ class DownloadTask:
     error_message: Optional[str] = None
     progress_percent: float = 0.0
     bytes_transferred: int = 0  # Across all files in the task; used for stall detection
+    poll_failed: bool = False  # Set by the backend when the last status poll could not be trusted
 
     # Backend-specific data
     extra: Dict[str, Any] = field(default_factory=dict)

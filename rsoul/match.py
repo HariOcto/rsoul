@@ -286,6 +286,39 @@ def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[
     return candidates
 
 
+_STOP_WORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "by", "with"}
+
+
+def _meaningful_words(text: str) -> List[str]:
+    return [w for w in normalize_for_matching(text).split() if w not in _STOP_WORDS]
+
+
+def title_variants(title: str) -> List[str]:
+    """The full title plus shorter forms that folders are often named after.
+
+    "Mistborn: The Final Empire" also gives "The Final Empire" (but not "Mistborn" alone),
+    and "The Final Empire (Mistborn #1)" also gives "The Final Empire". A shortened form is
+    only used if it has at least two meaningful words, so it can't match on one common word.
+    """
+    variants = [title]
+    no_suffix = re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", title).strip()
+    if no_suffix and no_suffix != title:
+        variants.append(no_suffix)
+    for text in list(variants):
+        if ":" in text:
+            main, sub = (part.strip() for part in text.split(":", 1))
+            for part in (sub, main):
+                if len(_meaningful_words(part)) >= 2 and part not in variants:
+                    variants.append(part)
+    return variants
+
+
+def author_in_name(author_name: str, candidate: str) -> bool:
+    """True if the author's surname appears in the candidate name."""
+    words = [w for w in normalize_for_matching(author_name).split() if len(w) > 1]
+    return bool(words) and words[-1] in normalize_for_matching(candidate).split()
+
+
 def audiobook_folder_match(
     target: Dict[str, Any],
     slskd_files: List[Dict[str, Any]],
@@ -316,6 +349,8 @@ def audiobook_folder_match(
     author_name = target["author"]["authorName"]
     allowed = [ext.split(" ")[0].lower() for ext in allowed_filetypes]
 
+    titles = title_variants(book_title)
+
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for slskd_file in slskd_files:
         directory, basename = split_slskd_path(slskd_file["filename"])
@@ -327,19 +362,23 @@ def audiobook_folder_match(
     for (directory, ext), files in groups.items():
         best_score = None
         for name in folder_name_candidates(directory, files):
-            score = score_name(
-                book_title,
-                author_name,
-                name,
-                minimum_match_ratio,
-                min_length_ratio=min_length_ratio,
-                min_jaccard_ratio=min_jaccard_ratio,
-                min_word_overlap=min_word_overlap,
-                min_title_jaccard=min_title_jaccard,
-                min_author_jaccard=min_author_jaccard,
-            )
-            if score is not None and (best_score is None or score > best_score):
-                best_score = score
+            for i, title in enumerate(titles):
+                # Shortened titles are easier to match by accident, so they need the author too
+                if i > 0 and not author_in_name(author_name, name):
+                    continue
+                score = score_name(
+                    title,
+                    author_name,
+                    name,
+                    minimum_match_ratio,
+                    min_length_ratio=min_length_ratio,
+                    min_jaccard_ratio=min_jaccard_ratio,
+                    min_word_overlap=min_word_overlap,
+                    min_title_jaccard=min_title_jaccard,
+                    min_author_jaccard=min_author_jaccard,
+                )
+                if score is not None and (best_score is None or score > best_score):
+                    best_score = score
 
         if best_score is None or best_score < minimum_match_ratio:
             continue

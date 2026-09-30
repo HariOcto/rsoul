@@ -43,13 +43,18 @@ class DownloadOrchestrator:
         # stops moving, waits too long in the peer's queue, or exceeds the overall safety cap.
         cfg = ctx.config
         self.stall_timeout = cfg.getint("Download Settings", "stall_timeout", fallback=1800)
-        self.queue_timeout = cfg.getint("Slskd", "remote_queue_timeout", fallback=3600)
+        self.queue_timeout = cfg.getint("Download Settings", "queue_timeout", fallback=3600)
         self.max_download_time = cfg.getint("Download Settings", "max_download_time", fallback=86400)
-        if cfg.has_option("Slskd", "stalled_timeout") or cfg.has_option("General", "stalled_timeout"):
-            logger.warning(
-                "'stalled_timeout' is no longer used: downloads now time out on lack of progress "
-                "(stall_timeout, remote_queue_timeout) with max_download_time as an overall cap."
-            )
+
+        # Settings from older versions that no longer do anything. remote_queue_timeout was never
+        # read before, so honouring it now (the sample config had 300s) would cancel most queued
+        # downloads after five minutes on upgrade; it is deliberately ignored instead.
+        for section, option in (("Slskd", "stalled_timeout"), ("General", "stalled_timeout"), ("Slskd", "remote_queue_timeout")):
+            if cfg.has_option(section, option):
+                logger.warning(
+                    f"[{section}] {option} is no longer used and can be removed. Downloads now time out on lack of "
+                    "progress: see stall_timeout, queue_timeout and max_download_time in [Download Settings]."
+                )
         self.poll_interval = 10  # seconds between status checks
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
@@ -196,6 +201,14 @@ class DownloadOrchestrator:
         if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
             return f"Exceeded max_download_time ({self.max_download_time}s)"
 
+        if task.poll_failed:
+            # Status unknown (e.g. slskd restarting): an outage is not the peer's fault, so the
+            # stall and queue timers wait; they restart from here once polling works again
+            m["last_progress_at"] = now
+            if m.get("queued_since") is not None:
+                m["queued_since"] = now
+            return None
+
         if task.status == DownloadStatus.QUEUED_LOCALLY:
             # Waiting for our own slskd download slots: not the peer's fault, so no timer runs
             m["queued_since"] = None
@@ -203,7 +216,7 @@ class DownloadOrchestrator:
             return None
 
         if task.status == DownloadStatus.QUEUED:
-            if not m.get("queued_since"):
+            if m.get("queued_since") is None:
                 m["queued_since"] = now
             if self.queue_timeout > 0 and now - m["queued_since"] >= self.queue_timeout:
                 return f"Waited more than {self.queue_timeout}s in the peer's upload queue"
@@ -212,6 +225,12 @@ class DownloadOrchestrator:
             return None
 
         m["queued_since"] = None
+        if task.bytes_transferred < m["last_bytes"]:
+            # The counter went backwards (resumed task tracking fewer files, or slskd restarted a
+            # transfer): treat it as a fresh baseline, not as a stall
+            m["last_bytes"] = task.bytes_transferred
+            m["last_progress_at"] = now
+            return None
         if task.bytes_transferred > m["last_bytes"]:
             m["last_bytes"] = task.bytes_transferred
             m["last_progress_at"] = now
@@ -220,6 +239,20 @@ class DownloadOrchestrator:
         if self.stall_timeout > 0 and now - m["last_progress_at"] >= self.stall_timeout:
             return f"No data received for {self.stall_timeout}s"
         return None
+
+    def _poll(self, backend: DownloadBackend, task: DownloadTask) -> DownloadTask:
+        """Refresh a task's status. Tasks that are already finished (e.g. a resumed download
+        found complete on disk) are left as they are; failed polls are flagged, not fatal."""
+        if task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+            return task
+        try:
+            task.poll_failed = False
+            return backend.get_status(task)
+        except Exception as e:
+            # Transient API errors: keep the task and try again next poll
+            logger.error(f"Error checking status for {task.filename}: {e}")
+            task.poll_failed = True
+            return task
 
     def _monitor_task(self, backend: DownloadBackend, task: DownloadTask) -> DownloadTask:
         """Monitor a download until completion or timeout (blocking).
@@ -232,7 +265,7 @@ class DownloadOrchestrator:
             Updated task with final status
         """
         while True:
-            task = backend.get_status(task)
+            task = self._poll(backend, task)
             if task.status == DownloadStatus.COMPLETED:
                 logger.info(f"Download completed: {task.filename}")
                 return task
@@ -407,11 +440,7 @@ class DownloadOrchestrator:
                     self._finish(task, on_complete)
                     continue
 
-                try:
-                    task = backend.get_status(task)
-                except Exception as e:
-                    # Transient API errors: keep the task and try again next poll
-                    logger.error(f"Error checking status for {task.filename}: {e}")
+                task = self._poll(backend, task)
 
                 if task.status in [DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED]:
                     completed_map[task_id] = task

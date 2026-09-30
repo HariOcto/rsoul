@@ -264,9 +264,10 @@ class SlskdBackend(DownloadBackend):
             logger.warning(f"Could not browse folder '{directory}' from {username}: {e}")
             return None
 
-        # slskd > 0.22.2 returns a list with one entry; older versions return the entry itself
+        # slskd > 0.22.2 returns a list of directories ({"name", "fileCount", "files"}); older
+        # versions return a single directory object
         if isinstance(listing, list):
-            listing = listing[0] if listing else None
+            listing = next((d for d in listing if d.get("name") == directory), listing[0] if listing else None)
         if not isinstance(listing, dict):
             return None
 
@@ -411,6 +412,15 @@ class SlskdBackend(DownloadBackend):
         ok = slskd_download_status(self.client, downloads)
         if not ok:
             logger.debug(f"Failed to get status for some files in task {task.task_id}")
+            # slskd forgets transfers (restart, "clear completed"); a file that is already in the
+            # download folder at full size has finished. slskd writes unfinished files to its
+            # separate incomplete directory, so a file here is complete.
+            for f in downloads:
+                if f.get("status") is None and self._finished_on_disk(task, f):
+                    f["status"] = {"state": "Completed, Succeeded", "bytesTransferred": f.get("size", 0)}
+
+        # Still-unknown files mean this poll can't be trusted; the orchestrator pauses timeouts
+        task.poll_failed = any(f.get("status") is None for f in downloads)
 
         all_succeeded, has_errors = downloads_all_done(downloads)
 
@@ -433,9 +443,11 @@ class SlskdBackend(DownloadBackend):
         # Map remaining slskd states to DownloadStatus
         states = [f.get("status", {}).get("state", "") for f in downloads if f.get("status")]
 
-        # Aggregate progress across all files (completed files count in full)
-        total_size = sum(f.get("size", 0) for f in downloads)
-        bytes_transferred = sum(f.get("status", {}).get("bytesTransferred", 0) for f in downloads if f.get("status"))
+        # Aggregate progress across all files (completed files count in full). offline_bytes are
+        # chapters that finished in an earlier run and are no longer tracked in slskd.
+        offline = task.extra.get("offline_bytes", 0)
+        total_size = sum(f.get("size", 0) for f in downloads) + offline
+        bytes_transferred = sum(f.get("status", {}).get("bytesTransferred", 0) for f in downloads if f.get("status")) + offline
         task.bytes_transferred = bytes_transferred
         if total_size > 0:
             task.progress_percent = (bytes_transferred / total_size) * 100
@@ -453,6 +465,16 @@ class SlskdBackend(DownloadBackend):
             task.status = DownloadStatus.PENDING
 
         return task
+
+    def _finished_on_disk(self, task: DownloadTask, file: Dict[str, Any]) -> bool:
+        """True if the file is already in the local download folder at its full size."""
+        if not self.download_dir:
+            return False
+        path = Path(self.download_dir) / (task.local_dir or "") / file["filename"].split("\\")[-1]
+        try:
+            return path.is_file() and (not file.get("size") or path.stat().st_size == file["size"])
+        except OSError:
+            return False
 
     def cancel(self, task: DownloadTask) -> bool:
         """Cancel the download in slskd."""
@@ -592,6 +614,8 @@ class SlskdBackend(DownloadBackend):
             return None
 
         extra["files"] = list(tracked.values())
+        # Chapters finished in an earlier run still count towards progress
+        extra["offline_bytes"] = sum((Path(self.download_dir) / local_dir / name).stat().st_size for name in on_disk)
         task = DownloadTask(
             task_id=task_data["task_id"],
             backend_name=self.name,

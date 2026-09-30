@@ -177,8 +177,10 @@ class FakeUsers:
 
     def directory(self, username, directory):
         self.browsed.append((username, directory))
-        # slskd > 0.22.2 returns a one-element list with basenames
-        return [self.listings[(username, directory)]]
+        # Shape per slskd's UsersController: a list of Soulseek directories,
+        # {"name", "fileCount", "files": [{"filename": <basename>, "size", ...}]}
+        listing = self.listings[(username, directory)]
+        return [{"name": directory, "fileCount": len(listing["files"]), "files": listing["files"]}]
 
 
 class FakeTransfers:
@@ -196,7 +198,14 @@ class FakeTransfers:
         directory = files[0]["filename"].rsplit("\\", 1)[0] if files else ""
         return {
             "directories": [
-                {"directory": directory, "files": [{"filename": f["filename"], "id": f"id{i}", "size": f["size"]} for i, f in enumerate(files)]}
+                {
+                    "directory": directory,
+                    "fileCount": len(files),
+                    "files": [
+                        {"filename": f["filename"], "id": f"id{i}", "size": f["size"], "state": "Queued, Remotely", "bytesTransferred": 0}
+                        for i, f in enumerate(files)
+                    ],
+                }
             ]
         }
 

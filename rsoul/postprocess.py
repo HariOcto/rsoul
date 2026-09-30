@@ -474,7 +474,22 @@ def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folde
     return commands
 
 
-def monitor_imports(readarr_client: Any, commands: list) -> None:
+def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str) -> str:
+    """Translate a path as Readarr/Chaptarr sees it into the path R:soul sees.
+
+    Import commands report paths from Readarr's side of the Docker volume mapping; moving
+    a failed import has to use R:soul's side, or the folder is never found.
+    """
+    if not readarr_download_dir or not local_download_dir:
+        return path
+    remote = os.path.normpath(readarr_download_dir)
+    normalized = os.path.normpath(path)
+    if normalized == remote or normalized.startswith(remote + os.sep):
+        return os.path.join(local_download_dir, os.path.relpath(normalized, remote))
+    return path
+
+
+def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: str = "", local_download_dir: str = "") -> None:
     """Monitor progress of Readarr import commands and report results."""
     if not commands:
         return
@@ -518,7 +533,7 @@ def monitor_imports(readarr_client: Any, commands: list) -> None:
                 if "failed" in message.lower() or "no files found" in message.lower():
                     logger.warning(f"{folder_name}: Import completed with warnings/errors: {message}")
                     if "body" in current_task and "path" in current_task["body"]:
-                        move_failed_import(current_task["body"]["path"])
+                        move_failed_import(to_local_path(current_task["body"]["path"], readarr_download_dir, local_download_dir))
                 else:
                     logger.info(f"{folder_name}: Import completed. Message: {message}")
 
@@ -529,7 +544,7 @@ def monitor_imports(readarr_client: Any, commands: list) -> None:
 
                 # Move failed import
                 if "body" in current_task and "path" in current_task["body"]:
-                    move_failed_import(current_task["body"]["path"])
+                    move_failed_import(to_local_path(current_task["body"]["path"], readarr_download_dir, local_download_dir))
             else:
                 logger.warning(f"{folder_name}: Import status unknown - {status}")
 
@@ -715,7 +730,7 @@ def process_imports(ctx: Any, grab_list: list):
             logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
             commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
             if commands:
-                monitor_imports(readarr, commands)
+                monitor_imports(readarr, commands, readarr_download_dir, local_download_dir)
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")

@@ -22,8 +22,9 @@ MEDIA_MODES = (EBOOK, AUDIOBOOK, BOTH)
 DEFAULT_EBOOK_FORMATS = ["epub", "azw3", "mobi"]
 DEFAULT_AUDIOBOOK_FORMATS = ["m4b", "mp3"]
 
-# Extensions treated as audio for folder grabbing and import handling.
-AUDIO_EXTENSIONS = {"m4b", "m4a", "mp3", "aac", "flac", "ogg", "opus", "wma"}
+# Audio extensions Chaptarr can import (from its MediaFileExtensions). Formats outside this
+# set would download fine but then fail to import.
+AUDIO_EXTENSIONS = {"flac", "ape", "wavpack", "wav", "alac", "mp2", "mp3", "wma", "m4a", "m4p", "m4b", "mp4", "aac", "mp4a", "ogg"}
 
 _warned_missing_media_type = False
 
@@ -80,5 +81,6 @@ def get_formats(config: Any, media_type: str) -> List[str]:
     return formats or list(DEFAULT_EBOOK_FORMATS)
 
 
-def is_audio_extension(extension: str) -> bool:
-    return extension.strip().lower().lstrip(".") in AUDIO_EXTENSIONS
+def unsupported_audiobook_formats(config: Any) -> List[str]:
+    """Configured audiobook formats that Chaptarr would not import."""
+    return [f for f in get_formats(config, AUDIOBOOK) if f not in AUDIO_EXTENSIONS]

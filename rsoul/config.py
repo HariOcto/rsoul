@@ -143,9 +143,12 @@ def validate_config(config: configparser.ConfigParser) -> None:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Stacks'")
 
     # Validate media mode early so a typo fails at startup, not mid-run
-    from .media import get_media_mode
+    from .media import get_media_mode, unsupported_audiobook_formats, EBOOK
 
-    get_media_mode(config)
+    if get_media_mode(config) != EBOOK:
+        unsupported = unsupported_audiobook_formats(config)
+        if unsupported:
+            logger.warning(f"audiobook_formats contains formats Chaptarr can't import: {', '.join(unsupported)}")
 
     # Validate priority list references only known backends
     if "Backends" in config:

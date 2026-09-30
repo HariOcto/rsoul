@@ -294,3 +294,47 @@ def test_single_download_404_means_transfer_gone(tmp_path):
 
     backend, task = slskd_task(tmp_path, C())
     assert backend.get_status(task).status == DownloadStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# From the live test: wanted "Salvation" (Peter F. Hamilton) must not download
+# "The Saints of Salvation" or "Salvation Lost"
+# ---------------------------------------------------------------------------
+
+
+def test_salvation_does_not_match_other_books_in_the_series():
+    from rsoul.match import audiobook_folder_match
+
+    folders = {
+        "darri": [
+            ("@@mbhkr\\audiobooks\\Sci-Fi\\Peter F. Hamilton\\Peter F Hamilton - Salvation (m4b)", "m4b", 1),
+            ("@@mbhkr\\audiobooks\\Sci-Fi\\Peter F. Hamilton\\Peter F. Hamilton - Salvation Lost", "mp3", 35),
+        ],
+        "Azazin1711": [("Hörbücher\\+ Hörbücher Sci-Fi +\\Peter F. Hamilton - Die Salvation Saga 3 - Erlösung", "mp3", 224)],
+        "squickle": [("Audiobooks on 16TB-3\\H\\Hamilton, Peter F\\Salvation Sequence 1 - Salvation", "m4b", 1)],
+        "hast": [("Virtual Voice Audiobooks\\Peter F. Hamilton\\Salvation (Unabridged)", "m4b", 1)],
+        "QZm": [("books\\audio_books\\Peter F. Hamilton\\The Saints of Salvation", "mp3", 193)],
+        "wobble7582": [("Audiobooks\\Peter F. Hamilton\\The Saints of Salvation", "m4b", 1)],
+    }
+    target = {"book": {"title": "Salvation", "seriesTitle": "The Salvation Sequence"}, "author": {"authorName": "Peter F. Hamilton"}}
+    matched = {}
+    for user, dirs in folders.items():
+        files = [{"filename": f"{d}\\{i:02d}.{ext}", "size": 10} for d, ext, n in dirs for i in range(1, n + 1)]
+        for m in audiobook_folder_match(target, files, user, ["m4b", "mp3"], [], 0.7):
+            matched[user] = m["directory"].split("\\")[-1]
+
+    assert matched == {
+        "darri": "Peter F Hamilton - Salvation (m4b)",
+        "squickle": "Salvation Sequence 1 - Salvation",
+        "hast": "Salvation (Unabridged)",
+    }
+
+
+def test_title_segment_match_cases():
+    from rsoul.match import title_segment_match as t
+
+    assert t("Lines of Departure", "Frontlines 2 - Lines of Departure", "Marko Kloos")
+    assert t("Lines of Departure", "Marko-Kloos-Lines-of-Departure-Unabr", "Marko Kloos")
+    assert t("Knife Edge", "Christopher G. Nuttall - Knife Edge Empire's Corps, Book 17", "Christopher G. Nuttall", "Empire's Corps")
+    assert not t("Knife Edge", "Christopher G. Nuttall - Knife Edge Empire's Corps, Book 17", "Christopher G. Nuttall", "")
+    assert not t("Salvation", "Peter F. Hamilton - Salvation Lost", "Peter F. Hamilton")

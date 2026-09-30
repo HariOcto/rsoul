@@ -328,6 +328,44 @@ def title_variants(title: str) -> List[str]:
     return variants
 
 
+# Words that may sit next to the title in a folder name without making it a different book
+_TITLE_NOISE = {
+    "book", "books", "bk", "vol", "volume", "part", "series", "sequence", "saga", "cycle", "trilogy",
+    "unabridged", "unabr", "abridged", "audiobook", "audio", "hoerbuch", "hörbuch", "retail",
+    "complete", "edition", "narrated", "read", "by", "m4b", "mp3", "m4a", "aac", "flac", "kbps",
+}
+
+
+def title_segment_match(title: str, candidate: str, author_name: str = "", series_title: str = "") -> bool:
+    """True if some part of the name is this title and nothing else.
+
+    The fuzzy score alone can't tell "Salvation" from "The Saints of Salvation" or "Salvation
+    Lost": it compares the last words of a name with the title and scores 1.0. Here the name is
+    split at " - ", commas, colons and folder boundaries, and one part must contain every word
+    of the title plus nothing except the author's name, the series name, numbers and noise such
+    as "Book", "Unabridged" or "m4b". "Frontlines 2 - Lines of Departure" and "Salvation
+    Sequence 1 - Salvation" pass; "The Saints of Salvation" and "Salvation Lost" don't.
+    """
+    title_words = set(_meaningful_words(title))
+    if not title_words:
+        return True
+
+    name = candidate
+    if " " not in name.strip():
+        name = re.sub(r"[-_.]+", " ", name)  # "Marko-Kloos-Lines-of-Departure-Unabr"
+    name = _BRACKETED.sub(" ", name)
+    ignore = set(normalize_for_matching(author_name).split()) | set(_meaningful_words(series_title)) | _TITLE_NOISE
+
+    for segment in re.split(r"\s+[-–]\s+|\\|,|;|:", name):
+        words = [w for w in normalize_for_matching(segment).split() if w not in STOP_WORDS]
+        if not title_words <= set(words):
+            continue
+        extras = [w for w in words if w not in title_words and w not in ignore and not re.fullmatch(r"\d+(?:st|nd|rd|th)?", w)]
+        if not extras:
+            return True
+    return False
+
+
 def author_in_name(author_name: str, candidate: str) -> bool:
     """True if the author's surname appears in the candidate name (or path)."""
     words = [w for w in normalize_for_matching(author_name).split() if len(w) > 1 and w not in _NAME_SUFFIXES]
@@ -366,6 +404,7 @@ def audiobook_folder_match(
 
     book_title = target["book"]["title"]
     author_name = target["author"]["authorName"]
+    series_title = target["book"].get("seriesTitle") or ""
     allowed = [ext.split(" ")[0].lower() for ext in allowed_filetypes]
 
     titles = title_variants(book_title)
@@ -399,8 +438,14 @@ def audiobook_folder_match(
             note("folders without the author's surname", directory)
             continue
 
+        names = folder_name_candidates(directory, files)
+        if not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
+            # e.g. "The Saints of Salvation" or "Salvation Lost" when "Salvation" is wanted
+            note("folders for a different title", directory)
+            continue
+
         best_score = None
-        for name in folder_name_candidates(directory, files):
+        for name in names:
             for title in titles:
                 score = score_name(
                     title,

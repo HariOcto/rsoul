@@ -360,7 +360,8 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
         words = [w for w in normalize_for_matching(segment).split() if w not in STOP_WORDS]
         if not title_words <= set(words):
             continue
-        extras = [w for w in words if w not in title_words and w not in ignore and not re.fullmatch(r"\d+(?:st|nd|rd|th)?", w)]
+        # Numbers, including ordinals such as 1st, 3rd or 4th, don't make it a different title
+        extras = [w for w in words if w not in title_words and w not in ignore and not re.fullmatch(r"\d+(?:[snrt][tdh])?", w)]
         if not extras:
             return True
     return False

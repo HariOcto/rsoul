@@ -11,7 +11,7 @@ from rich.console import Console
 from readarr_api import ReadarrAPI
 import slskd_api
 
-from rsoul.config import Context, setup_logging, validate_config
+from rsoul.config import Context, setup_logging, validate_config, apply_env_overrides, ENV_PREFIX
 from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
 from rsoul.workflow import run_workflow
@@ -67,11 +67,24 @@ def main():
         # Disable interpolation to make storing logging formats in the config file much easier
         config = configparser.ConfigParser(interpolation=None)
 
+        # The sample config shipped with R:soul supplies the defaults when there is no
+        # config.ini but settings come from RSOUL__<SECTION>__<OPTION> environment variables
+        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+        env_configured = any(key.upper().startswith(ENV_PREFIX) for key in os.environ)
+
         if os.path.exists(config_file_path):
             config.read(config_file_path)
+            config_source = config_file_path
+        elif env_configured and os.path.exists(template_path):
+            config.read(template_path)
+            config_source = "environment variables (defaults from the bundled sample config)"
         else:
             if is_docker():
-                console.print('Config file does not exist! Please mount "/data" and place your "config.ini" file there.', style="bold red")
+                console.print(
+                    'Config file does not exist! Mount "/data" and place your "config.ini" there, '
+                    f"or set options with {ENV_PREFIX}<SECTION>__<OPTION> environment variables.",
+                    style="bold red",
+                )
             else:
                 console.print("Config file does not exist! Please place it in the working directory.", style="bold red")
 
@@ -79,8 +92,14 @@ def main():
                 os.remove(lock_file_path)
             sys.exit(0)
 
+        # Environment variables override config.ini
+        env_overrides = apply_env_overrides(config)
+
         # Setup Logging
         setup_logging(config)
+        logger.info(f"Configuration from: {config_source}")
+        for line in env_overrides:
+            logger.info(f"Environment override: {line}")
 
         # Validate Config
         validate_config(config)

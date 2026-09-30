@@ -272,10 +272,11 @@ class DownloadBackend(ABC):
         pass
 
     def cleanup(self, task: DownloadTask) -> None:
-        """Optional cleanup after successful import.
+        """Optional cleanup once a task has finished (successfully or not).
 
-        Override if backend needs post-import cleanup
-        (e.g., removing from transfer list).
+        Override if the backend keeps per-download records that should go away,
+        e.g. slskd's transfer list. Only this task's own records may be touched:
+        other tools can share the same backend.
         """
         pass
 

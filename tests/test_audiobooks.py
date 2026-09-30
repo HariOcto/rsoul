@@ -209,8 +209,9 @@ class FakeTransfers:
             ]
         }
 
-    def cancel_download(self, username, id):
+    def cancel_download(self, username, id, remove=False):
         self.cancelled.append(id)
+        return True
 
     def get_all_downloads(self):
         return []

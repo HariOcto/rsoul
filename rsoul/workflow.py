@@ -103,12 +103,24 @@ class _RunResults:
 
     def on_complete(self, task: DownloadTask) -> None:
         if task.status == DownloadStatus.COMPLETED:
+            self._forget_transfers(task)
             self._pending.append(self._imports.submit(self._import, task))
             return
 
         self._handle_failure(task)
+        self._forget_transfers(task)
         if self.ctx.state:
             self.ctx.state.remove_task(task.task_id)
+
+    def _forget_transfers(self, task: DownloadTask) -> None:
+        """Remove this task's records from the backend (e.g. slskd's transfer list). Files on
+        disk are untouched; resume recognises finished files there if R:soul stops mid-import."""
+        backend = self.ctx.orchestrator.get_backend(task.backend_name) if self.ctx.orchestrator else None
+        if backend:
+            try:
+                backend.cleanup(task)
+            except Exception as e:
+                logger.warning(f"Could not clean up backend records for {task.book_title}: {e}")
 
     def wait_for_imports(self) -> None:
         """Block until every queued import has finished.
@@ -294,13 +306,6 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
     # 5. Final Cleanup
     if ctx.state and not ctx.state.has_pending_state():
         ctx.state.clear()
-
-    # Cleanup backend transfers (unfinished audiobooks keep their finished files on disk; resume accounts for that)
-    if ctx.slskd and ctx.config.getboolean("Backends", "slskd_enabled", fallback=True):
-        try:
-            ctx.slskd.transfers.remove_completed_downloads()
-        except Exception as e:
-            logger.warning(f"Failed to cleanup slskd transfers: {e}")
 
     # 6. Run Summary
     print_run_summary(

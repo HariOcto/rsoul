@@ -3,7 +3,6 @@
 Uses the real slskd-api client and R:soul's own Readarr client over real HTTP, with
 response shapes taken from the slskd v0.26 and Chaptarr v0.9.965 source.
 """
-import configparser
 import json
 import os
 import re
@@ -31,7 +30,10 @@ CH = {BOOK1_DIR: [(f"{i:02d} - Chapter {i}.mp3", 1000 + i) for i in range(1, 13)
       DECOY_DIR: [(f"{i:02d}.mp3", 3000) for i in range(1, 4)]}
 
 # ------------------------------------------------------------------ fake slskd
-transfers = {}  # id -> record
+# A finished download that belongs to another tool sharing slskd (e.g. Soularr for music);
+# R:soul must leave it alone
+FOREIGN = {"id": "soularr-1", "username": "musicpeer", "filename": "@@m\\Music\\Album\\01.flac", "size": 10, "state": "Completed, Succeeded", "bytesTransferred": 10}
+transfers = {"soularr-1": dict(FOREIGN)}  # id -> record
 lock = threading.Lock()
 
 def user_dirs(username):
@@ -115,7 +117,10 @@ class Slskd(BaseHTTPRequestHandler):
             if p.startswith("/api/v0/searches/"): return self.send(204)
             m = re.fullmatch(r"/api/v0/transfers/downloads/([^/]+)/([^/]+)", p)
             if m and m.group(2) in transfers:
-                transfers[m.group(2)]["state"] = "Completed, Cancelled"
+                if not transfers[m.group(2)]["state"].startswith("Completed"):
+                    transfers[m.group(2)]["state"] = "Completed, Cancelled"
+                if parse_qs(urlparse(self.path).query).get("remove") == ["True"] or parse_qs(urlparse(self.path).query).get("remove") == ["true"]:
+                    del transfers[m.group(2)]
                 return self.send(204)
         self.send(204)
 
@@ -159,16 +164,22 @@ def serve(handler):
 
 slskd_srv, chaptarr_srv = serve(Slskd), serve(Chaptarr)
 
-config = configparser.ConfigParser(interpolation=None)
-config.read(os.path.join(REPO, "config.ini"))
-config["Readarr"]["host_url"] = f"http://127.0.0.1:{chaptarr_srv.server_port}/audiobook"
-config["Slskd"].update({"host_url": f"http://127.0.0.1:{slskd_srv.server_port}", "download_dir": DL, "readarr_download_dir": DL})
-config["Search Settings"].update({"media_mode": "audiobook", "audiobook_min_size_mb": "0", "search_type": "first_page", "ignored_users": ""})
-config["Download Settings"].update({"monitor_window": "0", "stall_timeout": "1" if os.environ.get("SCENARIO") == "stall" else "1800"})
-config.setdefault("General", {})
-config["General"]["batch_delay"] = "0"
-with open(os.path.join(CFG, "config.ini"), "w") as f:
-    config.write(f)
+# Configure R:soul entirely through environment variables: no config.ini in the data folder
+os.environ.update({
+    "RSOUL__READARR__HOST_URL": f"http://127.0.0.1:{chaptarr_srv.server_port}/audiobook",
+    "RSOUL__READARR__API_KEY": "chaptarr-key",
+    "RSOUL__SLSKD__HOST_URL": f"http://127.0.0.1:{slskd_srv.server_port}",
+    "RSOUL__SLSKD__API_KEY": "slskd-key",
+    "RSOUL__SLSKD__DOWNLOAD_DIR": DL,
+    "RSOUL__SLSKD__READARR_DOWNLOAD_DIR": DL,
+    "RSOUL__SEARCH_SETTINGS__MEDIA_MODE": "audiobook",
+    "RSOUL__SEARCH_SETTINGS__AUDIOBOOK_MIN_SIZE_MB": "0",
+    "RSOUL__SEARCH_SETTINGS__SEARCH_TYPE": "first_page",
+    "RSOUL__SEARCH_SETTINGS__IGNORED_USERS": "",
+    "RSOUL__DOWNLOAD_SETTINGS__MONITOR_WINDOW": "0",
+    "RSOUL__DOWNLOAD_SETTINGS__STALL_TIMEOUT": "1" if os.environ.get("SCENARIO") == "stall" else "1800",
+    "RSOUL__GENERAL__BATCH_DELAY": "0",
+})
 
 import importlib.util
 spec = importlib.util.spec_from_file_location("rsoul_main", os.path.join(REPO, "rsoul.py")); main_mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(main_mod)
@@ -208,3 +219,7 @@ print("decoy (other author) enqueued:", any(t["username"] == "bob" for t in tran
 print("disc folder enqueued:", any("CD1" in t["filename"] for t in transfers.values()))
 print("state file left behind:", os.path.exists(os.path.join(CFG, "grab_list_state.json")))
 print("leftover download folders:", sorted(d for d in os.listdir(DL)))
+print("config.ini in data folder:", os.path.exists(os.path.join(CFG, "config.ini")))
+print("foreign slskd transfer kept:", "soularr-1" in transfers)
+print("cleared all finished transfers:", any(c == ("DELETE", "/api/v0/transfers/downloads/all/completed") for c in LOG["slskd"]))
+print("R:soul transfer records left in slskd:", sum(1 for t in transfers.values() if t["username"] != "musicpeer"))

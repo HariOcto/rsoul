@@ -27,6 +27,12 @@ def test_audiobook_run_end_to_end():
     assert "disc folder enqueued: False" in out
     assert "state file left behind: False" in out
     assert "leftover download folders: ['rsoul_audiobooks']" in out
+    # Configured only through RSOUL__ environment variables
+    assert "config.ini in data folder: False" in out
+    # Only R:soul's own transfer records are removed from the shared slskd
+    assert "foreign slskd transfer kept: True" in out
+    assert "cleared all finished transfers: False" in out
+    assert "R:soul transfer records left in slskd: 0" in out
 
 
 def test_stalled_peer_then_retry_end_to_end():
@@ -35,3 +41,5 @@ def test_stalled_peer_then_retry_end_to_end():
     assert "import commands: 0" in run1
     assert "leftovers moved to failed_downloads: {'Mistborn - The Final Empire (2006) [Michael Kramer]': 6}" in run1
     assert "book 1 staged files: 12 of 12" in out  # the retry in run 2 completes the book
+    assert "foreign slskd transfer kept: True" in out
+    assert "R:soul transfer records left in slskd: 0" in out

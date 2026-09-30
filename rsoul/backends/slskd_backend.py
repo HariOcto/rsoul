@@ -372,7 +372,7 @@ class SlskdBackend(DownloadBackend):
             logger.warning(f"Only {len(downloads)} of {len(files)} audiobook files were enqueued from {username} - cancelling")
             for d in downloads:
                 try:
-                    self.client.transfers.cancel_download(username=username, id=d["id"])
+                    self.client.transfers.cancel_download(username=username, id=d["id"], remove=True)
                 except Exception:
                     pass
             return None
@@ -534,11 +534,24 @@ class SlskdBackend(DownloadBackend):
         return success
 
     def cleanup(self, task: DownloadTask) -> None:
-        """Remove completed downloads from slskd."""
-        try:
-            self.client.transfers.remove_completed_downloads()
-        except Exception as e:
-            logger.warning(f"Failed to cleanup completed downloads in slskd: {e}")
+        """Remove this task's own records from slskd's transfer list.
+
+        slskd is often shared with other tools (e.g. Soularr for music), so R:soul
+        no longer clears every finished transfer; it removes only the ones it queued.
+        """
+        username = task.extra.get("username")
+        removed = 0
+        for f in task.extra.get("files", []):
+            if not f.get("id"):
+                continue
+            try:
+                # remove=True drops the record; for an unfinished transfer slskd cancels it first
+                if self.client.transfers.cancel_download(username=f.get("username") or username, id=f["id"], remove=True):
+                    removed += 1
+            except Exception as e:
+                logger.debug(f"Could not remove transfer {f['id']} from slskd: {e}")
+        if removed:
+            logger.debug(f"Removed {removed} transfer record(s) of {task.book_title} from slskd")
 
     def reconcile_task(self, task_data: Dict[str, Any]) -> Optional[DownloadTask]:
         """Reconcile a persisted task with live slskd state."""

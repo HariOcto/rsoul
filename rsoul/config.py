@@ -1,8 +1,9 @@
 import logging
+import os
 import sys
 import configparser
 from dataclasses import dataclass, field
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List, Mapping
 
 from .display import console
 from .media import get_media_mode, unsupported_audiobook_formats, EBOOK
@@ -103,6 +104,63 @@ def setup_logging(config):
     root_logger.addHandler(handler)
 
 
+ENV_PREFIX = "RSOUL__"
+_SENSITIVE = ("api_key", "password", "token", "secret")
+# Sections the code reads that the sample config.ini doesn't contain
+_EXTRA_SECTIONS = {"general": "General"}
+
+
+def _section_key(name: str) -> str:
+    """Normalise a section name for matching: "Search Settings" == "SEARCH_SETTINGS"."""
+    return name.strip().lower().replace(" ", "_")
+
+
+def apply_env_overrides(config: configparser.ConfigParser, environ: Optional[Mapping[str, str]] = None) -> List[str]:
+    """Override config values from environment variables.
+
+    RSOUL__<SECTION>__<OPTION>=value sets <option> in [<Section>]; spaces in section names
+    become underscores and case doesn't matter, e.g.
+
+        RSOUL__READARR__API_KEY=abc          -> [Readarr] api_key
+        RSOUL__SEARCH_SETTINGS__MEDIA_MODE=audiobook -> [Search Settings] media_mode
+
+    Environment values win over config.ini. Only sections that exist in the config (or in
+    the bundled template it was based on) are accepted, so a typo is reported instead of
+    silently creating a new section.
+
+    Returns:
+        Log lines describing what was set (sensitive values are not shown).
+    """
+    environ = os.environ if environ is None else environ
+    sections = {_section_key(name): name for name in config.sections()}
+    applied: List[str] = []
+
+    for key in sorted(environ):
+        if not key.upper().startswith(ENV_PREFIX):
+            continue
+        rest = key[len(ENV_PREFIX):]
+        if "__" not in rest:
+            applied.append(f"Ignored {key}: expected {ENV_PREFIX}<SECTION>__<OPTION>")
+            continue
+        section_token, option = rest.split("__", 1)
+        section = sections.get(_section_key(section_token))
+        if section is None and _section_key(section_token) in _EXTRA_SECTIONS:
+            # Read by the code but absent from the sample config
+            section = _EXTRA_SECTIONS[_section_key(section_token)]
+            config.add_section(section)
+            sections[_section_key(section)] = section
+        option = option.strip().lower()
+        if not section or not option:
+            applied.append(f"Ignored {key}: unknown section '{section_token}' (known: {', '.join(config.sections())})")
+            continue
+
+        config.set(section, option, environ[key])
+        shown = "(hidden)" if any(word in option for word in _SENSITIVE) else environ[key]
+        applied.append(f"[{section}] {option} = {shown} (from {key})")
+
+    return applied
+
+
 def validate_config(config: configparser.ConfigParser) -> None:
     """
     Validate that the configuration has all required sections and keys.
@@ -122,6 +180,18 @@ def validate_config(config: configparser.ConfigParser) -> None:
         for key in keys:
             if key not in config[section]:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section '{section}'")
+
+    # Placeholders from the sample config (e.g. YOUR_READARR_API_KEY) were never replaced
+    enabled_sections = ["Readarr"]
+    if config.getboolean("Backends", "slskd_enabled", fallback=True):
+        enabled_sections.append("Slskd")
+    if config.getboolean("Backends", "stacks_enabled", fallback=False):
+        enabled_sections.append("Stacks")
+    for section in enabled_sections:
+        value = config.get(section, "api_key", fallback="")
+        if value.startswith("YOUR_"):
+            env = f"{ENV_PREFIX}{section.upper().replace(' ', '_')}__API_KEY"
+            raise ValueError(f"Configuration Error: [{section}] api_key is still the placeholder '{value}'. Set it in config.ini or with the environment variable {env}.")
 
     # Validate backend-specific sections when enabled
     slskd_enabled = config.getboolean("Backends", "slskd_enabled", fallback=True)

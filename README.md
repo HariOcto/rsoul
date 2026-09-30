@@ -60,6 +60,42 @@ This project is a fork of [Soularr](https://github.com/mrusse/soularr) (original
 - **Import Management**: Automatically imports successful downloads into Readarr, handling multi-backend path mappings.
 - **Docker Support**: Ready for containerized deployment.
 
+## Configuring with environment variables
+
+Every option can also be set with an environment variable, which is handy in Docker Compose or TrueNAS custom apps:
+
+```
+RSOUL__<SECTION>__<OPTION>=value
+```
+
+The section name is case-insensitive, with spaces written as underscores: `RSOUL__READARR__API_KEY` sets `api_key` in `[Readarr]`, and `RSOUL__SEARCH_SETTINGS__MEDIA_MODE` sets `media_mode` in `[Search Settings]`.
+
+- **Environment variables win** over `config.ini`.
+- **`config.ini` becomes optional.** If there is none in the data folder, the sample `config.ini` shipped with R:soul provides the defaults and the environment variables fill in the rest. At minimum set the Readarr/Chaptarr and slskd `api_key` and `host_url`; R:soul stops with a clear error if an API key is still the sample placeholder.
+- **Typos are reported, not ignored silently.** A variable naming a section that doesn't exist is skipped with a log message. The log lists every value taken from the environment, with API keys and passwords hidden.
+
+```yaml
+services:
+  rsoul:
+    image: mephistopheles1/rsoul:latest
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      - SCRIPT_INTERVAL=300
+      - RSOUL__READARR__HOST_URL=http://192.168.1.10:8787
+      - RSOUL__READARR__API_KEY=your-readarr-or-chaptarr-key
+      - RSOUL__SLSKD__HOST_URL=http://192.168.1.10:5030
+      - RSOUL__SLSKD__API_KEY=your-slskd-key
+      - RSOUL__SLSKD__DOWNLOAD_DIR=/downloads
+      - RSOUL__SLSKD__READARR_DOWNLOAD_DIR=/downloads
+      - RSOUL__SEARCH_SETTINGS__MEDIA_MODE=audiobook
+    volumes:
+      - /path/to/slskd/downloads:/downloads
+      - /path/to/config/dir:/data   # still needed: resume state and history live here
+```
+
+Values in the environment are visible to anyone who can inspect the container, the same as in `config.ini`.
+
 ## Configuration Reference
 
 ### [Backends]
@@ -138,6 +174,8 @@ How audiobooks are handled:
 - **Failed downloads are cleared away**: whatever a failed download left behind (e.g. finished chapters) is moved to `<download_dir>/failed_downloads/`, so it can't mix with a later attempt.
 - **Time limits** are progress-based (see [Download timeouts](#download-timeouts)), so a large audiobook from a slow but steady peer is not cancelled.
 
+**Sharing slskd with other tools.** R:soul removes only its own records from slskd's transfer list once a download has finished or failed; it no longer clears every finished transfer, so tools such as Soularr can share the same slskd.
+
 **slskd download folder layout.** R:soul expects slskd's default layout, where each file lands in `<download_dir>/<name of the peer's folder>/`, i.e. `transfers.download.destination.subdirectory` left at `${SOURCE_DIRECTORY}`. Downloads from different peers whose folders have the same name share one local folder, and slskd renames a new file if its name is taken. R:soul therefore won't start a download whose files already exist in, or are still downloading into, the same local folder; it retries on a later run.
 
 ## Download timeouts
@@ -172,6 +210,8 @@ Each run can add up to `number_of_books_to_grab` new downloads. To keep slow dow
 - **Resume drops unrecoverable downloads.** Saved downloads that can't be found in slskd or on disk are removed from the resume state instead of staying there forever.
 - **The run summary is stricter.** A download whose import fails is now reported as failed instead of successful.
 - **Busy local folders are left alone.** A download is not started if files with the same names are already in, or still downloading into, its local slskd folder.
+- **Other slskd transfers are left alone.** R:soul used to clear every finished transfer in slskd at the end of each run; it now removes only its own.
+- **Configuration can come from environment variables** (`RSOUL__<SECTION>__<OPTION>`), and `config.ini` is optional when they are used.
 - **Everything else is opt-in.** `media_mode` defaults to `ebook`, `monitor_window` to `0` and `max_active_downloads` to `0` (no limit).
 
 ## Resume Functionality

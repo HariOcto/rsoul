@@ -10,6 +10,13 @@ services:
       - TZ=Etc/UTC
       #Script interval in seconds
       - SCRIPT_INTERVAL=300
+      # Optional: set any config.ini option as RSOUL__<SECTION>__<OPTION> (overrides config.ini;
+      # config.ini is then optional). Examples:
+      # - RSOUL__READARR__HOST_URL=http://192.168.1.10:8787
+      # - RSOUL__READARR__API_KEY=your-api-key
+      # - RSOUL__SLSKD__HOST_URL=http://192.168.1.10:5030
+      # - RSOUL__SLSKD__API_KEY=your-slskd-key
+      # - RSOUL__SEARCH_SETTINGS__MEDIA_MODE=audiobook
     user: "1000:1000"
     volumes:
       #"You can set /downloads to whatever you want but will then need to change the Slskd download dir in your config file"

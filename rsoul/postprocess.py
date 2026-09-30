@@ -5,7 +5,7 @@ import re
 import difflib
 import time
 import operator
-from typing import Any
+from typing import Any, Optional
 
 from mobi_header import MobiHeader
 import ebookmeta
@@ -584,7 +584,7 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
 
         results[task["id"]] = _import_succeeded(current_task)
         if results[task["id"]]:
-            logger.info(f"{folder_name}: Import completed. Message: {message}")
+            logger.info(f"{folder_name}: Import command finished (status: {current_task.get('status')}, result: {current_task.get('result', 'n/a')}). Message: {message or '-'}")
             continue
 
         logger.warning(f"{folder_name}: Import did not succeed (status: {current_task.get('status')}, result: {current_task.get('result', 'n/a')}): {message}")
@@ -592,6 +592,31 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
             move_failed_import(to_local_path(path, readarr_download_dir, local_download_dir))
 
     return results
+
+
+IMPORT_SETTLE_SECONDS = 30
+
+
+def files_left_after_import(paths: list, folder: str, settle: Optional[float] = None):
+    """Double-check a reported import: Readarr and Chaptarr move imported files out of the
+    download folder, so files still sitting there mean nothing was actually imported.
+
+    Waits up to `settle` seconds for the files to go. Returns the list of files still there
+    (logged as a failure), or None if they have all been moved.
+    """
+    deadline = time.time() + (IMPORT_SETTLE_SECONDS if settle is None else settle)
+    remaining = [p for p in paths if os.path.exists(p)]
+    while remaining and time.time() < deadline:
+        time.sleep(2)
+        remaining = [p for p in remaining if os.path.exists(p)]
+    if not remaining:
+        return None
+    logger.warning(
+        f"Import reported as finished, but {len(remaining)} of {len(paths)} file(s) are still in {folder}: "
+        "nothing was imported. Check Readarr/Chaptarr's logs (lines with DOWNLOAD-IMPORT) for the reason; "
+        "the files are left there so you can import them manually."
+    )
+    return remaining
 
 
 def process_imports(ctx: Any, grab_list: list) -> dict:
@@ -659,6 +684,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         failed_imports = []
         author_folders = set()
         folder_books: dict = {}  # import folder -> book IDs whose files were moved there
+        folder_files: dict = {}  # import folder -> local paths of the files handed to Readarr/Chaptarr
 
         for book_download in items:
             if book_download.get("media_type") == "audiobook":
@@ -670,6 +696,8 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                 if relative:
                     author_folders.add(relative)
                     folder_books.setdefault(relative, []).append(book_download.get("bookId"))
+                    names = book_download.get("expected_files") or []
+                    folder_files.setdefault(relative, []).extend(os.path.join(local_download_dir, relative, n) for n in names)
                 else:
                     logger.warning(f"Audiobook failed: {book_title} - {reason}")
                     names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
@@ -721,6 +749,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                         logger.info(f"Successfully processed {filename}")
                         author_folders.add(author_name_sanitized)
                         folder_books.setdefault(author_name_sanitized, []).append(book_id)
+                        folder_files.setdefault(author_name_sanitized, []).append(os.path.join(local_download_dir, author_name_sanitized, filename))
                     else:
                         failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
                         if ctx.history:
@@ -780,8 +809,12 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
             if commands:
                 command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir)
                 for command in commands:
-                    for book_id in folder_books.get(command.get("_rsoul_folder"), []):
-                        results[book_id] = command_results.get(command["id"], False)
+                    folder = command.get("_rsoul_folder")
+                    ok = command_results.get(command["id"], False)
+                    if ok:
+                        ok = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder)) is None
+                    for book_id in folder_books.get(folder, []):
+                        results[book_id] = ok
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")

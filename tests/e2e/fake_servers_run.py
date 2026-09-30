@@ -20,6 +20,7 @@ time.sleep = lambda s: real_sleep(0.002)  # speed up every wait inside R:soul
 
 DL = tempfile.mkdtemp(prefix="slskd-dl-")
 CFG = tempfile.mkdtemp(prefix="rsoul-cfg-")
+LIBRARY = tempfile.mkdtemp(prefix="library-")
 LOG = {"chaptarr": [], "slskd": []}
 
 BOOK1_DIR = "@@alice\\Audiobooks\\Brandon Sanderson\\Mistborn - The Final Empire (2006) [Michael Kramer]"
@@ -165,6 +166,11 @@ class Chaptarr(BaseHTTPRequestHandler):
         path = data.get("path", "")
         audio = [f for f in os.listdir(path) if f.endswith(".mp3")] if os.path.isdir(path) else []
         ok = len(audio) > 0  # Chaptarr: audio extension -> audiobook import
+        if ok:  # like Chaptarr, move the imported files into the library
+            dest = os.path.join(LIBRARY, os.path.basename(path))
+            os.makedirs(dest, exist_ok=True)
+            for f in audio:
+                os.replace(os.path.join(path, f), os.path.join(dest, f))
         commands[cid] = {"id": cid, "name": data["name"], "status": "completed", "result": "successful" if ok else "unsuccessful",
                          "message": f"Imported {len(audio)} files" if ok else "Failed to import", "body": {"path": path}}
         self.send(201, dict(commands[cid], status="queued"))
@@ -219,12 +225,13 @@ if STALL["on"]:
 wanted = [c for c in LOG["chaptarr"] if c[0] == "GET" and c[1].endswith("/wanted/missing")]
 posts = [c for c in LOG["chaptarr"] if c[0] == "POST"]
 browses = [c for c in LOG["slskd"] if c[0] == "POST" and "/directory" in c[1]]
-staged = os.path.join(DL, "rsoul_audiobooks", "Brandon Sanderson", "Mistborn The Final Empire")
 print(f"run took {elapsed:.1f}s")
 print("wanted list filtered to audiobooks:", all(c[2].get("mediaType") == ["audiobook"] for c in wanted))
 print("folders browsed:", [c[1] for c in browses])
 print("import commands:", [(c[2]["name"], c[2]["path"].replace(DL, "<dl>")) for c in posts])
-print("book 1 staged files:", len(os.listdir(staged)) if os.path.isdir(staged) else "MISSING", "of 12")
+imported_dir = os.path.join(LIBRARY, "Mistborn The Final Empire")
+print("book 1 imported files:", len(os.listdir(imported_dir)) if os.path.isdir(imported_dir) else "MISSING", "of 12")
+print("files left in staging:", sum(len(f) for _, _, f in os.walk(os.path.join(DL, "rsoul_audiobooks"))))
 print("decoy (other author) enqueued:", any(t["username"] == "bob" for t in transfers.values()))
 print("disc folder enqueued:", any("CD1" in t["filename"] for t in transfers.values()))
 print("state file left behind:", os.path.exists(os.path.join(CFG, "grab_list_state.json")))

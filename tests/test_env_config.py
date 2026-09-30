@@ -338,3 +338,47 @@ def test_title_segment_match_cases():
     assert t("Knife Edge", "Christopher G. Nuttall - Knife Edge Empire's Corps, Book 17", "Christopher G. Nuttall", "Empire's Corps")
     assert not t("Knife Edge", "Christopher G. Nuttall - Knife Edge Empire's Corps, Book 17", "Christopher G. Nuttall", "")
     assert not t("Salvation", "Peter F. Hamilton - Salvation Lost", "Peter F. Hamilton")
+
+
+# ---------------------------------------------------------------------------
+# From the live test: Chaptarr reported every import as finished, but was anything imported?
+# ---------------------------------------------------------------------------
+
+
+def _import_ctx(tmp_path, moves_files):
+    from rsoul import postprocess
+
+    local = tmp_path / "dl"
+    (local / "Book").mkdir(parents=True)
+    (local / "Book" / "01.m4b").write_bytes(b"x")
+
+    class Readarr:
+        def post_command(self, name, **kwargs):
+            self.path = kwargs["path"]
+            return {"id": 1, "body": {"path": kwargs["path"]}}
+
+        def get_command(self, id_):
+            if moves_files:
+                for root, _, files in os.walk(local / "rsoul_audiobooks"):
+                    for f in files:
+                        os.remove(os.path.join(root, f))
+            return {"id": 1, "status": "completed", "result": "successful", "body": {"path": self.path}}
+
+    config = configparser.ConfigParser()
+    config["Slskd"] = {"download_dir": str(local), "readarr_download_dir": str(local)}
+    item = {"author_name": "A", "title": "T", "bookId": 7, "dir": "Book", "filename": "01.m4b", "expected_files": ["01.m4b"], "backend_name": "slskd", "media_type": "audiobook"}
+    return postprocess, Context(config=config, slskd=None, readarr=Readarr()), item
+
+
+def test_import_counts_when_files_were_moved(tmp_path):
+    postprocess, ctx, item = _import_ctx(tmp_path, moves_files=True)
+    assert postprocess.process_imports(ctx, [item]) == {7: True}
+
+
+def test_import_reported_but_files_still_there_is_a_failure(tmp_path, caplog):
+    import logging
+
+    postprocess, ctx, item = _import_ctx(tmp_path, moves_files=False)
+    with caplog.at_level(logging.WARNING):
+        assert postprocess.process_imports(ctx, [item]) == {7: False}
+    assert "nothing was imported" in caplog.text

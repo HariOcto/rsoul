@@ -22,7 +22,8 @@ def run(scenario=""):
 def test_audiobook_run_end_to_end():
     out = run()
     assert "wanted list filtered to audiobooks: True" in out
-    assert "book 1 staged files: 12 of 12" in out  # search showed 5 chapters; browsing found all 12
+    assert "book 1 imported files: 12 of 12" in out  # search showed 5 chapters; browsing found all 12
+    assert "files left in staging: 0" in out
     assert "decoy (other author) enqueued: False" in out
     assert "disc folder enqueued: False" in out
     assert "state file left behind: False" in out
@@ -40,7 +41,7 @@ def test_stalled_peer_then_retry_end_to_end():
     run1 = out.split("--- run 2")[0]
     assert "import commands: 0" in run1
     assert "leftovers moved to failed_downloads: {'Mistborn - The Final Empire (2006) [Michael Kramer]': 6}" in run1
-    assert "book 1 staged files: 12 of 12" in out  # the retry in run 2 completes the book
+    assert "book 1 imported files: 12 of 12" in out  # the retry in run 2 completes the book
     assert "foreign slskd transfer kept: True" in out
     assert "R:soul transfer records left in slskd: 0" in out
 
@@ -49,5 +50,5 @@ def test_other_tool_clearing_finished_transfers_end_to_end():
     # Soularr-style "clear all finished transfers" happens repeatedly while R:soul downloads;
     # R:soul must recognise chapters already on disk and still import the whole book
     out = run("soularr_clears")
-    assert "book 1 staged files: 12 of 12" in out
+    assert "book 1 imported files: 12 of 12" in out
     assert "state file left behind: False" in out

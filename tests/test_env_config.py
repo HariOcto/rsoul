@@ -176,7 +176,7 @@ def test_folder_with_unfinished_foreign_download_is_avoided(tmp_path):
     records = [{"id": "s1", "filename": "@@o\\Mistborn\\cover.jpg", "state": "InProgress"}]
     backend, _ = slskd_task(tmp_path, ListClient(records))
     clashes = backend._local_clashes("@@p\\Mistborn", [{"filename": "@@p\\Mistborn\\01.mp3"}])
-    assert clashes == ["cover.jpg"]
+    assert len(clashes) == 1 and clashes[0].startswith("cover.jpg (still downloading from other")
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +227,70 @@ def test_no_match_is_explained(caplog):
         assert backend._match_audiobook_results(target, {"book": target.readarr_book, "author": target.readarr_author}, [{"username": "u", "files": files}]) == []
     assert "files in other formats: 1" in caplog.text
     assert "folders without the author's surname: 1" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# slskd answers 404 for a user without transfers and for unknown IDs, and slskd-api
+# raises requests.HTTPError for it (found in the first live test)
+# ---------------------------------------------------------------------------
+
+
+def http_404():
+    import requests
+
+    response = requests.Response()
+    response.status_code = 404
+    return requests.HTTPError("404 Client Error: Not Found", response=response)
+
+
+def test_first_download_from_a_new_peer(monkeypatch):
+    from rsoul import download
+
+    monkeypatch.setattr(download.time, "sleep", lambda s: None)
+
+    class Transfers:
+        queued = []
+
+        def get_downloads(self, username):
+            if not self.queued:
+                raise http_404()  # slskd: this user has no transfers yet
+            return {"directories": [{"directory": "@@p\\Book", "files": self.queued}]}
+
+        def enqueue(self, username, files):
+            self.queued = [{"id": "n1", "filename": files[0]["filename"], "size": 10, "state": "Requested"}]
+            return True
+
+    class C:
+        transfers = Transfers()
+
+    downloads = download.slskd_do_enqueue(C(), "peer", [{"filename": "@@p\\Book\\book.m4b", "size": 10}], "@@p\\Book")
+    assert [d["id"] for d in downloads] == ["n1"]
+
+
+def test_user_list_404_means_transfer_gone(tmp_path):
+    class T:
+        def get_downloads(self, username):
+            raise http_404()
+
+    class C:
+        transfers = T()
+
+    backend, task = slskd_task(tmp_path, C())
+    task = backend.get_status(task)
+    assert task.status == DownloadStatus.FAILED
+    assert task.poll_failed is False
+
+
+def test_single_download_404_means_transfer_gone(tmp_path):
+    class T:
+        def get_downloads(self, username):
+            raise ConnectionError("list endpoint down")
+
+        def get_download(self, username, id):
+            raise http_404()
+
+    class C:
+        transfers = T()
+
+    backend, task = slskd_task(tmp_path, C())
+    assert backend.get_status(task).status == DownloadStatus.FAILED

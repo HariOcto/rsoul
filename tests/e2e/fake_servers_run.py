@@ -87,6 +87,8 @@ class Slskd(BaseHTTPRequestHandler):
                 users = sorted({t["username"] for t in transfers.values()})
                 return self.send(200, [{"username": u, "directories": user_dirs(u)} for u in users])
             m = re.fullmatch(r"/api/v0/transfers/downloads/([^/]+)", p)
+            if m and not any(t["username"] == m.group(1) for t in transfers.values()):
+                return self.send(404)  # slskd: this user has no transfers (empty body)
             if m:
                 advance()
                 if os.environ.get("SCENARIO") == "soularr_clears":
@@ -99,7 +101,7 @@ class Slskd(BaseHTTPRequestHandler):
                 return self.send(200, {"username": m.group(1), "directories": user_dirs(m.group(1))})
             m = re.fullmatch(r"/api/v0/transfers/downloads/([^/]+)/([^/]+)", p)
             if m:
-                t = transfers.get(m.group(2)); return self.send(200, t) if t else self.send(404, "not found")
+                t = transfers.get(m.group(2)); return self.send(200, t) if t else self.send(404)
         self.send(404, "unknown")
     def do_POST(self):
         p = unquote(urlparse(self.path).path); data = self.body(); LOG["slskd"].append(("POST", p))

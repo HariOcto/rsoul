@@ -373,10 +373,11 @@ class SlskdBackend(DownloadBackend):
         # is already taken, so R:soul would then pick up the wrong (old or other) file.
         clashes = self._local_clashes(file_dir, files)
         if clashes:
+            local = str(Path(self.download_dir or "") / file_dir.split(chr(92))[-1])
             logger.warning(
-                f"Not downloading {target.book_title} from {username}: the local folder "
-                f"'{file_dir.split(chr(92))[-1]}' already has files with the same names, or another download "
-                f"is still writing into it (e.g. {clashes[0]}). It is retried on a later run."
+                f"Not downloading {target.book_title} from {username}: the local folder {local} is in use "
+                f"({len(clashes)} file(s), e.g. {clashes[0]}). If those files are left over from an earlier "
+                f"download, move or delete them; otherwise it is retried on a later run."
             )
             return None
 
@@ -515,7 +516,7 @@ class SlskdBackend(DownloadBackend):
 
         if self.download_dir and os.path.isdir(self.download_dir):
             folder = Path(self.download_dir) / leaf
-            clashes.update(n for n in names if (folder / n).exists())
+            clashes.update(f"{n} (already in the download folder)" for n in names if (folder / n).exists())
 
         # Unfinished downloads (from any peer or tool) headed for the same local folder. Any such
         # download counts, not only same-named files: Soularr deletes the whole local folder of an
@@ -527,7 +528,7 @@ class SlskdBackend(DownloadBackend):
                         continue
                     for f in directory.get("files", []):
                         if not str(f.get("state", "")).startswith("Completed"):
-                            clashes.add(f.get("filename", "").split("\\")[-1])
+                            clashes.add(f"{f.get('filename', '').split(chr(92))[-1]} (still downloading from {user_transfer.get('username', '?')})")
         except Exception as e:
             logger.warning(f"Could not check slskd's transfer list for clashing downloads: {e}")
 

@@ -6,12 +6,33 @@ from .types import SlskdFile, SlskdDirectory
 logger = logging.getLogger(__name__)
 
 
+def is_not_found(error: Exception) -> bool:
+    """True for an HTTP 404 from slskd.
+
+    slskd answers 404 for a user with no transfers at all, and for a transfer ID it doesn't
+    know (any more). slskd-api raises on every HTTP error, so these arrive as exceptions,
+    but they are definite answers, not outages.
+    """
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 404
+
+
+def get_user_downloads(slskd_client: Any, username: str) -> Dict[str, Any]:
+    """slskd's transfer list for one user; an empty list when the user has none (404)."""
+    try:
+        return slskd_client.transfers.get_downloads(username=username)
+    except Exception as e:
+        if is_not_found(e):
+            return {"username": username, "directories": []}
+        raise
+
+
 def _transfer_ids(slskd_client: Any, username: str) -> Optional[set]:
     """IDs of all transfers slskd currently lists for a user, or None if the list is unavailable."""
     try:
-        download_list = slskd_client.transfers.get_downloads(username=username)
-    except Exception:
-        logger.error(f"Could not read slskd's transfer list for {username}", exc_info=True)
+        download_list = get_user_downloads(slskd_client, username)
+    except Exception as e:
+        logger.error(f"Could not read slskd's transfer list for {username}: {e}")
         return None
     return {f["id"] for d in download_list.get("directories", []) for f in d.get("files", [])}
 
@@ -49,7 +70,7 @@ def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], f
         time.sleep(2)
         downloads = []  # Reset on each attempt
         try:
-            download_list = slskd_client.transfers.get_downloads(username=username)
+            download_list = get_user_downloads(slskd_client, username)
             for file in files:
                 target_filename = file["filename"]
                 target_basename = target_filename.split("\\")[-1]
@@ -121,10 +142,10 @@ def slskd_download_status(slskd_client: Any, downloads: List[SlskdFile]) -> bool
 
     for username, files in pending.items():
         try:
-            listing = slskd_client.transfers.get_downloads(username=username)
+            listing = get_user_downloads(slskd_client, username)
             by_id = {f["id"]: f for d in listing.get("directories", []) for f in d.get("files", [])}
-        except Exception:
-            logger.warning(f"Could not list transfers for {username}; checking files one by one")
+        except Exception as e:
+            logger.warning(f"Could not list transfers for {username} ({e}); checking files one by one")
             by_id = None
 
         for file in files:
@@ -144,14 +165,16 @@ def slskd_download_status(slskd_client: Any, downloads: List[SlskdFile]) -> bool
                 continue
             try:
                 record = slskd_client.transfers.get_download(file["username"], file["id"])
-                # An unknown ID gives no usable record (slskd sends an empty 404 body)
                 file["status"] = record if isinstance(record, dict) and "state" in record else None
                 if file["status"] is None:
                     ok = False
-            except Exception:
-                logger.exception(f"Error getting download status of {file['filename']}")
+            except Exception as e:
                 file["status"] = None
                 ok = False
+                if is_not_found(e):
+                    file["missing"] = True  # slskd doesn't know this transfer (any more)
+                else:
+                    logger.warning(f"Error getting download status of {file['filename']}: {e}")
     return ok
 
 

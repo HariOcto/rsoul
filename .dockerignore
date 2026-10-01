@@ -1,0 +1,26 @@
+# Keep the image to the application itself. config.ini stays: it is the bundled sample
+# that supplies defaults when settings come from RSOUL__ environment variables.
+.git
+.github
+.venv
+venv
+env
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.idea
+.vscode
+.DS_Store
+*.log
+*.patch
+*.zip
+# Runtime files that may exist in a checkout used for local runs
+grab_list_state.json
+*.tmp
+failed_downloads.json
+failure_list.txt
+health.json
+.current_page.txt
+.rsoul.lock
+failed_imports
+failed_downloads

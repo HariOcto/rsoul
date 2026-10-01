@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import sys
 import configparser
@@ -105,6 +106,21 @@ def setup_logging(config):
 
 
 ENV_PREFIX = "RSOUL__"
+
+# Settings that must be finite numbers >= 0 (0 disables a limit where documented)
+NON_NEGATIVE_SETTINGS = [
+    ("Slskd", "request_timeout"),
+    ("Readarr", "request_timeout"),
+    ("Readarr", "import_poll_timeout"),
+    ("Download Settings", "stall_timeout"),
+    ("Download Settings", "queue_timeout"),
+    ("Download Settings", "max_download_time"),
+]
+# Settings read as whole numbers, which must be >= 0
+NON_NEGATIVE_INT_SETTINGS = [
+    ("Download Settings", "monitor_window"),
+    ("Download Settings", "max_active_downloads"),
+]
 _SENSITIVE = ("api_key", "password", "token", "secret")
 # Sections the code reads that the sample config.ini doesn't contain
 _EXTRA_SECTIONS = {"general": "General"}
@@ -212,6 +228,26 @@ def validate_config(config: configparser.ConfigParser) -> None:
         for key in stacks_required:
             if key not in config["Stacks"]:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section 'Stacks'")
+
+    # Numeric settings: a typo such as "-100" or "nan" must not silently disable a limit
+    for section, option in NON_NEGATIVE_SETTINGS:
+        if config.has_option(section, option):
+            raw = config.get(section, option).strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' is not a number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be 0 or a positive number")
+    for section, option in NON_NEGATIVE_INT_SETTINGS:
+        if config.has_option(section, option):
+            raw = config.get(section, option).strip()
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be a whole number")
+            if value < 0:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be 0 or a positive whole number")
 
     # Validate media mode early so a typo fails at startup, not mid-run
     if get_media_mode(config) != EBOOK:

@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import List, Optional, Any, Dict
 
 
+class BackendUnavailable(Exception):
+    """The backend couldn't be reached to check a saved download.
+
+    Raised by reconcile_task so a temporary outage (e.g. slskd restarting) isn't mistaken
+    for the download being gone: the saved state is kept and checked again next run.
+    """
+
+
 class DownloadStatus(Enum):
     """Normalized download status across all backends."""
 

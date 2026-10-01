@@ -132,6 +132,15 @@ class StateManager:
                     return
             self.add_task(task)
 
+    def set_extra(self, task_id: str, extra: Dict[str, Any]) -> None:
+        """Replace a saved task's extra data (e.g. a follow-up on a pending import)."""
+        with self._lock:
+            for item in self.items:
+                if item.get("task_id") == task_id:
+                    item["extra"] = extra
+                    self._save()
+                    return
+
     def remove_task(self, task_id: str) -> None:
         """Remove a task by its task_id.
 

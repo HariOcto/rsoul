@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import sys
+import time
 import argparse
 import os
 import configparser
@@ -15,14 +16,26 @@ from rsoul.config import Context, setup_logging, validate_config, apply_env_over
 from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
 from rsoul.workflow import run_workflow
-from rsoul.search import get_books
+from rsoul.search import get_books, SearchError
 from rsoul.media import get_media_mode
+from rsoul.net import apply_timeout
+from rsoul.locking import AlreadyRunning, InstanceLock
+from rsoul import health
 from rsoul.history import HistoryManager
 from rsoul.state import StateManager
 from rsoul.backends import create_backends_from_config
 from rsoul.orchestrator import DownloadOrchestrator
 
 logger = logging.getLogger("readarr_soul")
+
+
+# Exit codes (run.sh logs anything other than 0)
+EXIT_OK = 0  # run finished; books not found on Soulseek don't count as errors
+EXIT_ERROR = 1  # configuration/startup problem or a crash: nothing (more) was done
+EXIT_PARTIAL = 2  # saved downloads were handled, but the search for new books failed
+
+# Outcome of the last run, for the health status (filled in by main)
+LAST_RUN: dict = {}
 
 
 def main():
@@ -47,21 +60,22 @@ def main():
     config_dir = args.config_dir
 
     # Path setup
-    lock_file_path = os.path.join(config_dir, ".rsoul.lock")
     config_file_path = os.path.join(config_dir, "config.ini")
 
-    # Lock check
-    if not is_docker() and os.path.exists(lock_file_path):
-        console.print(f"readarr_soul instance is already running.", style="bold red")
-        sys.exit(1)
+    # One R:soul per data folder (an OS lock: released automatically, even after a crash)
+    instance_lock = InstanceLock(config_dir)
+    try:
+        instance_lock.acquire()
+    except AlreadyRunning as e:
+        console.print(str(e), style="bold red")
+        return EXIT_ERROR
 
+    exit_code = EXIT_OK
+    health.configure(config_dir)
+    health.write_status("running", run_started_at=time.time())
     try:
         # Print banner
         print_startup_banner()
-
-        if not is_docker():
-            with open(lock_file_path, "w") as lock_file:
-                lock_file.write("locked")
 
         # Load Config
         # Disable interpolation to make storing logging formats in the config file much easier
@@ -88,9 +102,7 @@ def main():
             else:
                 console.print("Config file does not exist! Please place it in the working directory.", style="bold red")
 
-            if os.path.exists(lock_file_path) and not is_docker():
-                os.remove(lock_file_path)
-            sys.exit(0)
+            return EXIT_ERROR
 
         # Environment variables override config.ini
         env_overrides = apply_env_overrides(config)
@@ -128,8 +140,11 @@ def main():
             slskd_api_key = config["Slskd"]["api_key"]
             slskd_host_url = config["Slskd"]["host_url"]
             slskd_url_base = config.get("Slskd", "url_base", fallback="/")
-            slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
+            # A finite timeout so a hung slskd can't freeze the run (0 = no timeout)
+            slskd_timeout = config.getfloat("Slskd", "request_timeout", fallback=30) or None
+            slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base, timeout=slskd_timeout)
         readarr = ReadarrAPI(readarr_host_url, readarr_api_key)
+        apply_timeout(readarr.session, config.getfloat("Readarr", "request_timeout", fallback=60))
 
         # Initialize History Manager
         history_manager = HistoryManager(config_dir)
@@ -149,25 +164,31 @@ def main():
         else:
             logger.warning("No backends available - downloads will fail")
 
-        # Check if we have saved state to resume
+        # Check if we have saved state to resume (downloads, or imports awaiting confirmation)
         has_saved_state = state_manager.has_pending_state()
+        saved_downloads = [i for i in state_manager.get_items() if not i.get("extra", {}).get("import_pending")]
         if has_saved_state:
-            console.print(f"\nFound saved state with {len(state_manager.get_items())} pending downloads", style="bold yellow")
+            console.print(f"\nFound saved state with {len(state_manager.get_items())} pending item(s)", style="bold yellow")
 
         # Fetch Wanted Books. Without a monitor window, a run with saved state only resumes;
         # with one, it resumes and searches for new books in the same run.
         monitor_window = config.getint("Download Settings", "monitor_window", fallback=0)
         wanted_books = []
         download_targets = []
-        if not has_saved_state or monitor_window > 0:
+        if not saved_downloads or monitor_window > 0:
             try:
                 for source in search_sources:
                     logger.debug(f"Getting records from {source}")
                     wanted_books.extend(get_books(ctx, source, search_type, page_size))
-            except ValueError as ex:
-                logger.error(f"An error occurred: {ex}")
-                logger.error("Exiting...")
-                sys.exit(0)
+            except (ValueError, SearchError) as ex:
+                # Neither a bad search setting nor an unreachable Readarr/Chaptarr may strand
+                # downloads that are already running
+                logger.error(f"Searching for new books failed: {ex}")
+                if not has_saved_state:
+                    return EXIT_ERROR if isinstance(ex, ValueError) else EXIT_PARTIAL
+                logger.error("Continuing with the saved downloads only")
+                wanted_books = []
+                exit_code = EXIT_PARTIAL
 
             # Construct Download Targets. Books still downloading from an earlier run (hand-off)
             # are skipped here already, so their authors aren't fetched for nothing.
@@ -189,29 +210,51 @@ def main():
         # Run if we have download targets OR if we have saved state to resume
         if len(download_targets) > 0 or has_saved_state:
             try:
-                run_workflow(ctx, download_targets)
+                LAST_RUN.update(run_workflow(ctx, download_targets) or {})
             except Exception:
                 logger.exception("Fatal error encountered during workflow execution")
-                sys.exit(1)
+                return EXIT_ERROR
         else:
             console.print("No releases wanted. Nothing to do!", style="blue")
             logger.info("No releases wanted. Exiting...")
 
     except KeyboardInterrupt:
         console.print("\nOperation cancelled by user", style="bold yellow")
+        return 130
     except ValueError as e:
         logger.error(f"{e}")
-        sys.exit(1)
-    except Exception as e:
+        return EXIT_ERROR
+    except Exception:
         logger.exception("An unexpected error occurred")
+        return EXIT_ERROR
     finally:
-        # cleanup lock
-        if os.path.exists(lock_file_path) and not is_docker():
-            try:
-                os.remove(lock_file_path)
-            except OSError:
-                pass
+        instance_lock.release()
+
+    return exit_code
+
+
+def _main_with_status() -> int:
+    LAST_RUN.clear()
+    code = main()
+    # Docker's health check only looks at how recent this file is (liveness). The details
+    # below say how the last run went, for anyone reading health.json.
+    details = {
+        "last_exit": code,
+        "last_run_ended_at": time.time(),
+        "last_run": {
+            "search_failed": code == EXIT_PARTIAL,
+            "grabbed": LAST_RUN.get("grabbed_count", 0),
+            "failed": LAST_RUN.get("failed_download", 0),
+            "still_downloading": LAST_RUN.get("still_running", 0),
+            "pending_imports": LAST_RUN.get("pending_imports", 0),
+            "unchecked_downloads": LAST_RUN.get("unchecked_downloads", 0),
+        },
+    }
+    if code == EXIT_OK:
+        details["last_success_at"] = details["last_run_ended_at"]
+    health.write_status("idle", **details)
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(_main_with_status())

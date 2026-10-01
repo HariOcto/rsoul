@@ -97,6 +97,7 @@ class _RunResults:
         self.remove_wanted_on_failure = ctx.config.getboolean("Search Settings", "remove_wanted_on_failure", fallback=False)
         self.failure_file_path = os.path.join(ctx.config_dir, "failure_list.txt")
         self.slskd_download_dir = ctx.config.get("Slskd", "download_dir", fallback="")
+        self.pending_imports: List[tuple] = []  # (author, title) - import not confirmed yet
         self._lock = threading.Lock()
         self._imports = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rsoul-import")
         self._pending: List[Future] = []
@@ -142,6 +143,17 @@ class _RunResults:
         except Exception as e:
             logger.error(f"Error importing task {task.filename}: {e}")
             imported = False
+
+        if isinstance(imported, dict):
+            # Not confirmed yet (still running, or Readarr/Chaptarr unreachable): keep the task in
+            # the saved state so the next run follows it up instead of losing the staged files
+            task.extra["import_pending"] = imported
+            if self.ctx.state:
+                self.ctx.state.update_task(task)
+            with self._lock:
+                self.pending_imports.append((task.author_name, task.book_title))
+            logger.info(f"Import of {task.book_title} not confirmed yet; it will be checked on the next run")
+            return
 
         with self._lock:
             if imported:
@@ -218,15 +230,42 @@ def unmonitor_book(ctx: "Context", book: Dict[str, Any], media_type: str) -> Non
         logger.error(f"Failed to unmonitor book: {e}")
 
 
+def _follow_up_pending_imports(ctx: "Context", results: "_RunResults") -> int:
+    """Check imports that an earlier run couldn't confirm. Returns how many are still pending."""
+    items = [i for i in (ctx.state.get_tasks_for_orchestrator() if ctx.state else []) if i.get("extra", {}).get("import_pending")]
+    still_pending = 0
+    for item in items:
+        author, title = item.get("author_name", ""), item.get("book_title", "")
+        outcome = postprocess.check_pending_import(ctx.readarr, item["extra"]["import_pending"])
+        if outcome is True:
+            results.completed_tasks.append(DownloadTask(item["task_id"], item.get("backend_name", ""), DownloadStatus.COMPLETED, title, author, item.get("book_id"), item.get("filename", "")))
+            ctx.state.remove_task(item["task_id"])
+        elif outcome is False:
+            results.failed_download += 1
+            results.failed_imports.append((author, title))
+            ctx.state.remove_task(item["task_id"])
+        else:
+            if isinstance(outcome, dict):
+                ctx.state.set_extra(item["task_id"], dict(item["extra"], import_pending=outcome))
+            still_pending += 1
+            results.pending_imports.append((author, title))
+    return still_pending
+
+
 def _resume_persisted(ctx: "Context") -> List[DownloadTask]:
     """Reconcile saved downloads with the backends; drop the ones that can no longer be resumed."""
     persisted = ctx.state.get_tasks_for_orchestrator() if ctx.state else []
+    # Finished downloads waiting for an import confirmation aren't downloads to resume
+    persisted = [i for i in persisted if not i.get("extra", {}).get("import_pending")]
     if not persisted:
         return []
 
     tasks = ctx.orchestrator.resume_tasks(persisted)
     resumed_ids = {t.task_id for t in tasks}
+    unchecked = getattr(ctx.orchestrator, "unchecked_task_ids", set())
     for item in persisted:
+        if item["task_id"] in unchecked:
+            continue  # couldn't be checked (e.g. slskd down): keep it for the next run
         if item["task_id"] not in resumed_ids:
             logger.warning(f"Dropping download that can no longer be resumed: {item.get('book_title', item['task_id'])}")
             ctx.state.remove_task(item["task_id"])
@@ -251,7 +290,12 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
     active: List[DownloadTask] = []
     unfinished: List[DownloadTask] = []
 
-    has_saved = bool(ctx.state and ctx.state.has_pending_state())
+    results = _RunResults(ctx, [])
+
+    # 0. Follow up imports an earlier run couldn't confirm
+    pending_count = _follow_up_pending_imports(ctx, results)
+
+    has_saved = bool(ctx.state and any(not i.get("extra", {}).get("import_pending") for i in ctx.state.get_items()))
 
     # 1. Resume saved downloads
     resumed: List[DownloadTask] = []
@@ -259,16 +303,20 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         logger.info("Found saved state - attempting to resume previous session")
         print_section_header("RESUMING PREVIOUS SESSION")
         resumed = _resume_persisted(ctx)
+        unchecked = getattr(ctx.orchestrator, "unchecked_task_ids", set())
         if resumed:
             logger.info(f"Resuming {len(resumed)} downloads from previous session")
-        else:
+        if unchecked:
+            logger.warning(f"{len(unchecked)} saved download(s) couldn't be checked; they are kept for the next run")
+        if not resumed and not unchecked and not pending_count:
             logger.info("No items could be resumed - starting fresh")
             ctx.state.clear()
 
     # 2. Search & enqueue new books (legacy mode only when nothing was resumed)
     targets: List[DownloadTarget] = []
-    if monitor_window > 0 or not resumed:
-        in_flight = {t.book_id for t in resumed}
+    kept = [i for i in (ctx.state.get_items() if ctx.state else []) if i.get("task_id") in getattr(ctx.orchestrator, "unchecked_task_ids", set())]
+    if monitor_window > 0 or not (resumed or kept):
+        in_flight = {t.book_id for t in resumed} | {i.get("book_id") for i in kept}
         wanted = [t for t in download_targets if t["book"]["id"] not in in_flight]
         if in_flight:
             logger.info(f"Skipping {len(in_flight)} book(s) that are still downloading from an earlier run")
@@ -276,14 +324,15 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         # Optional cap on downloads running at once (resumed ones included)
         max_active = ctx.config.getint("Download Settings", "max_active_downloads", fallback=0)
         if max_active > 0:
-            room = max(0, max_active - len(resumed))
+            running = len(resumed) + len(kept)
+            room = max(0, max_active - running)
             if len(wanted) > room:
-                logger.info(f"max_active_downloads = {max_active}: {len(resumed)} running, starting {room} of {len(wanted)} wanted book(s)")
+                logger.info(f"max_active_downloads = {max_active}: {running} running, starting {room} of {len(wanted)} wanted book(s)")
                 wanted = wanted[:room]
 
         targets = build_targets(ctx, wanted)
 
-    results = _RunResults(ctx, targets)
+    results.targets_by_id = {t.book_id: t for t in targets}
 
     if targets:
         print_section_header("STARTING BATCH SEARCH PHASE")
@@ -314,5 +363,13 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         results.failed_books if results.failed_books else None,
         results.failed_imports if results.failed_imports else None,
     )
+    if results.pending_imports:
+        logger.info(f"Imports not confirmed yet ({len(results.pending_imports)}), checked again next run: " + ", ".join(f"{a} — {t}" for a, t in results.pending_imports))
 
-    return {"failed_download": results.failed_download, "grabbed_count": len(results.completed_tasks), "still_running": len(unfinished)}
+    return {
+        "failed_download": results.failed_download,
+        "grabbed_count": len(results.completed_tasks),
+        "still_running": len(unfinished),
+        "pending_imports": len(results.pending_imports),
+        "unchecked_downloads": len(getattr(ctx.orchestrator, "unchecked_task_ids", set())),
+    }

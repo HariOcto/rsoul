@@ -7,7 +7,7 @@ Provides functions to discover and instantiate available backends.
 from typing import List, Dict, TYPE_CHECKING
 import logging
 
-from .base import DownloadBackend, DownloadStatus, SearchResult, DownloadTask, DownloadTarget
+from .base import BackendUnavailable, DownloadBackend, DownloadStatus, SearchResult, DownloadTask, DownloadTarget
 
 if TYPE_CHECKING:
     from ..config import Context
@@ -100,6 +100,7 @@ def create_backends_from_config(ctx: "Context") -> List[DownloadBackend]:
 
 # Export base classes
 __all__ = [
+    "BackendUnavailable",
     "DownloadBackend",
     "DownloadStatus",
     "SearchResult",

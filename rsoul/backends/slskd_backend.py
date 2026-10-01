@@ -6,6 +6,7 @@ from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 from .base import (
+    BackendUnavailable,
     DownloadBackend,
     SearchResult,
     DownloadTask,
@@ -597,8 +598,12 @@ class SlskdBackend(DownloadBackend):
         saved_ids = {f.get("id") for f in task_data.get("extra", {}).get("files", []) if f.get("id")}
 
         try:
-            # Query slskd for all downloads to find matching transfer
             all_downloads = self.client.transfers.get_all_downloads()
+        except Exception as e:
+            raise BackendUnavailable(f"slskd not reachable: {e}") from e
+
+        try:
+            # Find the matching transfer in slskd's list
 
             candidates = []
             for user_transfer in all_downloads:
@@ -683,7 +688,11 @@ class SlskdBackend(DownloadBackend):
         saved_ids = {f["id"] for f in extra.get("files", []) if f.get("id")}
         tracked: Dict[str, Dict[str, Any]] = {}
         try:
-            for user_transfer in self.client.transfers.get_all_downloads():
+            all_downloads = self.client.transfers.get_all_downloads()
+        except Exception as e:
+            raise BackendUnavailable(f"slskd not reachable: {e}") from e
+        try:
+            for user_transfer in all_downloads:
                 if user_transfer["username"] != username:
                     continue
                 for directory in user_transfer["directories"]:

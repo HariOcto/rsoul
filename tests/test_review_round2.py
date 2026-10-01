@@ -388,7 +388,8 @@ def test_import_command_timeout(monkeypatch):
             return {"id": id_, "status": "started"}
 
     monkeypatch.setattr(postprocess.time, "sleep", lambda s: None)
-    assert postprocess.monitor_imports(Readarr(), [{"id": 1}], timeout=0) == {1: False}
+    # Still running when the wait ends: left for the next run, not counted as failed
+    assert postprocess.monitor_imports(Readarr(), [{"id": 1}], timeout=0) == {1: None}
 
 
 # ---------------------------------------------------------------------------

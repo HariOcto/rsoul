@@ -9,7 +9,9 @@ import time
 import logging
 from typing import List, Optional, Dict, Any, TYPE_CHECKING, Callable, Tuple
 
+from . import health
 from .backends.base import (
+    BackendUnavailable,
     DownloadBackend,
     DownloadStatus,
     DownloadTask,
@@ -56,6 +58,7 @@ class DownloadOrchestrator:
                     "progress: see stall_timeout, queue_timeout and max_download_time in [Download Settings]."
                 )
         self.poll_interval = 10  # seconds between status checks
+        self.unchecked_task_ids: set = set()
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
         """Get a backend instance by name.
@@ -215,6 +218,17 @@ class DownloadOrchestrator:
                 m["queued_since"] = now
             return None
 
+        # Progress is measured in bytes where the backend reports them (slskd) and in percent
+        # otherwise (Stacks reports only a percentage). It is checked before the queue state:
+        # a multi-file audiobook can show "queued" at every poll (the peer serves one chapter
+        # at a time and the poll lands between chapters) while bytes keep arriving.
+        bytes_now, percent_now = task.bytes_transferred, task.progress_percent or 0.0
+        moved = bytes_now != m["last_bytes"] or percent_now != m["last_percent"]
+        if moved:
+            # Forward progress, or a counter that went backwards (resumed task tracking fewer
+            # files, a restarted transfer): either way a fresh baseline, not a stall
+            m["last_bytes"], m["last_percent"], m["last_progress_at"] = bytes_now, percent_now, now
+
         if task.status == DownloadStatus.QUEUED_LOCALLY:
             # Waiting for our own slskd download slots: not the peer's fault, so no timer runs
             m["queued_since"] = None
@@ -222,8 +236,8 @@ class DownloadOrchestrator:
             return None
 
         if task.status == DownloadStatus.QUEUED:
-            if m.get("queued_since") is None:
-                m["queued_since"] = now
+            if m.get("queued_since") is None or moved:
+                m["queued_since"] = now  # data arrived since the last poll, so the queue moved too
             if self.queue_timeout > 0 and now - m["queued_since"] >= self.queue_timeout:
                 return f"Waited more than {self.queue_timeout}s in a queue without starting"
             # Waiting in a queue is not a stall
@@ -231,16 +245,7 @@ class DownloadOrchestrator:
             return None
 
         m["queued_since"] = None
-        # Progress is measured in bytes where the backend reports them (slskd) and in percent
-        # otherwise (Stacks reports only a percentage)
-        bytes_now, percent_now = task.bytes_transferred, task.progress_percent or 0.0
-        if bytes_now < m["last_bytes"] or percent_now < m["last_percent"]:
-            # A counter went backwards (resumed task tracking fewer files, or a transfer was
-            # restarted): treat it as a fresh baseline, not as a stall
-            m["last_bytes"], m["last_percent"], m["last_progress_at"] = bytes_now, percent_now, now
-            return None
-        if bytes_now > m["last_bytes"] or percent_now > m["last_percent"]:
-            m["last_bytes"], m["last_percent"], m["last_progress_at"] = bytes_now, percent_now, now
+        if moved:
             return None
 
         if self.stall_timeout > 0 and now - m["last_progress_at"] >= self.stall_timeout:
@@ -475,6 +480,7 @@ class DownloadOrchestrator:
                 break
 
             self._log_batch_status(list(active_map.values()), list(completed_map.values()))
+            health.heartbeat()
             time.sleep(self.poll_interval)
 
         return list(completed_map.values()), list(active_map.values())
@@ -496,6 +502,9 @@ class DownloadOrchestrator:
             List of reconciled and still-active tasks
         """
         resumed: List[DownloadTask] = []
+        # Saved tasks that couldn't be checked (backend unreachable or disabled): not resumed
+        # this run, but not given up either
+        self.unchecked_task_ids = set()
 
         for task_data in persisted_tasks:
             backend_name = task_data.get("backend_name", "slskd")
@@ -508,11 +517,17 @@ class DownloadOrchestrator:
                     break
 
             if not backend:
-                logger.warning(f"Backend {backend_name} not available for resume")
+                logger.warning(f"Backend {backend_name} not available: keeping {task_data.get('book_title', 'download')} for a later run")
+                self.unchecked_task_ids.add(task_data.get("task_id"))
                 continue
 
             # Let backend reconcile the task
-            task = backend.reconcile_task(task_data)
+            try:
+                task = backend.reconcile_task(task_data)
+            except BackendUnavailable as e:
+                logger.warning(f"Could not check {task_data.get('book_title', 'download')} ({e}); keeping it for the next run")
+                self.unchecked_task_ids.add(task_data.get("task_id"))
+                continue
             if task:
                 resumed.append(task)
                 logger.info(f"Resumed task: {task.filename} from {backend_name}")

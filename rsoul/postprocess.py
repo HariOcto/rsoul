@@ -11,6 +11,7 @@ from mobi_header import MobiHeader
 import ebookmeta
 from .utils import sanitize_folder_name, jaccard_similarity, extract_author_title
 from .display import print_import_summary, print_section_header
+from . import health
 
 logger = logging.getLogger("readarr_soul")
 
@@ -458,12 +459,26 @@ def organize_audiobook(book_download: dict, local_download_dir: str) -> tuple:
         target_dir = os.path.join(local_download_dir, relative)
         counter += 1
 
+    moved = []
     try:
         os.makedirs(target_dir, exist_ok=True)
         for name in expected:
             shutil.move(os.path.join(source_dir, name), os.path.join(target_dir, name))
+            moved.append(name)
         logger.info(f"Moved {len(expected)} audiobook files to {target_dir}")
     except Exception as e:
+        # Put the chapters already moved back next to the others, so the failure handling
+        # moves the whole book to failed_imports instead of leaving part of it in staging
+        for name in moved:
+            try:
+                shutil.move(os.path.join(target_dir, name), os.path.join(source_dir, name))
+            except Exception as back_error:
+                logger.error(f"Could not move {name} back from {target_dir}: {back_error}")
+        try:
+            if os.path.isdir(target_dir) and not os.listdir(target_dir):
+                os.rmdir(target_dir)
+        except OSError:
+            pass
         return None, f"Failed to organize audiobook: {e}"
 
     # Clean up the source folder if nothing else is left in it
@@ -520,7 +535,8 @@ def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str)
     return path
 
 
-IMPORT_TIMEOUT_SECONDS = 3600
+# How long a run waits for an import command before leaving it for the next run
+IMPORT_TIMEOUT_SECONDS = 600
 
 
 def _import_succeeded(command: dict) -> bool:
@@ -542,8 +558,9 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
     """Wait for Readarr import commands to finish and report results.
 
     Returns:
-        {command id: True if the import succeeded}. Failed imports are moved to failed_imports;
-        commands still running after `timeout` seconds count as failed but are left in place.
+        {command id: True if the import succeeded, False if it failed, None if it was still
+        running (or Readarr/Chaptarr couldn't be reached) when the wait ended}. Failed imports
+        are moved to failed_imports; unfinished ones are left in place to be checked again.
     """
     results: dict = {}
     if not commands:
@@ -566,6 +583,7 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
             if current_task.get("status") in ["completed", "failed", "aborted", "cancelled", "orphaned"]:
                 final[task["id"]] = current_task
         if len(final) < len(commands):
+            health.heartbeat()
             time.sleep(2)
 
     # Report final results
@@ -573,8 +591,8 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
     for task in commands:
         current_task = final.get(task["id"])
         if current_task is None:
-            logger.error(f"Import command {task['id']} still running after {timeout:.0f}s - not waiting any longer")
-            results[task["id"]] = False
+            logger.warning(f"Import command {task['id']} hasn't finished after {timeout:.0f}s; it will be checked again on the next run")
+            results[task["id"]] = None
             continue
 
         body = current_task.get("body") or {}
@@ -619,13 +637,102 @@ def files_left_after_import(paths: list, folder: str, settle: Optional[float] = 
     return remaining
 
 
+# How long an import may stay unconfirmed across runs before R:soul gives up on it
+PENDING_IMPORT_MAX_AGE = 24 * 3600
+PENDING_IMPORT_MAX_SUBMITS = 3
+
+
+def pending_import_record(folder: str, readarr_download_dir: str, local_download_dir: str, files: list, command_id: Optional[int]) -> dict:
+    """Everything needed to finish an import on a later run."""
+    return {
+        "folder": folder,
+        "local_dir": os.path.join(local_download_dir, folder),
+        "readarr_path": os.path.join(readarr_download_dir, folder),
+        "files": list(files),
+        "command_id": command_id,
+        "submits": 1 if command_id is not None else 0,
+        "since": time.time(),
+    }
+
+
+def _give_up(local_dir: str, left: list) -> None:
+    """Move the files of an import R:soul stops following into failed_imports, like every
+    other failed import, so nothing is left untracked in the staging folder."""
+    if left:
+        move_failed_import(local_dir)
+        logger.error("Its files are in failed_imports for a manual import in Readarr/Chaptarr")
+
+
+def check_pending_import(readarr_client: Any, pending: dict, now: Optional[float] = None):
+    """Follow up an import left unconfirmed by an earlier run.
+
+    Returns True (imported), False (failed or given up), None (still running; keep waiting),
+    or an updated pending record (re-submitted; check again next run).
+    """
+    now = time.time() if now is None else now
+    local_dir, files = pending["local_dir"], pending.get("files", [])
+    left = [p for p in files if os.path.exists(p)]
+    label = pending.get("folder", local_dir)
+
+    if now - pending.get("since", now) > PENDING_IMPORT_MAX_AGE:
+        if files and not left:
+            # Chaptarr moves the files when it imports them, even if R:soul never heard back
+            logger.info(f"Files of {label} are gone from the download folder: treating the import as done")
+            return True
+        logger.error(f"Import of {label} still unconfirmed after {PENDING_IMPORT_MAX_AGE // 3600} hours; giving up")
+        _give_up(local_dir, left)
+        return False
+
+    command_id = pending.get("command_id")
+    if command_id is not None:
+        try:
+            command = readarr_client.get_command(command_id)
+        except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) != 404:
+                logger.warning(f"Could not check import of {label} ({e}); trying again next run")
+                return None
+            command = None  # Readarr/Chaptarr no longer knows the command (e.g. it restarted)
+
+        if command is not None:
+            status = command.get("status")
+            if status not in ("completed", "failed", "aborted", "cancelled", "orphaned"):
+                logger.info(f"Import of {label} is still running; checking again next run")
+                return None
+            if _import_succeeded(command) and files_left_after_import(files, local_dir) is None:
+                logger.info(f"Import of {label} finished (result: {command.get('result', 'n/a')})")
+                return True
+            logger.warning(f"Import of {label} did not succeed (status: {status}, result: {command.get('result', 'n/a')})")
+            if left:
+                move_failed_import(local_dir)
+            return False
+
+    # No command (never submitted, or forgotten by the server)
+    if files and not left:
+        logger.info(f"Files of {label} are gone from the download folder: treating the import as done")
+        return True
+    if pending.get("submits", 0) >= PENDING_IMPORT_MAX_SUBMITS:
+        logger.error(f"Import of {label} submitted {pending['submits']} times without a result; giving up")
+        _give_up(local_dir, left)
+        return False
+    try:
+        command = readarr_client.post_command(name="DownloadedBooksScan", path=pending["readarr_path"])
+    except Exception as e:
+        logger.warning(f"Could not submit import of {label} ({e}); trying again next run")
+        return None
+    logger.info(f"Submitted import of {label} again - command ID {command['id']}")
+    return dict(pending, command_id=command["id"], submits=pending.get("submits", 0) + 1)
+
+
 def process_imports(ctx: Any, grab_list: list) -> dict:
     """Process downloaded files, validate metadata, and trigger Readarr import.
 
     Handles items from multiple backends by grouping them and using backend-specific paths.
 
     Returns:
-        {bookId: True if the book was imported (or sync is disabled), False otherwise}
+        {bookId: True if the book was imported (or sync is disabled), False if it failed, or a
+        pending-import record (dict) when the import couldn't be confirmed yet: the command
+        was still running, or Readarr/Chaptarr couldn't be reached. Pending imports are
+        checked again on the next run by check_pending_import.}
     """
     results = {item.get("bookId"): False for item in grab_list}
     print_section_header("METADATA VALIDATION & IMPORT PHASE")
@@ -806,15 +913,26 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         if author_folders:
             logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
             commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
-            if commands:
-                command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir)
-                for command in commands:
-                    folder = command.get("_rsoul_folder")
+            poll_timeout = ctx.config.getfloat("Readarr", "import_poll_timeout", fallback=IMPORT_TIMEOUT_SECONDS)
+            command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir, timeout=poll_timeout) if commands else {}
+            command_for = {c.get("_rsoul_folder"): c for c in commands}
+
+            for folder in author_folders:
+                command = command_for.get(folder)
+                if command is None:
+                    # Readarr/Chaptarr didn't accept the import (unreachable?): keep the files
+                    # staged and submit again on the next run instead of losing track of them
+                    outcome = pending_import_record(folder, readarr_download_dir, local_download_dir, folder_files.get(folder, []), None)
+                else:
                     ok = command_results.get(command["id"], False)
-                    if ok:
-                        ok = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder)) is None
-                    for book_id in folder_books.get(folder, []):
-                        results[book_id] = ok
+                    if ok is None:
+                        outcome = pending_import_record(folder, readarr_download_dir, local_download_dir, folder_files.get(folder, []), command["id"])
+                    elif ok:
+                        outcome = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder)) is None
+                    else:
+                        outcome = False
+                for book_id in folder_books.get(folder, []):
+                    results[book_id] = outcome
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")

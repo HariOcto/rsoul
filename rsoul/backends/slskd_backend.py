@@ -22,6 +22,7 @@ from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_do
 from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
+from .. import health
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[
         minimumPeerUploadSpeed=ctx.config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
     )
 
+    health.heartbeat()  # searching many books can take longer than the health check allows
     time.sleep(10)
 
     while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":

@@ -1,7 +1,7 @@
 """A small status file for Docker's health check.
 
 R:soul writes <config dir>/health.json when a run starts and ends, and about once a minute
-while it monitors downloads or waits for imports (the steps that can take long). `python -m rsoul.health` reports
+while it searches, monitors downloads or waits for imports (the steps that can take long). `python -m rsoul.health` reports
 the container as unhealthy when that file hasn't been updated for longer than a run
 plus the wait between runs should take, which means R:soul is stuck or not running.
 It only affects the status shown by Docker/TrueNAS; nothing is restarted.

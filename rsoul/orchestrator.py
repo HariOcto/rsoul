@@ -348,6 +348,7 @@ class DownloadOrchestrator:
                 if elapsed < batch_delay:
                     time.sleep(batch_delay - elapsed)
             last_target_time = time.time()
+            health.heartbeat()
 
             task = self.start_download(target)
             if task:

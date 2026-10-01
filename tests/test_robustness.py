@@ -696,3 +696,27 @@ def test_whole_number_settings_reject_other_values(option, value):
     config["Download Settings"][option] = value
     with pytest.raises(ValueError, match=option):
         validate_config(config)
+
+
+def test_search_phase_keeps_health_fresh(tmp_path, monkeypatch):
+    # Found live: searching 10 books can take over 15 minutes without a heartbeat
+    from rsoul.backends.base import DownloadTarget
+
+    beats = []
+    monkeypatch.setattr(health, "heartbeat", lambda: beats.append(1))
+
+    class Backend:
+        name = "fake"
+
+        def is_available(self):
+            return True
+
+        def search(self, target):
+            return []
+
+    config = configparser.ConfigParser()
+    config["General"] = {"batch_delay": "0"}
+    orch = DownloadOrchestrator([Backend()], Context(config=config, slskd=None, readarr=None))
+    targets = [DownloadTarget(i, f"B{i}", "A", "", ["mp3"], {"id": i, "title": f"B{i}"}, {"authorName": "A"}) for i in range(3)]
+    orch.start_targets(targets)
+    assert len(beats) == 3

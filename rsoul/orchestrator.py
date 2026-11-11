@@ -544,6 +544,10 @@ class DownloadOrchestrator:
                 logger.warning(f"Could not check {task_data.get('book_title', 'download')} ({e}); keeping it for the next run")
                 self.unchecked_task_ids.add(task_data.get("task_id"))
                 continue
+            except Exception:
+                # Saved data in a shape nobody expected: give up on this one download, not the run
+                logger.exception(f"Error resuming {task_data.get('book_title', 'download')}; dropping it")
+                task = None
             if task:
                 resumed.append(task)
                 logger.info(f"Resumed task: {task.filename} from {backend_name}")

@@ -286,29 +286,84 @@ def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[
     return candidates
 
 
-# Chapter and part numbers at either end of a file name: "Title - 01", "Title (Part 2 of 5)",
-# "03 - Title", "CD2 Title". A number that is part of a longer one ("1984") is left alone.
+# Chapter and part numbers in file names.
+#
+# A number at the end of a name is only *evidently* a chapter or part number when something
+# sets it apart from the title: a word such as "Part" or "CD", a separator ("Title - 3",
+# "Title (3)") or zero padding ("Title 03"). A bare "Title 2" is more often the
+# second book of a series, so it is never taken for a part of "Title" on its own. The one
+# exception, "Title 10" next to "Title 01"..."Title 09", is handled in same_book_files.
 _PART_WORD = r"(?:part|pt|chapter|chap|ch|cd|disc|disk|track|teil|kapitel)"
-_TRAILING_PART = re.compile(rf"[\s\-_.,(\[]*(?:(?<![A-Za-z]){_PART_WORD}\.?\s*)?(?<!\d)\d{{1,3}}(?:\s*(?:of|von|/)\s*\d{{1,3}})?[\s)\]]*$", re.IGNORECASE)
-_LEADING_PART = re.compile(rf"^[\s(\[]*(?:{_PART_WORD}\.?\s*)?\d{{1,3}}(?!\d)[\s)\]\-_.]+", re.IGNORECASE)
+_NUMBER = r"(?<!\d)(?P<n>\d{1,3})(?:\s*(?:of|von|/)\s*\d{1,3})?[\s)\]]*$"
+_TRAILING_EVIDENT = re.compile(
+    rf"(?:[\s\-_.,(\[]*(?<![A-Za-z]){_PART_WORD}\.?\s*"  # "Part 2", "CD2", "(pt. 3"
+    rf"|(?:\s+[\-–]\s*|\s*[(\[]\s*)"  # " - 2", "(2"; not "_2" or ".2", which often stand for a space
+    rf"|(?:\s+|[\-_.])(?=0\d))"  # " 02", "-02"
+    rf"{_NUMBER}",
+    re.IGNORECASE,
+)
+_TRAILING_ANY = re.compile(rf"[\s\-_.,(\[]*(?:(?<![A-Za-z]){_PART_WORD}\.?\s*)?{_NUMBER}", re.IGNORECASE)
+# A number in front of the name is a track number: "03 - Title", "03. Title", "CD2 Title"
+_LEADING_PART = re.compile(rf"^[\s(\[]*(?:{_PART_WORD}\.?\s*)?(?P<n>\d{{1,3}})(?!\d)[\s)\]\-_.]+", re.IGNORECASE)
 
 
 def _stem(basename: str) -> str:
     return basename.rsplit(".", 1)[0] if "." in basename else basename
 
 
+def _strip_numbers(name: str, trailing: "re.Pattern") -> str:
+    stripped = _LEADING_PART.sub("", trailing.sub("", name)).strip()
+    return stripped or name  # nothing but a number: leave it
+
+
 def strip_part_numbers(name: str) -> str:
-    """"Author - Title - 01" -> "Author - Title"; "03 - Title" -> "Title". Returns the name
-    unchanged if nothing but a number would be left."""
-    stripped = _LEADING_PART.sub("", _TRAILING_PART.sub("", name)).strip()
-    return stripped or name
+    """Remove evident chapter/part numbers: "Author - Title - 01" -> "Author - Title",
+    "03 - Title" -> "Title", "Title (Part 2 of 5)" -> "Title". "Title 2" is left as it is."""
+    return _strip_numbers(name, _TRAILING_EVIDENT)
 
 
 def book_key(basename: str) -> str:
     """What the files of one book have in common: the file name without its extension and
-    without chapter/part numbers, normalised. "Author - Title - 01.mp3" and
-    "Author - Title - 02.mp3" share a key; "Author - Other Title.mp3" has a different one."""
+    without evident chapter/part numbers, normalised. "Author - Title - 01.mp3" and
+    "Author - Title - 02.mp3" share a key; "Author - Title 2.m4b" (a sequel) has its own."""
     return normalize_for_matching(strip_part_numbers(_stem(basename)))
+
+
+def _loose_key(basename: str) -> str:
+    return normalize_for_matching(_strip_numbers(_stem(basename), _TRAILING_ANY))
+
+
+def part_number(basename: str) -> Optional[int]:
+    """The chapter/part number a file name carries at its start or end, if any."""
+    stem = _stem(basename)
+    found = _LEADING_PART.search(stem) or _TRAILING_ANY.search(stem)
+    return int(found.group("n")) if found else None
+
+
+def same_book_files(matched: List[str], basenames: List[str]) -> List[str]:
+    """Of the files in a folder, those that belong to the same book as the matched ones.
+
+    Files with the same book_key belong together. Files that differ only by a bare number
+    ("Title 10" next to "Title 01") are added when the others show a zero-padded numbering
+    that such a number continues; otherwise ("Title 2" next to "Title") they are other books.
+    """
+    keys = {book_key(name) for name in matched}
+    loose = {_loose_key(name) for name in matched}
+    sure = [name for name in basenames if book_key(name) in keys]
+    # "Title.m4b" next to "Title (2).m4b" is a book and a second copy (or something else), not
+    # two parts: numbered and unnumbered files only go together with their own kind
+    numbered = {name: strip_part_numbers(_stem(name)) != _stem(name) for name in set(sure) | set(matched)}
+    kinds = {numbered[name] for name in matched}
+    if len(kinds) == 1:
+        sure = [name for name in sure if numbered[name] in kinds]
+    unsure = [name for name in basenames if name not in sure and _loose_key(name) in loose]
+    if unsure:
+        tokens = [found.group("n") for found in (_TRAILING_ANY.search(_stem(name)) for name in sure) if found]
+        padded = [len(token) for token in tokens if token.startswith("0")]
+        if padded and len(tokens) == len(sure):  # every sure file is numbered, in a padded scheme
+            width = max(padded)
+            sure = sure + [name for name in unsure if len(_TRAILING_ANY.search(_stem(name)).group("n")) >= width]
+    return sure
 
 
 def file_name_candidates(basename: str) -> List[str]:
@@ -398,9 +453,26 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
             continue
         # Numbers, including ordinals such as 1st, 3rd or 4th, don't make it a different title
         extras = [w for w in words if w not in title_words and w not in ignore and not re.fullmatch(r"\d+(?:[snrt][tdh])?", w)]
-        if not extras:
-            return True
+        if extras:
+            continue
+        # ...except a bare number right behind the title: "Dune 2" is the next book, not "Dune".
+        # A number that is set apart is fine: zero-padded ("Dune 01", a chapter), a year
+        # ("Dune 1965"), after another word ("Dune Book 1") or in front ("1 Dune").
+        if any(_sequel_number(w, words[i - 1] if i else None, title_words) for i, w in enumerate(words) if w not in title_words):
+            continue
+        return True
     return False
+
+
+def _sequel_number(word: str, previous: Optional[str], title_words: set) -> bool:
+    """True for a bare number (or ordinal) that directly follows a word of the title."""
+    if previous not in title_words or not re.fullmatch(r"\d+(?:[snrt][tdh])?", word):
+        return False
+    if word.startswith("0") and len(word) >= 2:
+        return False  # zero-padded: a chapter or track number
+    if re.fullmatch(r"(?:1[89]|20)\d\d", word):
+        return False  # a year
+    return True
 
 
 def author_in_name(author_name: str, candidate: str) -> bool:

@@ -19,7 +19,8 @@ if TYPE_CHECKING:
     from ..config import Context
 
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
-from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, book_key
+from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number
+from ..media import AUDIO_EXTENSIONS
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
 from .. import health
@@ -360,8 +361,13 @@ class SlskdBackend(DownloadBackend):
                 # ("Audiobooks", an author folder). Take the files that share the matched name,
                 # i.e. the one file of a single-file book or every chapter of
                 # "Author - Title - 01.mp3", "... - 02.mp3", and nothing else.
-                keys = {book_key(split_slskd_path(f["filename"])[1]) for f in match["files"]}
-                files = [f for f in files if book_key(split_slskd_path(f["filename"])[1]) in keys]
+                matched = [split_slskd_path(f["filename"])[1] for f in match["files"]]
+                own = set(same_book_files(matched, [split_slskd_path(f["filename"])[1] for f in files]))
+                files = [f for f in files if split_slskd_path(f["filename"])[1] in own]
+            elif files and self._chapters_in_other_formats(directory, ext, files, browsed):
+                # "01.mp3" next to "02.m4a": this format alone is not the whole book
+                logger.info(f"Skipping {directory} from {username}: its chapters are spread over several audio formats")
+                continue
             if not files:
                 continue
 
@@ -379,6 +385,24 @@ class SlskdBackend(DownloadBackend):
 
             logger.info(f"Audiobook candidate: {label} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
             yield self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], file_based=file_based)
+
+    @staticmethod
+    def _chapters_in_other_formats(directory: str, ext: str, files: List[Dict[str, Any]], browsed: List[Dict[str, Any]]) -> bool:
+        """True if the folder's numbered chapters are split between this format and another.
+
+        A second complete copy in another format (an .m4b next to the mp3 chapters, or the
+        same chapters as mp3 and m4a) is fine. It is a split when each format has chapter
+        numbers the other lacks.
+        """
+        own = {part_number(split_slskd_path(f["filename"])[1]) for f in files} - {None}
+        other = set()
+        for f in browsed:
+            folder, basename = split_slskd_path(f["filename"])
+            other_ext = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
+            if folder == directory and other_ext != ext and other_ext in AUDIO_EXTENSIONS:
+                other.add(part_number(basename))
+        other.discard(None)
+        return bool(own - other) and bool(other - own)
 
     def _audiobook_result(
         self, target: DownloadTarget, username: str, directory: str, ext: str, files: List[Dict[str, Any]], total_size: int, score: float, file_based: bool = False

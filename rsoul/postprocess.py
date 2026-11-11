@@ -536,7 +536,11 @@ def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str)
 
 
 def import_failure_retry_days(config: Any) -> float:
-    """Days before a peer whose files weren't imported is tried again (0 = never again)."""
+    """Days before a peer whose files weren't imported is tried again (0 = never again).
+
+    Applies to every failure that may have a local cause (files not found or not movable,
+    Readarr/Chaptarr not importing). Only an ebook whose metadata is for another book is
+    recorded for good: that is the one case where the content is known to be wrong."""
     return config.getfloat("Postprocessing", "import_failure_retry_days", fallback=IMPORT_FAILURE_RETRY_DAYS)
 
 
@@ -819,7 +823,8 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
                     move_files_aside(local_download_dir, book_download.get("dir", ""), names)
                     if ctx.history and source_id and book_title:
-                        ctx.history.add_failure(source_id, book_title, reason or "Audiobook import failed")
+                        # Missing files or a failed move say nothing about the peer's files
+                        ctx.history.add_failure(source_id, book_title, reason or "Audiobook import failed", retry_after_days=import_failure_retry_days(ctx.config))
                 continue
 
             try:
@@ -848,7 +853,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     logger.error(f"Source file not found: {source_file_path}")
                     failed_imports.append((folder, filename, author_name_sanitized, f"Source file not found: {source_file_path}"))
                     if ctx.history:
-                        ctx.history.add_failure(source_id, book_title, "Source file not found")
+                        ctx.history.add_failure(source_id, book_title, "Source file not found", retry_after_days=import_failure_retry_days(ctx.config))
                     continue
 
                 # 1. Validate Metadata (skip for stacks backend - trust AA matching)
@@ -870,7 +875,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     else:
                         failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
                         if ctx.history:
-                            ctx.history.add_failure(source_id, book_title, "Failed to organize file")
+                            ctx.history.add_failure(source_id, book_title, "Failed to organize file", retry_after_days=import_failure_retry_days(ctx.config))
                 else:
                     logger.warning(f"Metadata validation failed for {filename}")
                     failed_imports.append((folder, filename, author_name_sanitized, "Metadata validation failed"))
@@ -884,7 +889,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     sid = book_download.get("source_id", book_download.get("username", ""))
                     t = book_download.get("title", "")
                     if sid and t:
-                        ctx.history.add_failure(sid, t, "Unexpected processing error")
+                        ctx.history.add_failure(sid, t, "Unexpected processing error", retry_after_days=import_failure_retry_days(ctx.config))
 
         # Handle failed imports
         if failed_imports:

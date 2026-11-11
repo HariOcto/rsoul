@@ -79,15 +79,43 @@ class StateManager:
         extra = item.setdefault("extra", {})
         if not isinstance(extra, dict):
             return False
+        def text(value: Any, empty_ok: bool = True) -> bool:
+            return isinstance(value, str) and (empty_ok or bool(value))
+
+        def number(value: Any) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+
         files = extra.get("files", [])
-        if not isinstance(files, list) or not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
+        if not isinstance(files, list):
             return False
-        if not isinstance(extra.get("expected_files", []), list):
+        for f in files:
+            if not isinstance(f, dict) or not text(f.get("filename"), empty_ok=False):
+                return False
+            # (state files from before transfer IDs were saved have no "id")
+            if not (f.get("id") is None or text(f["id"], empty_ok=False)) or not number(f.get("size") or 0):
+                return False
+            if not all(text(f.get(key) or "") for key in ("username", "file_dir")):
+                return False
+            if not isinstance(f.get("status") or {}, dict):
+                return False
+        expected = extra.get("expected_files", [])
+        if not isinstance(expected, list) or not all(text(name, empty_ok=False) for name in expected):
+            return False
+        if not all(text(extra.get(key, "")) for key in ("username", "file_dir", "media_type", "path")):
+            return False
+        if not isinstance(extra.get("monitor", {}), dict) or not all(v is None or number(v) for v in extra.get("monitor", {}).values()):
+            return False
+        if not number(extra.get("offline_bytes", 0)):
             return False
         pending = extra.get("import_pending")
-        if pending is not None and not (isinstance(pending, dict) and isinstance(pending.get("local_dir"), str)):
-            return False
-        return all(isinstance(item.get(key, ""), str) for key in ("backend_name", "book_title", "author_name", "filename", "local_dir"))
+        if pending is not None:
+            if not isinstance(pending, dict) or not text(pending.get("local_dir")) or not text(pending.get("readarr_path", "")):
+                return False
+            if not isinstance(pending.get("files", []), list) or not all(text(path) for path in pending.get("files", [])):
+                return False
+            if not all(number(pending.get(key, 0)) for key in ("submits", "since")):
+                return False
+        return all(text(item.get(key, "")) for key in ("backend_name", "book_title", "author_name", "filename", "local_dir", "series_title"))
 
     def _keep_damaged_copy(self, move: bool) -> str:
         """Set the damaged state file aside for troubleshooting. Returns its new name ("" on failure)."""

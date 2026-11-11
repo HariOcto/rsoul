@@ -398,7 +398,9 @@ def audiobook_folder_match(
     scores at least minimum_match_ratio is returned, best match first.
 
     Returns:
-        List of dicts: directory, extension, files, score, total_size.
+        List of dicts: directory, extension, files, score, total_size, single_file.
+        single_file is True when the folder's name didn't match but the name of the only
+        matching file in it did: that file is the book, and the folder may hold other books.
     """
     if username in ignored_users:
         return []
@@ -440,7 +442,14 @@ def audiobook_folder_match(
             continue
 
         names = folder_name_candidates(directory, files)
-        if not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
+        # Was it the folder that matched, or only the name of a single file inside it? A lone
+        # "Author - Title.m4b" often sits in a folder full of other books ("Audiobooks",
+        # "Brandon Sanderson"): then only that file belongs to the book, not the whole folder.
+        folder_names = folder_name_candidates(directory, [])
+        matched_on_folder = any(title_segment_match(title, name, author_name, series_title) for name in folder_names for title in titles)
+        if not matched_on_folder:
+            names = [name for name in names if name not in folder_names]  # the file's own name
+        if not matched_on_folder and not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
             # e.g. "The Saints of Salvation" or "Salvation Lost" when "Salvation" is wanted
             note("folders for a different title", directory)
             continue
@@ -472,6 +481,8 @@ def audiobook_folder_match(
             "files": files,
             "score": best_score,
             "total_size": sum(f.get("size", 0) for f in files),
+            # True: only this one file is the book; the rest of the folder is something else
+            "single_file": not matched_on_folder,
         }
         current = best_per_ext.get(ext)
         if current is None or (candidate["score"], candidate["total_size"]) > (current["score"], current["total_size"]):

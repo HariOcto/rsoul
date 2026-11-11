@@ -165,14 +165,15 @@ Set `media_mode` in `[Search Settings]`:
 
 How audiobooks are handled:
 
-- **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A single-file audiobook (`.m4b`) can also match on its filename.
+- **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A single-file audiobook (`.m4b`) can also match on its filename; then only that file is downloaded, because the folder around it (`Audiobooks`, an author folder) usually holds other books too.
 - **The author must appear in the folder path** (e.g. `Brandon Sanderson\The Final Empire` or `Brandon Sanderson - The Final Empire`). Titles repeat across authors, so a folder named only after the title is not trusted.
 - **Title forms**: besides the full title, a shorter form can match, such as "The Final Empire" for "Mistborn: The Final Empire". Ebook matching is unchanged.
 - **Exact title required**: one part of the folder name (split at " - ", commas and folder boundaries) must be the title and nothing else except the author, the series name (from Chaptarr), numbers and words like "Book" or "Unabridged". So "Frontlines 2 - Lines of Departure" matches *Lines of Departure*, but "The Saints of Salvation" and "Salvation Lost" don't match *Salvation*.
 - **Only complete folders are downloaded.** Candidates are tried best match first; each is listed in full on the peer's share, and every audio file in it is queued. A folder that can't be listed is skipped, because search results only show some of its files. If not every file can be queued, the download is cancelled.
 - **Multi-disc audiobooks are skipped.** Folders named like `CD1`, `Disc 2` or `Part 3` are one part of a larger book, so they are not downloaded.
 - **Import**: files are moved to `<download_dir>/rsoul_audiobooks/<Author>/<Title>/` and imported with one `DownloadedBooksScan` per book folder. Chaptarr decides from the file extension that they are an audiobook. Ebook metadata validation is not applied to audio files. Use formats Chaptarr can import (e.g. `m4b`, `mp3`, `m4a`, `flac`); R:soul warns at startup about others.
-- **Failed downloads are cleared away**: whatever a failed download left behind (e.g. finished chapters) is moved to `<download_dir>/failed_downloads/`, so it can't mix with a later attempt.
+- **Failed downloads are cleared away**: whatever a failed download left behind (e.g. finished chapters) is moved to `<download_dir>/failed_downloads/`, so it can't mix with a later attempt. The same happens to a saved download that can no longer be resumed; its remaining transfers are cancelled in slskd.
+- **Rejected imports**: if Readarr/Chaptarr finishes the import without taking the files, they are moved to `<download_dir>/failed_imports/` and the peer is added to `failed_downloads.json`, so the next run tries another peer instead of downloading the same files again.
 - **Time limits** are progress-based (see [Download timeouts](#download-timeouts)), so a large audiobook from a slow but steady peer is not cancelled.
 
 **Sharing slskd with other tools.** R:soul removes only its own records from slskd's transfer list once a download has finished or failed; it no longer clears every finished transfer, so tools such as Soularr can share the same slskd. The reverse is handled too:
@@ -199,7 +200,7 @@ Progress means new bytes (slskd) or a higher percentage (Stacks, which reports o
 
 The overall cap still applies in both cases. Timers start when a download is queued.
 
-Imports run on a background thread, so the other downloads keep being monitored while Readarr or Chaptarr imports a finished one. A download only counts as successful in the run summary once its import succeeded; an import still running after an hour counts as failed.
+Imports run on a background thread, so the other downloads keep being monitored while Readarr or Chaptarr imports a finished one. A download only counts as successful in the run summary once its import succeeded; an import that is still running when the run ends is followed up on the next run (see [Reliability](#reliability)).
 
 ### Hand-off between runs
 
@@ -214,7 +215,7 @@ Each run can add up to `number_of_books_to_grab` new downloads. To keep slow dow
 - **Outages don't erase saved downloads.** If slskd can't be reached when a run starts, saved downloads are kept for the next run instead of being given up.
 - **A failed search isn't mistaken for an empty wanted list.** If Readarr/Chaptarr can't be reached, or a search setting is invalid, saved downloads are still followed up and the run ends with exit code `2`.
 - **One R:soul per data folder.** On filesystems that support OS file locks (local disks and ZFS datasets do), a lock on `.rsoul.lock` prevents two R:soul processes, or two containers sharing a data folder, from running at once. The lock is released automatically when R:soul exits, even after a crash. Where locking isn't supported, R:soul logs a warning and runs without it.
-- **Settings are checked at startup.** Time limits must be `0` or a positive number, and `monitor_window` and `max_active_downloads` must be whole numbers. Values like `-100`, `nan` or `2.5` stop R:soul with a clear error instead of silently disabling a limit or failing later.
+- **Settings are checked at startup.** Time limits must be `0` or a positive number (decimals are fine), `monitor_window` and `max_active_downloads` must be whole numbers, and `number_of_books_to_grab` must be at least 1. Values like `-100`, `nan` or a `monitor_window` of `2.5` stop R:soul with a clear error instead of silently disabling a limit or failing later. So does a `download_dir` that is still the sample placeholder (`/path/to/...`); a placeholder `readarr_download_dir` falls back to `download_dir` with a warning.
 - **Exit codes.** Each run exits with `0` (finished), `1` (configuration or startup problem, another instance running, or a crash) or `2` (saved downloads were handled, but searching for new books failed). In Docker, `run.sh` logs any non-zero exit and stops promptly on `docker stop`.
 - **Health check.** R:soul writes `health.json` to its data folder at the start and end of each run, and about once a minute while it searches, monitors downloads or waits for imports. The Docker image's health check reports *unhealthy* when that file is older than `max(900, 2 × SCRIPT_INTERVAL + 120)` seconds (override with `RSOUL_HEALTH_MAX_AGE`), meaning R:soul is stuck or not running. Nothing is restarted automatically. This is a liveness check only: whether slskd and Chaptarr work is recorded separately in `health.json` under `last_run` (failures, pending imports, a failed search, downloads that couldn't be checked).
 
@@ -227,6 +228,7 @@ Each run can add up to `number_of_books_to_grab` new downloads. To keep slow dow
 - **Busy local folders are left alone.** A download is not started if files with the same names are already in, or still downloading into, its local slskd folder.
 - **Other slskd transfers are left alone.** R:soul used to clear every finished transfer in slskd at the end of each run; it now removes only its own.
 - **Configuration can come from environment variables** (`RSOUL__<SECTION>__<OPTION>`), and `config.ini` is optional when they are used.
+- **Page counters.** With `search_type = incrementing_page`, the cutoff-unmet list now keeps its own page counter (`.current_page_cutoff_unmet.txt`). With `search_source = all` the two lists used to share one counter, so each saw only every other page.
 - **Everything else is opt-in.** `media_mode` defaults to `ebook`, `monitor_window` to `0` and `max_active_downloads` to `0` (no limit).
 
 ## Resume Functionality

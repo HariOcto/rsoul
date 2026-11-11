@@ -37,7 +37,7 @@ def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks:
     ...continues left-to-right until max_fallbacks reached
     """
     queries = []
-    first_name = author_name.split()[0] if author_name else author_name
+    first_name = author_name.split()[0] if author_name.split() else ""
     title_words = book_title.split()
 
     # Step 1: First name + full title
@@ -58,6 +58,10 @@ def _strip_initials(author_name: str) -> str:
     return " ".join(words)
 
 
+# Extra seconds, beyond the 10 s head start and slskd's own search_timeout, to wait for a search
+SEARCH_WAIT_MARGIN = 60
+
+
 def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[Dict[str, Any]], str]:
     """Execute a single SLSKD search and return results.
 
@@ -71,9 +75,10 @@ def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[
     """
     print_search_summary(query, 0, search_type, "searching")
 
+    search_timeout_ms = ctx.config.getint("Search Settings", "search_timeout", fallback=5000)
     search = ctx.slskd.searches.search_text(
         searchText=query,
-        searchTimeout=ctx.config.getint("Search Settings", "search_timeout", fallback=5000),
+        searchTimeout=search_timeout_ms,
         filterResponses=True,
         maximumPeerQueueLength=ctx.config.getint("Search Settings", "maximum_peer_queue", fallback=50),
         minimumPeerUploadSpeed=ctx.config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
@@ -82,7 +87,14 @@ def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[
     health.heartbeat()  # searching many books can take longer than the health check allows
     time.sleep(10)
 
+    # slskd ends a search itself after search_timeout; the cap only guards against a search
+    # that never leaves "InProgress", which would otherwise hang the whole run
+    deadline = time.time() + search_timeout_ms / 1000 + SEARCH_WAIT_MARGIN
     while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":
+        if time.time() >= deadline:
+            logger.warning(f"Search '{query}' is still in progress after {search_timeout_ms / 1000 + SEARCH_WAIT_MARGIN:.0f}s; using the results so far")
+            break
+        health.heartbeat()
         time.sleep(1)
 
     results = ctx.slskd.searches.search_responses(search["id"])
@@ -195,7 +207,8 @@ class SlskdBackend(DownloadBackend):
     def _match_thresholds(self) -> Dict[str, Any]:
         """Matching thresholds shared by ebook and audiobook matching."""
         return dict(
-            ignored_users=self.config.get("Search Settings", "ignored_users", fallback="").split(","),
+            # "User1, User2": names are compared exactly, so the spaces must go
+            ignored_users=[u.strip() for u in self.config.get("Search Settings", "ignored_users", fallback="").split(",") if u.strip()],
             minimum_match_ratio=self.config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5),
             min_length_ratio=self.config.getfloat("Search Settings", "min_length_ratio", fallback=0.4),
             min_jaccard_ratio=self.config.getfloat("Search Settings", "min_jaccard_ratio", fallback=0.25),
@@ -315,6 +328,20 @@ class SlskdBackend(DownloadBackend):
             directory = match["directory"]
             ext = match["extension"]
 
+            if match.get("single_file"):
+                # The file's own name matched, not the folder's: the folder may be a whole
+                # library ("Audiobooks", an author folder), so take this one file and nothing else
+                files = [{"filename": f["filename"], "size": f.get("size", 0)} for f in match["files"]]
+                total_size = sum(f["size"] for f in files)
+                if total_size < min_size_bytes:
+                    logger.info(f"Skipping {files[0]['filename']} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
+                    continue
+                if self._local_clashes(directory, files):
+                    logger.info(f"Skipping {files[0]['filename']} from {username}: its local download folder is in use")
+                    continue
+                logger.info(f"Audiobook candidate: {files[0]['filename']} (single file, {total_size / 1048576:.0f} MB) from {username}")
+                return [self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], single_file=True)]
+
             browsed = self._browse_directory(username, directory) if directory else None
             if browsed is None:
                 # Search results list only the files that matched the query, so without the full
@@ -338,28 +365,34 @@ class SlskdBackend(DownloadBackend):
                 logger.info(f"Skipping {directory} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
                 continue
 
+            if self._local_clashes(directory, files):
+                # download() would refuse this folder; the next candidate may be fine
+                logger.info(f"Skipping {directory} from {username}: its local download folder is in use")
+                continue
+
             logger.info(f"Audiobook candidate: {directory} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
-            return [
-                SearchResult(
-                    title=target.book_title,
-                    author=target.author_name,
-                    filename=split_slskd_path(files[0]["filename"])[1],
-                    size_bytes=total_size,
-                    extension=ext,
-                    backend_name=self.name,
-                    source_id=f"{username}|{directory}",
-                    score=match["score"],
-                    username=username,
-                    extra={
-                        "username": username,
-                        "file_dir": directory,
-                        "files": files,
-                        "media_type": "audiobook",
-                    },
-                )
-            ]
+            return [self._audiobook_result(target, username, directory, ext, files, total_size, match["score"])]
 
         return []
+
+    def _audiobook_result(
+        self, target: DownloadTarget, username: str, directory: str, ext: str, files: List[Dict[str, Any]], total_size: int, score: float, single_file: bool = False
+    ) -> SearchResult:
+        extra: Dict[str, Any] = {"username": username, "file_dir": directory, "files": files, "media_type": "audiobook"}
+        if single_file:
+            extra["single_file"] = True
+        return SearchResult(
+            title=target.book_title,
+            author=target.author_name,
+            filename=split_slskd_path(files[0]["filename"])[1],
+            size_bytes=total_size,
+            extension=ext,
+            backend_name=self.name,
+            source_id=f"{username}|{files[0]['filename'] if single_file else directory}",
+            score=score,
+            username=username,
+            extra=extra,
+        )
 
     def download(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
         """Initiate download of a Soulseek file."""
@@ -384,21 +417,12 @@ class SlskdBackend(DownloadBackend):
             )
             return None
 
-        downloads = slskd_do_enqueue(self.client, username, files, file_dir)
+        # An audiobook needs every chapter; anything less is cancelled again by the enqueue helper
+        is_audiobook = result.extra.get("media_type") == "audiobook"
+        downloads = slskd_do_enqueue(self.client, username, files, file_dir, require_all=is_audiobook)
 
         if not downloads:
             logger.warning(f"Failed to enqueue download for {target.book_title} from {username}")
-            return None
-
-        is_audiobook = result.extra.get("media_type") == "audiobook"
-        if is_audiobook and len(downloads) < len(files):
-            # An audiobook with missing chapters is worse than none: cancel and let the run report a failure
-            logger.warning(f"Only {len(downloads)} of {len(files)} audiobook files were enqueued from {username} - cancelling")
-            for d in downloads:
-                try:
-                    self.client.transfers.cancel_download(username=username, id=d["id"], remove=True)
-                except Exception:
-                    pass
             return None
 
         # Log what was enqueued
@@ -409,7 +433,13 @@ class SlskdBackend(DownloadBackend):
         local_dir = file_dir.split("\\")[-1] if file_dir else ""
 
         # Use (username, filename) as task_id; audiobooks are one task per folder
-        task_id = f"{username}|{file_dir}" if is_audiobook else f"{username}|{result.filename}"
+        # (a single-file audiobook shares its folder with other books, so its file names the task)
+        if is_audiobook and not result.extra.get("single_file"):
+            task_id = f"{username}|{file_dir}"
+        elif is_audiobook:
+            task_id = f"{username}|{files[0]['filename']}"
+        else:
+            task_id = f"{username}|{result.filename}"
 
         extra = {"username": username, "file_dir": file_dir, "files": downloads, "slskd_id": downloads[0]["id"] if downloads else None}
         if is_audiobook:

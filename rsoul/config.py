@@ -81,7 +81,10 @@ def setup_logging(config):
     else:
         log_config = DEFAULT_LOGGING_CONF
 
-    level = getattr(logging, log_config.get("level", "INFO").upper())
+    # A typo in the level must not stop R:soul before it can log anything
+    level = getattr(logging, str(log_config.get("level", "INFO")).strip().upper(), None)
+    if not isinstance(level, int):
+        level = logging.INFO
     datefmt = log_config.get("datefmt", DEFAULT_LOGGING_CONF["datefmt"])
 
     # Check if colors should be enabled (default: True if stdout is a TTY)
@@ -120,6 +123,10 @@ NON_NEGATIVE_SETTINGS = [
 NON_NEGATIVE_INT_SETTINGS = [
     ("Download Settings", "monitor_window"),
     ("Download Settings", "max_active_downloads"),
+]
+# Settings read as whole numbers, which must be >= 1
+POSITIVE_INT_SETTINGS = [
+    ("Search Settings", "number_of_books_to_grab"),
 ]
 _SENSITIVE = ("api_key", "password", "token", "secret")
 # Sections the code reads that the sample config.ini doesn't contain
@@ -248,6 +255,31 @@ def validate_config(config: configparser.ConfigParser) -> None:
                 raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be a whole number")
             if value < 0:
                 raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be 0 or a positive whole number")
+
+    for section, option in POSITIVE_INT_SETTINGS:
+        if config.has_option(section, option):
+            raw = config.get(section, option).strip()
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be a whole number")
+            if value < 1:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{raw}' must be 1 or more")
+
+    # Placeholder paths from the sample config. They matter most when R:soul is configured
+    # through environment variables, where the bundled sample supplies every default: a
+    # forgotten readarr_download_dir would send Readarr/Chaptarr to a folder that doesn't exist.
+    for section in enabled_sections:
+        if section == "Readarr":
+            continue
+        local = config.get(section, "download_dir", fallback="")
+        if local.startswith("/path/to/"):
+            env = f"{ENV_PREFIX}{section.upper()}__DOWNLOAD_DIR"
+            raise ValueError(f"Configuration Error: [{section}] download_dir is still the placeholder '{local}'. Set it in config.ini or with the environment variable {env}.")
+        mapped = config.get(section, "readarr_download_dir", fallback="")
+        if mapped.startswith("/mapped/path/to/"):
+            logger.warning(f"[{section}] readarr_download_dir is still the placeholder '{mapped}': using download_dir ({local}) instead")
+            config.remove_option(section, "readarr_download_dir")
 
     # Validate media mode early so a typo fails at startup, not mid-run
     if get_media_mode(config) != EBOOK:

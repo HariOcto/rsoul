@@ -108,10 +108,15 @@ class _RunResults:
             self._pending.append(self._imports.submit(self._import, task))
             return
 
-        self._handle_failure(task)
+        # Transfers first: this cancels chapters that are still running, so none of them can
+        # land in the download folder after the leftovers have been moved away
         self._forget_transfers(task)
-        if self.ctx.state:
-            self.ctx.state.remove_task(task.task_id)
+        try:
+            self._handle_failure(task)
+        finally:
+            # Whatever went wrong while reporting the failure, the task must not stay saved
+            if self.ctx.state:
+                self.ctx.state.remove_task(task.task_id)
 
     def _forget_transfers(self, task: DownloadTask) -> None:
         """Remove this task's records from the backend (e.g. slskd's transfer list). Files on
@@ -160,8 +165,8 @@ class _RunResults:
                 self.completed_tasks.append(task)
             else:
                 # Not unmonitored even with remove_wanted_on_failure: the download itself worked,
-                # and the peer is already recorded in the failure history, so the next search
-                # tries other peers for the same book.
+                # and process_imports recorded the peer in the failure history, so the next
+                # search tries other peers for the same book.
                 logger.error(f"Downloaded but not imported: {task.book_title} by {task.author_name}")
                 self.failed_download += 1
                 self.failed_imports.append((task.author_name, task.book_title))
@@ -200,8 +205,11 @@ class _RunResults:
 
                 current_datetime_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
                 failure_string = current_datetime_str + " - " + task.author_name + ", " + book.get("title", task.book_title) + "\n"
-                with open(self.failure_file_path, "a") as file:
-                    file.write(failure_string)
+                try:
+                    with open(self.failure_file_path, "a") as file:
+                        file.write(failure_string)
+                except OSError as e:
+                    logger.warning(f"Could not write to {self.failure_file_path}: {e}")
             else:
                 logger.error(f"Failed to grab book: {task.book_title} for author: {task.author_name}")
         else:
@@ -243,6 +251,10 @@ def _follow_up_pending_imports(ctx: "Context", results: "_RunResults") -> int:
         elif outcome is False:
             results.failed_download += 1
             results.failed_imports.append((author, title))
+            if ctx.history:
+                # Same as an import that fails within a run: try other peers next time
+                extra = item.get("extra", {})
+                ctx.history.add_failure(extra.get("username", "") or extra.get("path", ""), title, "Import failed or was never confirmed")
             ctx.state.remove_task(item["task_id"])
         else:
             if isinstance(outcome, dict):
@@ -268,8 +280,35 @@ def _resume_persisted(ctx: "Context") -> List[DownloadTask]:
             continue  # couldn't be checked (e.g. slskd down): keep it for the next run
         if item["task_id"] not in resumed_ids:
             logger.warning(f"Dropping download that can no longer be resumed: {item.get('book_title', item['task_id'])}")
+            _abandon(ctx, item)
             ctx.state.remove_task(item["task_id"])
     return tasks
+
+
+def _abandon(ctx: "Context", item: Dict[str, Any]) -> None:
+    """Clear away what a dropped download leaves behind: transfers still queued in the backend
+    and files already in the download folder (e.g. some chapters of an audiobook). Left alone,
+    they would block every later attempt at the same folder ("local folder is in use")."""
+    backend = ctx.orchestrator.get_backend(item.get("backend_name", "slskd")) if ctx.orchestrator else None
+    if not backend:
+        return
+    task = DownloadTask(
+        task_id=item["task_id"],
+        backend_name=item.get("backend_name", "slskd"),
+        status=DownloadStatus.FAILED,
+        book_title=item.get("book_title", ""),
+        author_name=item.get("author_name", ""),
+        book_id=item.get("book_id", 0),
+        filename=item.get("filename", ""),
+        series_title=item.get("series_title", ""),
+        local_dir=item.get("local_dir", ""),
+        extra=item.get("extra") or {},
+    )
+    for step in (backend.cleanup, backend.discard):
+        try:
+            step(task)
+        except Exception as e:
+            logger.warning(f"Could not clean up after dropped download of {task.book_title}: {e}")
 
 
 def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict[str, int]:

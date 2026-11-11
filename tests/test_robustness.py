@@ -569,6 +569,7 @@ def test_zero_time_limit_is_allowed():
     config.read(os.path.join(REPO, "config.ini"))
     config["Readarr"]["api_key"] = "a"
     config["Slskd"]["api_key"] = "b"
+    config["Slskd"]["download_dir"] = "/downloads"
     config["Download Settings"]["stall_timeout"] = "0"
     validate_config(config)
 

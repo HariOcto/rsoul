@@ -23,7 +23,10 @@ class SearchError(Exception):
 
 def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int) -> List[Book]:
     """Get books from Readarr based on search source and type."""
-    current_page_file_path = os.path.join(ctx.config_dir, ".current_page.txt")
+    # One page counter per list: with search_source = all, a shared counter would be advanced
+    # twice per run, so each list would only ever see every other page
+    page_file = ".current_page.txt" if search_source == "missing" else f".current_page_{search_source}.txt"
+    current_page_file_path = os.path.join(ctx.config_dir, page_file)
 
     base_method = ctx.readarr.get_missing if search_source == "missing" else ctx.readarr.get_cutoff
 
@@ -59,14 +62,17 @@ def get_books(ctx: "Context", search_source: str, search_type: str, page_size: i
             page += 1
 
     elif search_type == "incrementing_page":
+        last_page = max(1, math.ceil(total_wanted / page_size))
         page = get_current_page(current_page_file_path)
+        if page > last_page:
+            page = 1  # the list got shorter since the last run: don't waste a run on an empty page
         try:
             wanted_records = api_method(page=page, page_size=page_size, sort_dir="ascending", sort_key="title")["records"]
         except Exception as e:
             # Don't move on to the next page: these books would otherwise be skipped
             raise SearchError(f"Could not get page {page} of the {search_source} list: {e}") from e
 
-        page = 1 if page >= math.ceil(total_wanted / page_size) else page + 1
+        page = 1 if page >= last_page else page + 1
         update_current_page(current_page_file_path, page)
 
     else:  # first_page

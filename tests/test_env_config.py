@@ -76,7 +76,7 @@ def test_placeholder_api_key_is_rejected_with_hint():
 
 def test_env_only_config_validates():
     config = template()
-    apply_env_overrides(config, {"RSOUL__READARR__API_KEY": "a", "RSOUL__SLSKD__API_KEY": "b"})
+    apply_env_overrides(config, {"RSOUL__READARR__API_KEY": "a", "RSOUL__SLSKD__API_KEY": "b", "RSOUL__SLSKD__DOWNLOAD_DIR": "/downloads"})
     validate_config(config)
 
 

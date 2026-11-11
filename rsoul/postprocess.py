@@ -632,7 +632,7 @@ def files_left_after_import(paths: list, folder: str, settle: Optional[float] = 
     logger.warning(
         f"Import reported as finished, but {len(remaining)} of {len(paths)} file(s) are still in {folder}: "
         "nothing was imported. Check Readarr/Chaptarr's logs (lines with DOWNLOAD-IMPORT) for the reason; "
-        "the files are left there so you can import them manually."
+        "the files are moved to failed_imports, from where you can import them manually."
     )
     return remaining
 
@@ -791,6 +791,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         failed_imports = []
         author_folders = set()
         folder_books: dict = {}  # import folder -> book IDs whose files were moved there
+        book_sources: dict = {}  # book ID -> (source id, title), to record a peer whose files were rejected
         folder_files: dict = {}  # import folder -> local paths of the files handed to Readarr/Chaptarr
 
         for book_download in items:
@@ -803,6 +804,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                 if relative:
                     author_folders.add(relative)
                     folder_books.setdefault(relative, []).append(book_download.get("bookId"))
+                    book_sources[book_download.get("bookId")] = (source_id, book_title)
                     names = book_download.get("expected_files") or []
                     folder_files.setdefault(relative, []).extend(os.path.join(local_download_dir, relative, n) for n in names)
                 else:
@@ -856,6 +858,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                         logger.info(f"Successfully processed {filename}")
                         author_folders.add(author_name_sanitized)
                         folder_books.setdefault(author_name_sanitized, []).append(book_id)
+                        book_sources[book_id] = (source_id, book_title)
                         folder_files.setdefault(author_name_sanitized, []).append(os.path.join(local_download_dir, author_name_sanitized, filename))
                     else:
                         failed_imports.append((folder, filename, author_name_sanitized, "Failed to organize file"))
@@ -928,11 +931,21 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     if ok is None:
                         outcome = pending_import_record(folder, readarr_download_dir, local_download_dir, folder_files.get(folder, []), command["id"])
                     elif ok:
-                        outcome = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder)) is None
+                        left = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder))
+                        outcome = left is None
+                        if left:
+                            # Like every other failed import: don't leave the files where the next
+                            # import of this author or book would trip over them
+                            move_files_aside(local_download_dir, folder, [os.path.basename(p) for p in left])
                     else:
                         outcome = False
                 for book_id in folder_books.get(folder, []):
                     results[book_id] = outcome
+                    if outcome is False and ctx.history:
+                        # Readarr/Chaptarr rejected these files. Without a record of the peer the
+                        # next run would find, download and fail on exactly the same files again.
+                        source_id, title = book_sources.get(book_id, ("", ""))
+                        ctx.history.add_failure(source_id, title, "Import rejected by Readarr/Chaptarr")
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")

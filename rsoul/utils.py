@@ -16,19 +16,17 @@ def is_docker():
 
 
 def get_current_page(path: str, default_page=1) -> int:
-    if os.path.exists(path):
+    """The page to fetch next. A missing, empty or damaged page file starts again at page 1
+    instead of stopping every run with an error."""
+    try:
         with open(path, "r") as file:
-            page_string = file.read().strip()
-            if page_string:
-                return int(page_string)
-            else:
-                with open(path, "w") as file:
-                    file.write(str(default_page))
-                return default_page
-    else:
-        with open(path, "w") as file:
-            file.write(str(default_page))
-        return default_page
+            page = int(file.read().strip())
+        if page >= 1:
+            return page
+    except (OSError, ValueError):
+        pass
+    update_current_page(path, default_page)
+    return default_page
 
 
 def update_current_page(path: str, page: int) -> None:

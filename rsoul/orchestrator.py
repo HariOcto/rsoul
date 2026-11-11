@@ -30,6 +30,9 @@ class DownloadOrchestrator:
     Tries each backend in priority order until success or all fail.
     """
 
+    # How many search results are tried, best first, until one download starts
+    MAX_START_ATTEMPTS = 3
+
     def __init__(self, backends: List[DownloadBackend], ctx: "Context"):
         """Initialize orchestrator.
 
@@ -44,9 +47,10 @@ class DownloadOrchestrator:
         # Progress-based timeouts (seconds, 0 = disabled). A download is only given up on when it
         # stops moving, waits too long in the peer's queue, or exceeds the overall safety cap.
         cfg = ctx.config
-        self.stall_timeout = cfg.getint("Download Settings", "stall_timeout", fallback=1800)
-        self.queue_timeout = cfg.getint("Download Settings", "queue_timeout", fallback=3600)
-        self.max_download_time = cfg.getint("Download Settings", "max_download_time", fallback=86400)
+        # Read as numbers, not whole numbers: validate_config accepts "1800.5" and "1800.0"
+        self.stall_timeout = cfg.getfloat("Download Settings", "stall_timeout", fallback=1800)
+        self.queue_timeout = cfg.getfloat("Download Settings", "queue_timeout", fallback=3600)
+        self.max_download_time = cfg.getfloat("Download Settings", "max_download_time", fallback=86400)
 
         # Settings from older versions that no longer do anything. remote_queue_timeout was never
         # read before, so honouring it now (the sample config had 300s) would cancel most queued
@@ -172,12 +176,15 @@ class DownloadOrchestrator:
 
         logger.info(f"Found {len(results)} results from {backend.name}")
 
-        # 2. Download best result
-        best_result = results[0]
-
-        task = backend.download(target, best_result)
+        # 2. Download the best result; if it can't be started (peer gone, its local folder is
+        # in use...), try the next ones instead of failing on the same result run after run
+        task = None
+        for attempt, result in enumerate(results[: self.MAX_START_ATTEMPTS], start=1):
+            task = backend.download(target, result)
+            if task:
+                break
+            logger.warning(f"Failed to start download from {backend.name} (result {attempt} of {len(results)})")
         if not task:
-            logger.warning(f"Failed to start download from {backend.name}")
             return None
 
         # Timers start when the download is queued, not at the first status poll (which only
@@ -208,7 +215,7 @@ class DownloadOrchestrator:
         m.setdefault("last_percent", 0.0)
 
         if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
-            return f"Exceeded max_download_time ({self.max_download_time}s)"
+            return f"Exceeded max_download_time ({self.max_download_time:g}s)"
 
         if task.poll_failed:
             # Status unknown (e.g. slskd restarting): an outage is not the peer's fault, so the
@@ -239,7 +246,7 @@ class DownloadOrchestrator:
             if m.get("queued_since") is None or moved:
                 m["queued_since"] = now  # data arrived since the last poll, so the queue moved too
             if self.queue_timeout > 0 and now - m["queued_since"] >= self.queue_timeout:
-                return f"Waited more than {self.queue_timeout}s in a queue without starting"
+                return f"Waited more than {self.queue_timeout:g}s in a queue without starting"
             # Waiting in a queue is not a stall
             m["last_progress_at"] = now
             return None
@@ -249,7 +256,7 @@ class DownloadOrchestrator:
             return None
 
         if self.stall_timeout > 0 and now - m["last_progress_at"] >= self.stall_timeout:
-            return f"No data received for {self.stall_timeout}s"
+            return f"No data received for {self.stall_timeout:g}s"
         return None
 
     def _poll(self, backend: DownloadBackend, task: DownloadTask) -> DownloadTask:
@@ -265,6 +272,14 @@ class DownloadOrchestrator:
             logger.error(f"Error checking status for {task.filename}: {e}")
             task.poll_failed = True
             return task
+
+    def _cancel(self, backend: DownloadBackend, task: DownloadTask) -> None:
+        """Cancel a download that is being given up on; a failing cancel must not stop the
+        monitoring of every other download."""
+        try:
+            backend.cancel(task)
+        except Exception as e:
+            logger.warning(f"Could not cancel {task.book_title} in {backend.name}: {e}")
 
     def _monitor_task(self, backend: DownloadBackend, task: DownloadTask) -> DownloadTask:
         """Monitor a download until completion or timeout (blocking).
@@ -291,7 +306,7 @@ class DownloadOrchestrator:
             reason = self.check_timeouts(task)
             if reason:
                 logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
-                backend.cancel(task)
+                self._cancel(backend, task)
                 task.status = DownloadStatus.FAILED
                 task.error_message = reason
                 return task
@@ -464,7 +479,7 @@ class DownloadOrchestrator:
                 reason = self.check_timeouts(task)
                 if reason:
                     logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
-                    backend.cancel(task)
+                    self._cancel(backend, task)
                     task.status = DownloadStatus.FAILED
                     task.error_message = reason
                     completed_map[task_id] = task

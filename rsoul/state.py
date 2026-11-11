@@ -45,7 +45,10 @@ class StateManager:
 
         try:
             with open(self.filepath, "r") as f:
-                self.items = json.load(f)
+                items = json.load(f)
+            if not isinstance(items, list):
+                raise json.JSONDecodeError("expected a list of saved downloads", "", 0)
+            self.items = [item for item in items if isinstance(item, dict)]
             logger.info(f"Loaded {len(self.items)} items from state file")
         except json.JSONDecodeError:
             logger.error("State file corrupted. Starting fresh.")

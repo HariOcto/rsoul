@@ -37,10 +37,39 @@ def _transfer_ids(slskd_client: Any, username: str) -> Optional[set]:
     return {f["id"] for d in download_list.get("directories", []) for f in d.get("files", [])}
 
 
-def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], file_dir: str) -> Optional[List[SlskdFile]]:
+def _cancel_untracked(slskd_client: Any, username: str, files: List[SlskdFile], file_dir: str, pre_existing: set) -> None:
+    """Cancel what an enqueue started but R:soul isn't going to track.
+
+    slskd accepted the request, yet not every transfer showed up in its list in time. The
+    ones that did (and any that appear a moment later) would download unattended into the
+    local folder and then block every later attempt at it, so they are cancelled here.
+    """
+    leaf = file_dir.split("\\")[-1]
+    wanted = {f["filename"] for f in files} | {f["filename"].split("\\")[-1] for f in files}
+    try:
+        download_list = get_user_downloads(slskd_client, username)
+    except Exception as e:
+        logger.warning(f"Could not look for untracked transfers from {username}: {e}")
+        return
+    for directory in download_list.get("directories", []):
+        if directory.get("directory") not in (file_dir, leaf):
+            continue
+        for record in directory.get("files", []):
+            if record.get("id") in pre_existing or record.get("filename") not in wanted:
+                continue
+            try:
+                slskd_client.transfers.cancel_download(username=username, id=record["id"], remove=True)
+            except Exception as e:
+                logger.warning(f"Could not cancel untracked transfer {record.get('filename')} from {username}: {e}")
+
+
+def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], file_dir: str, require_all: bool = False) -> Optional[List[SlskdFile]]:
     """
     Takes a list of files to download and returns a list of files that were successfully added to the download queue
     It also adds to each file the details needed to track that specific file.
+
+    With require_all (audiobooks), anything short of every file counts as a failure: the
+    transfers that did get queued are cancelled again and None is returned.
 
     slskd keeps old transfer records (finished, failed or cancelled) in its list, so the same
     user/folder/filename can appear more than once. Records that existed before this enqueue
@@ -109,13 +138,14 @@ def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], f
 
         except Exception:
             logger.error("Error getting download list after enqueue", exc_info=True)
-            if attempt == 3:
-                return downloads or None
 
-    # Partial result: some files never appeared. Callers decide whether that is acceptable.
+    # Partial result: some files never appeared
     if downloads:
         logger.warning(f"Only {len(downloads)} of {len(files)} files appeared in the slskd transfer list")
-    return downloads or None
+    if not downloads or require_all:
+        _cancel_untracked(slskd_client, username, files, file_dir, pre_existing)
+        return None
+    return downloads
 
 
 TERMINAL_SUCCESS = "Completed, Succeeded"
@@ -197,13 +227,10 @@ def downloads_all_done(downloads: List[SlskdFile]) -> Tuple[bool, bool]:
         state = file["status"]["state"]
         if state != TERMINAL_SUCCESS:
             all_succeeded = False
-            if state in [
-                "Completed, Cancelled",
-                "Completed, TimedOut",
-                "Completed, Errored",
-                "Completed, Rejected",
-                "Completed, Aborted",
-            ]:
+            # "Completed, Cancelled", "Completed, TimedOut", "Completed, Errored", "Completed,
+            # Rejected", "Completed, Aborted"... every finished state other than success is a
+            # failure, including ones a newer slskd may add
+            if str(state).startswith("Completed"):
                 has_errors = True
 
     return all_succeeded, has_errors

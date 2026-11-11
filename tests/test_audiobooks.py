@@ -388,10 +388,22 @@ def test_audiobook_import_moves_folder_and_scans_book_folder(tmp_path):
     config = make_config()
     config["Slskd"]["download_dir"] = str(local)
     config["Slskd"]["readarr_download_dir"] = "/chaptarr/downloads"
-    client = FakeImportClient()
+    book_dir = local / postprocess.AUDIOBOOK_STAGING_DIR / "Brandon Sanderson" / "Mistborn The Final Empire"
+    staged = []
+
+    class ImportingClient(FakeImportClient):
+        """Like Chaptarr: the import moves the files out of the download folder."""
+
+        def post_command(self, name, **kwargs):
+            staged.extend(sorted(os.listdir(book_dir)))
+            for n in os.listdir(book_dir):
+                os.remove(book_dir / n)
+            return super().post_command(name, **kwargs)
+
+    client = ImportingClient()
     ctx = Context(config=config, slskd=None, readarr=client)
 
-    postprocess.process_imports(
+    result = postprocess.process_imports(
         ctx,
         [
             {
@@ -408,8 +420,8 @@ def test_audiobook_import_moves_folder_and_scans_book_folder(tmp_path):
         ],
     )
 
-    book_dir = local / postprocess.AUDIOBOOK_STAGING_DIR / "Brandon Sanderson" / "Mistborn The Final Empire"
-    assert sorted(os.listdir(book_dir)) == names
+    assert result == {7: True}
+    assert staged == names
     assert not source.exists()
     assert client.commands == [
         ("DownloadedBooksScan", {"path": os.path.join("/chaptarr/downloads", postprocess.AUDIOBOOK_STAGING_DIR, "Brandon Sanderson", "Mistborn The Final Empire")})

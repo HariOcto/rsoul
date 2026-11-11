@@ -254,7 +254,9 @@ def _follow_up_pending_imports(ctx: "Context", results: "_RunResults") -> int:
             if ctx.history:
                 # Same as an import that fails within a run: try other peers next time
                 extra = item.get("extra", {})
-                ctx.history.add_failure(extra.get("username", "") or extra.get("path", ""), title, "Import failed or was never confirmed")
+                ctx.history.add_failure(
+                    extra.get("username", "") or extra.get("path", ""), title, "Import failed or was never confirmed", retry_after_days=postprocess.import_failure_retry_days(ctx.config)
+                )
             ctx.state.remove_task(item["task_id"])
         else:
             if isinstance(outcome, dict):

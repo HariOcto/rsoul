@@ -1,7 +1,7 @@
 import json
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class HistoryManager:
                 except OSError:
                     pass
 
-    def add_failure(self, source_id: str, book_title: str, reason: str = ""):
+    def add_failure(self, source_id: str, book_title: str, reason: str = "", retry_after_days: float = 0):
         """
         Record a failed download/import.
 
@@ -53,6 +53,9 @@ class HistoryManager:
             source_id: Backend-specific identifier (slskd username, AA path, etc.)
             book_title: The canonical book title from Readarr.
             reason: Optional reason for failure.
+            retry_after_days: If > 0, the entry only holds for this many days. Used when the
+                files themselves may be fine (Readarr/Chaptarr didn't import them, which can
+                also be a path, permission or import-setting problem on its side).
         """
         if not source_id or not book_title:
             return
@@ -61,10 +64,26 @@ class HistoryManager:
         if self.is_failed(source_id, book_title):
             return
 
+        # Entries that have run out make room for the new one
+        self.history = [e for e in self.history if not self._expired(e)]
+
         entry = {"source_id": source_id, "book_title": book_title, "timestamp": datetime.now().isoformat(), "reason": reason}
+        if retry_after_days and retry_after_days > 0:
+            entry["retry_after"] = (datetime.now() + timedelta(days=retry_after_days)).isoformat()
         self.history.append(entry)
         logger.info(f"Added to blocklist: '{source_id}' for Book '{book_title}'")
         self.save()
+
+    @staticmethod
+    def _expired(entry: Dict[str, str]) -> bool:
+        """True for a temporary entry whose time is up. Entries without retry_after never expire."""
+        retry_after = entry.get("retry_after") if isinstance(entry, dict) else None
+        if not retry_after:
+            return False
+        try:
+            return datetime.now() >= datetime.fromisoformat(retry_after)
+        except (TypeError, ValueError):
+            return False
 
     def is_failed(self, source_id: str, book_title: str) -> bool:
         """
@@ -79,6 +98,8 @@ class HistoryManager:
         target_book = book_title.strip().lower()
 
         for entry in self.history:
+            if self._expired(entry):
+                continue
             # Support both new 'source_id' and legacy 'username' field
             h_source = entry.get("source_id", entry.get("username", "")).strip().lower()
             h_book = entry.get("book_title", "").strip().lower()

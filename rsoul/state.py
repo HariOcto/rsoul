@@ -7,6 +7,7 @@ Uses (username, filename) as composite key since slskd IDs are ephemeral.
 
 import json
 import os
+import shutil
 import logging
 import threading
 import time
@@ -47,16 +48,59 @@ class StateManager:
             with open(self.filepath, "r") as f:
                 items = json.load(f)
             if not isinstance(items, list):
-                raise json.JSONDecodeError("expected a list of saved downloads", "", 0)
-            self.items = [item for item in items if isinstance(item, dict)]
-            logger.info(f"Loaded {len(self.items)} items from state file")
-        except json.JSONDecodeError:
-            logger.error("State file corrupted. Starting fresh.")
-            self.filepath.unlink(missing_ok=True)
+                raise ValueError("expected a list of saved downloads")
+        except ValueError as e:  # includes json.JSONDecodeError
+            kept = self._keep_damaged_copy(move=True)
+            logger.error(f"State file is damaged ({e}); starting fresh." + (f" The damaged file was kept as {kept}" if kept else ""))
             self.items = []
+            return
         except Exception as e:
             logger.error(f"Error loading state file: {e}")
             self.items = []
+            return
+
+        self.items = [item for item in items if self._usable(item)]
+        dropped = len(items) - len(self.items)
+        if dropped:
+            kept = self._keep_damaged_copy(move=False)
+            logger.error(f"Ignoring {dropped} damaged entr{'y' if dropped == 1 else 'ies'} in the state file." + (f" A copy of the file was kept as {kept}" if kept else ""))
+        logger.info(f"Loaded {len(self.items)} items from state file")
+
+    @staticmethod
+    def _usable(item: Any) -> bool:
+        """Whether a saved entry has the shape the rest of R:soul relies on. A hand-edited or
+        half-written entry is dropped here rather than crashing a run later."""
+        if not isinstance(item, dict):
+            return False
+        if "task_id" not in item:
+            return True  # entry from a version before task IDs; cleared by the workflow
+        if not isinstance(item["task_id"], str) or not item["task_id"]:
+            return False
+        extra = item.setdefault("extra", {})
+        if not isinstance(extra, dict):
+            return False
+        files = extra.get("files", [])
+        if not isinstance(files, list) or not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
+            return False
+        if not isinstance(extra.get("expected_files", []), list):
+            return False
+        pending = extra.get("import_pending")
+        if pending is not None and not (isinstance(pending, dict) and isinstance(pending.get("local_dir"), str)):
+            return False
+        return all(isinstance(item.get(key, ""), str) for key in ("backend_name", "book_title", "author_name", "filename", "local_dir"))
+
+    def _keep_damaged_copy(self, move: bool) -> str:
+        """Set the damaged state file aside for troubleshooting. Returns its new name ("" on failure)."""
+        target = self.filepath.with_name(f"{self.filepath.name}.damaged-{time.strftime('%Y%m%d-%H%M%S')}")
+        try:
+            if move:
+                os.replace(self.filepath, target)
+            else:
+                shutil.copy2(self.filepath, target)
+            return str(target)
+        except OSError as e:
+            logger.warning(f"Could not keep a copy of the damaged state file: {e}")
+            return ""
 
     def _save(self) -> None:
         """Atomic write to disk using temp file + rename."""

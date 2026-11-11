@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..config import Context
 
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
-from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path
+from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, book_key
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
 from .. import health
@@ -111,6 +111,8 @@ class SlskdBackend(DownloadBackend):
         self.ctx = ctx
         self.client = ctx.slskd
         self.config = ctx.config
+        # book ID -> further usable audiobook results of the last search, produced on demand
+        self._alternates: Dict[int, Any] = {}
 
     @property
     def name(self) -> str:
@@ -322,30 +324,27 @@ class SlskdBackend(DownloadBackend):
         # Best name match first, then the configured format order, then the largest folder
         candidates.sort(key=lambda c: (-c[1]["score"], allowed.index(c[1]["extension"]), -c[1]["total_size"]))
 
-        # Browse candidates in order and stop at the first usable folder: the orchestrator only
-        # downloads the first result, and each browse is a slow round trip to the peer.
-        for username, match in candidates[:browse_limit]:
+        # Candidates are browsed lazily, best first: search() gets the first usable one, and
+        # download() asks for the next only if that one can't be started. Each browse is a slow
+        # round trip to the peer, so none is made before it is needed.
+        usable = self._usable_audiobook_results(target, candidates[:browse_limit], min_size_bytes)
+        first = next(usable, None)
+        if first is None:
+            return []
+        self._alternates[target.book_id] = usable
+        return [first]
+
+    def _usable_audiobook_results(self, target: DownloadTarget, candidates: List[Tuple[str, Dict[str, Any]]], min_size_bytes: int):
+        """Yield a SearchResult for each candidate whose complete file list could be fetched."""
+        for username, match in candidates:
             directory = match["directory"]
             ext = match["extension"]
-
-            if match.get("single_file"):
-                # The file's own name matched, not the folder's: the folder may be a whole
-                # library ("Audiobooks", an author folder), so take this one file and nothing else
-                files = [{"filename": f["filename"], "size": f.get("size", 0)} for f in match["files"]]
-                total_size = sum(f["size"] for f in files)
-                if total_size < min_size_bytes:
-                    logger.info(f"Skipping {files[0]['filename']} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
-                    continue
-                if self._local_clashes(directory, files):
-                    logger.info(f"Skipping {files[0]['filename']} from {username}: its local download folder is in use")
-                    continue
-                logger.info(f"Audiobook candidate: {files[0]['filename']} (single file, {total_size / 1048576:.0f} MB) from {username}")
-                return [self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], single_file=True)]
+            file_based = bool(match.get("file_based"))
 
             browsed = self._browse_directory(username, directory) if directory else None
             if browsed is None:
                 # Search results list only the files that matched the query, so without the full
-                # listing we can't know the folder is complete. Try the next candidate instead.
+                # listing we can't know the book is complete. Try the next candidate instead.
                 logger.info(f"Skipping {directory or '(share root)'} from {username}: could not list the full folder")
                 continue
 
@@ -356,31 +355,37 @@ class SlskdBackend(DownloadBackend):
                 # Only this folder's own files, not ones from subfolders
                 and split_slskd_path(f["filename"])[0] == directory
             ]
+            if file_based:
+                # The files' own names matched, not the folder's: the folder may be a whole library
+                # ("Audiobooks", an author folder). Take the files that share the matched name,
+                # i.e. the one file of a single-file book or every chapter of
+                # "Author - Title - 01.mp3", "... - 02.mp3", and nothing else.
+                keys = {book_key(split_slskd_path(f["filename"])[1]) for f in match["files"]}
+                files = [f for f in files if book_key(split_slskd_path(f["filename"])[1]) in keys]
             if not files:
                 continue
 
             files.sort(key=lambda f: f["filename"].lower())
             total_size = sum(f["size"] for f in files)
+            label = f"{files[0]['filename']} (+{len(files) - 1} more)" if file_based else directory
             if total_size < min_size_bytes:
-                logger.info(f"Skipping {directory} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
+                logger.info(f"Skipping {label} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
                 continue
 
             if self._local_clashes(directory, files):
-                # download() would refuse this folder; the next candidate may be fine
-                logger.info(f"Skipping {directory} from {username}: its local download folder is in use")
+                # download() would refuse these files; the next candidate may be fine
+                logger.info(f"Skipping {label} from {username}: its local download folder is in use")
                 continue
 
-            logger.info(f"Audiobook candidate: {directory} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
-            return [self._audiobook_result(target, username, directory, ext, files, total_size, match["score"])]
-
-        return []
+            logger.info(f"Audiobook candidate: {label} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
+            yield self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], file_based=file_based)
 
     def _audiobook_result(
-        self, target: DownloadTarget, username: str, directory: str, ext: str, files: List[Dict[str, Any]], total_size: int, score: float, single_file: bool = False
+        self, target: DownloadTarget, username: str, directory: str, ext: str, files: List[Dict[str, Any]], total_size: int, score: float, file_based: bool = False
     ) -> SearchResult:
         extra: Dict[str, Any] = {"username": username, "file_dir": directory, "files": files, "media_type": "audiobook"}
-        if single_file:
-            extra["single_file"] = True
+        if file_based:
+            extra["file_based"] = True
         return SearchResult(
             title=target.book_title,
             author=target.author_name,
@@ -388,14 +393,31 @@ class SlskdBackend(DownloadBackend):
             size_bytes=total_size,
             extension=ext,
             backend_name=self.name,
-            source_id=f"{username}|{files[0]['filename'] if single_file else directory}",
+            source_id=f"{username}|{files[0]['filename'] if file_based else directory}",
             score=score,
             username=username,
             extra=extra,
         )
 
     def download(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
-        """Initiate download of a Soulseek file."""
+        """Initiate download of a Soulseek file or audiobook.
+
+        search() returns one audiobook result at a time. If that one can't be started (the peer
+        went offline, its queue refused the files...), the next usable candidates of the same
+        search are tried here, so one bad peer doesn't fail the book.
+        """
+        alternates = self._alternates.pop(target.book_id, None)
+        task = self._download_one(target, result)
+        if task is None and alternates is not None and result.extra.get("media_type") == "audiobook":
+            for alternate in alternates:
+                logger.info(f"Trying the next audiobook candidate for {target.book_title}: {alternate.username}")
+                task = self._download_one(target, alternate)
+                if task is not None:
+                    break
+        return task
+
+    def _download_one(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
+        """Queue one search result in slskd."""
         username = result.extra["username"]
         files = result.extra["files"]
         file_dir = result.extra["file_dir"]
@@ -423,6 +445,14 @@ class SlskdBackend(DownloadBackend):
 
         if not downloads:
             logger.warning(f"Failed to enqueue download for {target.book_title} from {username}")
+            # Anything that did arrive from this attempt (a quick peer can finish a file before
+            # its transfer is cancelled) must not block the next attempt at this folder. The
+            # clash check above made sure none of these names were there before.
+            leaf = file_dir.split("\\")[-1] if file_dir else ""
+            if self.download_dir and leaf:
+                moved_to = move_files_aside(self.download_dir, leaf, [f["filename"].split("\\")[-1] for f in files], bucket="failed_downloads")
+                if moved_to:
+                    logger.info(f"Moved files of the abandoned download to {moved_to}")
             return None
 
         # Log what was enqueued
@@ -433,8 +463,8 @@ class SlskdBackend(DownloadBackend):
         local_dir = file_dir.split("\\")[-1] if file_dir else ""
 
         # Use (username, filename) as task_id; audiobooks are one task per folder
-        # (a single-file audiobook shares its folder with other books, so its file names the task)
-        if is_audiobook and not result.extra.get("single_file"):
+        # (file-based audiobooks share their folder with other books, so the first file names the task)
+        if is_audiobook and not result.extra.get("file_based"):
             task_id = f"{username}|{file_dir}"
         elif is_audiobook:
             task_id = f"{username}|{files[0]['filename']}"

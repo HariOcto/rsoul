@@ -286,6 +286,42 @@ def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[
     return candidates
 
 
+# Chapter and part numbers at either end of a file name: "Title - 01", "Title (Part 2 of 5)",
+# "03 - Title", "CD2 Title". A number that is part of a longer one ("1984") is left alone.
+_PART_WORD = r"(?:part|pt|chapter|chap|ch|cd|disc|disk|track|teil|kapitel)"
+_TRAILING_PART = re.compile(rf"[\s\-_.,(\[]*(?:(?<![A-Za-z]){_PART_WORD}\.?\s*)?(?<!\d)\d{{1,3}}(?:\s*(?:of|von|/)\s*\d{{1,3}})?[\s)\]]*$", re.IGNORECASE)
+_LEADING_PART = re.compile(rf"^[\s(\[]*(?:{_PART_WORD}\.?\s*)?\d{{1,3}}(?!\d)[\s)\]\-_.]+", re.IGNORECASE)
+
+
+def _stem(basename: str) -> str:
+    return basename.rsplit(".", 1)[0] if "." in basename else basename
+
+
+def strip_part_numbers(name: str) -> str:
+    """"Author - Title - 01" -> "Author - Title"; "03 - Title" -> "Title". Returns the name
+    unchanged if nothing but a number would be left."""
+    stripped = _LEADING_PART.sub("", _TRAILING_PART.sub("", name)).strip()
+    return stripped or name
+
+
+def book_key(basename: str) -> str:
+    """What the files of one book have in common: the file name without its extension and
+    without chapter/part numbers, normalised. "Author - Title - 01.mp3" and
+    "Author - Title - 02.mp3" share a key; "Author - Other Title.mp3" has a different one."""
+    return normalize_for_matching(strip_part_numbers(_stem(basename)))
+
+
+def file_name_candidates(basename: str) -> List[str]:
+    """Names to match a book's own file on: with and without part numbers and release noise."""
+    stem = _stem(basename)
+    candidates: List[str] = []
+    for name in (stem, strip_part_numbers(stem)):
+        for variant in (name, clean_audiobook_name(name)):
+            if variant and variant not in candidates:
+                candidates.append(variant)
+    return candidates
+
+
 def _meaningful_words(text: str) -> List[str]:
     return [w for w in normalize_for_matching(text).split() if w not in STOP_WORDS]
 
@@ -398,9 +434,10 @@ def audiobook_folder_match(
     scores at least minimum_match_ratio is returned, best match first.
 
     Returns:
-        List of dicts: directory, extension, files, score, total_size, single_file.
-        single_file is True when the folder's name didn't match but the name of the only
-        matching file in it did: that file is the book, and the folder may hold other books.
+        List of dicts: directory, extension, files, score, total_size, file_based.
+        file_based is True when the folder's name didn't match but the names of files in it
+        did: the files sharing that name (see book_key) are the book, and the folder may hold
+        other books.
     """
     if username in ignored_users:
         return []
@@ -426,35 +463,11 @@ def audiobook_folder_match(
             stats[reason] = stats.get(reason, 0) + 1
         logger.debug(f"Audiobook folder rejected ({reason}): {directory} from {username}")
 
-    best_per_ext: Dict[str, Dict[str, Any]] = {}
-    for (directory, ext), files in groups.items():
-        if is_disc_folder(directory):
-            logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
-            note("disc/part folders", directory)
-            continue
-
-        # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
-        # authors, so the author's surname must appear somewhere in the path (or, for a
-        # single-file book, the filename). This also rules out other books with the same title.
-        path_text = directory + (" " + split_slskd_path(files[0]["filename"])[1] if len(files) == 1 else "")
-        if not author_in_name(author_name, path_text):
-            note("folders without the author's surname", directory)
-            continue
-
-        names = folder_name_candidates(directory, files)
-        # Was it the folder that matched, or only the name of a single file inside it? A lone
-        # "Author - Title.m4b" often sits in a folder full of other books ("Audiobooks",
-        # "Brandon Sanderson"): then only that file belongs to the book, not the whole folder.
-        folder_names = folder_name_candidates(directory, [])
-        matched_on_folder = any(title_segment_match(title, name, author_name, series_title) for name in folder_names for title in titles)
-        if not matched_on_folder:
-            names = [name for name in names if name not in folder_names]  # the file's own name
-        if not matched_on_folder and not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
-            # e.g. "The Saints of Salvation" or "Salvation Lost" when "Salvation" is wanted
-            note("folders for a different title", directory)
-            continue
-
-        best_score = None
+    def best_score_for(names: List[str]) -> Optional[float]:
+        """Best fuzzy score of these names, or None if none of them is exactly this title."""
+        if not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
+            return None
+        best = None
         for name in names:
             for title in titles:
                 score = score_name(
@@ -468,25 +481,80 @@ def audiobook_folder_match(
                     min_title_jaccard=min_title_jaccard,
                     min_author_jaccard=min_author_jaccard,
                 )
-                if score is not None and (best_score is None or score > best_score):
-                    best_score = score
+                if score is not None and (best is None or score > best):
+                    best = score
+        return -1.0 if best is None else best  # -1: the title is there, but the fuzzy score rejects it
 
-        if best_score is None or best_score < minimum_match_ratio:
-            note("folders not matching the title", directory)
-            continue
+    best_per_ext: Dict[str, Dict[str, Any]] = {}
 
+    def offer(directory: str, ext: str, files: List[Dict[str, Any]], score: float, file_based: bool) -> None:
         candidate = {
             "directory": directory,
             "extension": ext,
             "files": files,
-            "score": best_score,
+            "score": score,
             "total_size": sum(f.get("size", 0) for f in files),
-            # True: only this one file is the book; the rest of the folder is something else
-            "single_file": not matched_on_folder,
+            # True: the files' own names matched, not the folder's. Only the files that share
+            # this name are the book; the rest of the folder is something else.
+            "file_based": file_based,
         }
         current = best_per_ext.get(ext)
         if current is None or (candidate["score"], candidate["total_size"]) > (current["score"], current["total_size"]):
             best_per_ext[ext] = candidate
+
+    for (directory, ext), files in groups.items():
+        if is_disc_folder(directory):
+            logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
+            note("disc/part folders", directory)
+            continue
+
+        # Was it the folder that matched, or only the names of files inside it? Files named
+        # "Author - Title.m4b" or "Author - Title - 01.mp3" often sit in a folder full of other
+        # books ("Audiobooks", "Brandon Sanderson"): then only they belong to the book.
+        folder_names = folder_name_candidates(directory, [])
+        if any(title_segment_match(title, name, author_name, series_title) for name in folder_names for title in titles):
+            # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
+            # authors, so the author's surname must appear somewhere in the path (or, for a
+            # single-file book, the filename). This also rules out other books with the same title.
+            path_text = directory + (" " + split_slskd_path(files[0]["filename"])[1] if len(files) == 1 else "")
+            if not author_in_name(author_name, path_text):
+                note("folders without the author's surname", directory)
+                continue
+            score = best_score_for(folder_name_candidates(directory, files))
+            if score is None or score < minimum_match_ratio:
+                note("folders not matching the title", directory)
+                continue
+            offer(directory, ext, files, score, file_based=False)
+            continue
+
+        # The folder is not this book. Look at the files instead, grouped by the name they
+        # share once chapter and part numbers are set aside.
+        by_book: Dict[str, List[Dict[str, Any]]] = {}
+        for slskd_file in files:
+            by_book.setdefault(book_key(split_slskd_path(slskd_file["filename"])[1]), []).append(slskd_file)
+
+        reasons = set()
+        for book_files in by_book.values():
+            basename = split_slskd_path(book_files[0]["filename"])[1]
+            if not author_in_name(author_name, directory + " " + basename):
+                reasons.add("author")
+                continue
+            score = best_score_for(file_name_candidates(basename))
+            if score is None:
+                reasons.add("title")
+            elif score < minimum_match_ratio:
+                reasons.add("score")
+            else:
+                offer(directory, ext, book_files, score, file_based=True)
+                reasons.add("matched")
+        if "matched" not in reasons:
+            if "score" in reasons:
+                note("folders not matching the title", directory)
+            elif "title" in reasons:
+                # e.g. "The Saints of Salvation" or "Salvation Lost" when "Salvation" is wanted
+                note("folders for a different title", directory)
+            else:
+                note("folders without the author's surname", directory)
 
     # Best match first; the configured format order only breaks ties
     matches = sorted(best_per_ext.values(), key=lambda c: (-c["score"], allowed.index(c["extension"])))

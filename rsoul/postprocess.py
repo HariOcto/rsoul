@@ -535,6 +535,13 @@ def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str)
     return path
 
 
+def import_failure_retry_days(config: Any) -> float:
+    """Days before a peer whose files weren't imported is tried again (0 = never again)."""
+    return config.getfloat("Postprocessing", "import_failure_retry_days", fallback=IMPORT_FAILURE_RETRY_DAYS)
+
+
+IMPORT_FAILURE_RETRY_DAYS = 7
+
 # How long a run waits for an import command before leaving it for the next run
 IMPORT_TIMEOUT_SECONDS = 600
 
@@ -944,8 +951,10 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     if outcome is False and ctx.history:
                         # Readarr/Chaptarr rejected these files. Without a record of the peer the
                         # next run would find, download and fail on exactly the same files again.
+                        # The record is temporary: the cause can also be on Readarr/Chaptarr's side
+                        # (path mapping, permissions, import settings), and the peer's files fine.
                         source_id, title = book_sources.get(book_id, ("", ""))
-                        ctx.history.add_failure(source_id, title, "Import rejected by Readarr/Chaptarr")
+                        ctx.history.add_failure(source_id, title, "Not imported by Readarr/Chaptarr", retry_after_days=import_failure_retry_days(ctx.config))
 
         else:
             logger.warning(f"No successful imports for backend {backend_name}")

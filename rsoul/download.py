@@ -37,30 +37,41 @@ def _transfer_ids(slskd_client: Any, username: str) -> Optional[set]:
     return {f["id"] for d in download_list.get("directories", []) for f in d.get("files", [])}
 
 
+# How often, a few seconds apart, the transfer list is checked again for late arrivals
+UNTRACKED_CHECKS = 3
+
+
 def _cancel_untracked(slskd_client: Any, username: str, files: List[SlskdFile], file_dir: str, pre_existing: set) -> None:
     """Cancel what an enqueue started but R:soul isn't going to track.
 
     slskd accepted the request, yet not every transfer showed up in its list in time. The
-    ones that did (and any that appear a moment later) would download unattended into the
-    local folder and then block every later attempt at it, so they are cancelled here.
+    ones that did, and any that appear in the next few seconds, would download unattended
+    into the local folder and then block every later attempt at it, so they are cancelled.
+    The list is checked a few times because slskd registers transfers asynchronously. A
+    transfer that appears even later is caught by the local-folder clash check, which then
+    names it in the log.
     """
     leaf = file_dir.split("\\")[-1]
     wanted = {f["filename"] for f in files} | {f["filename"].split("\\")[-1] for f in files}
-    try:
-        download_list = get_user_downloads(slskd_client, username)
-    except Exception as e:
-        logger.warning(f"Could not look for untracked transfers from {username}: {e}")
-        return
-    for directory in download_list.get("directories", []):
-        if directory.get("directory") not in (file_dir, leaf):
+    for check in range(UNTRACKED_CHECKS):
+        if check:
+            time.sleep(2)
+        try:
+            download_list = get_user_downloads(slskd_client, username)
+        except Exception as e:
+            logger.warning(f"Could not look for untracked transfers from {username}: {e}")
             continue
-        for record in directory.get("files", []):
-            if record.get("id") in pre_existing or record.get("filename") not in wanted:
+        for directory in download_list.get("directories", []):
+            if directory.get("directory") not in (file_dir, leaf):
                 continue
-            try:
-                slskd_client.transfers.cancel_download(username=username, id=record["id"], remove=True)
-            except Exception as e:
-                logger.warning(f"Could not cancel untracked transfer {record.get('filename')} from {username}: {e}")
+            for record in directory.get("files", []):
+                if record.get("id") in pre_existing or record.get("filename") not in wanted:
+                    continue
+                try:
+                    slskd_client.transfers.cancel_download(username=username, id=record["id"], remove=True)
+                    logger.info(f"Cancelled untracked transfer {record.get('filename', '').split(chr(92))[-1]} from {username}")
+                except Exception as e:
+                    logger.warning(f"Could not cancel untracked transfer {record.get('filename')} from {username}: {e}")
 
 
 def slskd_do_enqueue(slskd_client: Any, username: str, files: List[SlskdFile], file_dir: str, require_all: bool = False) -> Optional[List[SlskdFile]]:

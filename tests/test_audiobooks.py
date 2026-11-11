@@ -312,7 +312,8 @@ def test_audiobook_download_cancels_when_files_missing():
     task = backend.download(audiobook_target(), result)
 
     assert task is None
-    assert len(backend.client.transfers.cancelled) == 5
+    # (the transfer list is checked more than once for late arrivals; this fake keeps listing them)
+    assert len(set(backend.client.transfers.cancelled)) == 5
 
 
 def test_reconcile_audiobook_all_on_disk(tmp_path):

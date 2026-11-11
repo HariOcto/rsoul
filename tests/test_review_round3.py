@@ -165,17 +165,17 @@ def library_client():
     return Client(responses=[{"username": "peer", "files": [{"filename": BOOK_FILE, "size": 500 * MB}]}], listings={("peer", LIBRARY): listing})
 
 
-def test_single_file_match_is_flagged():
+def test_file_name_match_is_flagged():
     t = {"book": {"title": TITLE}, "author": {"authorName": AUTHOR}}
     matches = audiobook_folder_match(t, [{"filename": BOOK_FILE, "size": 500 * MB}], "peer", ["m4b"], [], 0.7)
-    assert [m["single_file"] for m in matches] == [True]
+    assert [m["file_based"] for m in matches] == [True]
 
 
-def test_folder_named_after_the_book_is_not_single_file():
+def test_folder_named_after_the_book_is_not_file_based():
     t = {"book": {"title": TITLE}, "author": {"authorName": AUTHOR}}
     directory = "@@share\\Brandon Sanderson\\Mistborn - The Final Empire"
     matches = audiobook_folder_match(t, [{"filename": f"{directory}\\book.m4b", "size": 500 * MB}], "peer", ["m4b"], [], 0.7)
-    assert [m["single_file"] for m in matches] == [False]
+    assert [m["file_based"] for m in matches] == [False]
 
 
 def test_single_file_audiobook_does_not_take_the_whole_folder():
@@ -185,7 +185,7 @@ def test_single_file_audiobook_does_not_take_the_whole_folder():
     assert len(results) == 1
     assert [f["filename"] for f in results[0].extra["files"]] == [BOOK_FILE]
     assert results[0].size_bytes == 500 * MB
-    assert client.users.browsed == []  # nothing to learn from the folder listing
+    assert client.users.browsed == [("peer", LIBRARY)]  # listed to find further parts of the same book
 
 
 def test_single_file_audiobooks_from_one_folder_get_separate_tasks():
@@ -609,4 +609,5 @@ def test_state_file_with_wrong_shape_is_not_used(tmp_path, content):
 
 def test_state_file_roundtrip_still_works(tmp_path):
     (tmp_path / "grab_list_state.json").write_text(json.dumps([{"task_id": "a", "book_id": 1}]))
-    assert StateManager(str(tmp_path)).get_tasks_for_orchestrator() == [{"task_id": "a", "book_id": 1}]
+    # (a missing "extra" is filled in, so later code can rely on it)
+    assert StateManager(str(tmp_path)).get_tasks_for_orchestrator() == [{"task_id": "a", "book_id": 1, "extra": {}}]

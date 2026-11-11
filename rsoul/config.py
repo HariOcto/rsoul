@@ -118,6 +118,7 @@ NON_NEGATIVE_SETTINGS = [
     ("Download Settings", "stall_timeout"),
     ("Download Settings", "queue_timeout"),
     ("Download Settings", "max_download_time"),
+    ("Postprocessing", "import_failure_retry_days"),
 ]
 # Settings read as whole numbers, which must be >= 0
 NON_NEGATIVE_INT_SETTINGS = [

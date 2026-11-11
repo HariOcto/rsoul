@@ -21,8 +21,11 @@ class SearchError(Exception):
     """
 
 
-def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int) -> List[Book]:
-    """Get books from Readarr based on search source and type."""
+def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int, advance_page: bool = True) -> List[Book]:
+    """Get books from Readarr based on search source and type.
+
+    advance_page=False (dry run) leaves the page counter of incrementing_page untouched, so the
+    next real run gets the same books."""
     # One page counter per list: with search_source = all, a shared counter would be advanced
     # twice per run, so each list would only ever see every other page
     page_file = ".current_page.txt" if search_source == "missing" else f".current_page_{search_source}.txt"
@@ -63,7 +66,8 @@ def get_books(ctx: "Context", search_source: str, search_type: str, page_size: i
 
     elif search_type == "incrementing_page":
         last_page = max(1, math.ceil(total_wanted / page_size))
-        page = get_current_page(current_page_file_path)
+        # (a dry run only reads the counter; it doesn't create or repair the file either)
+        page = get_current_page(current_page_file_path) if advance_page or os.path.exists(current_page_file_path) else 1
         if page > last_page:
             page = 1  # the list got shorter since the last run: don't waste a run on an empty page
         try:
@@ -72,8 +76,9 @@ def get_books(ctx: "Context", search_source: str, search_type: str, page_size: i
             # Don't move on to the next page: these books would otherwise be skipped
             raise SearchError(f"Could not get page {page} of the {search_source} list: {e}") from e
 
-        page = 1 if page >= last_page else page + 1
-        update_current_page(current_page_file_path, page)
+        if advance_page:
+            page = 1 if page >= last_page else page + 1
+            update_current_page(current_page_file_path, page)
 
     else:  # first_page
         wanted_records = wanted["records"]

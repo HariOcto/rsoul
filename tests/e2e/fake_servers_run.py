@@ -206,6 +206,28 @@ def fast_init(self, *a, **k):
 orchestrator.DownloadOrchestrator.__init__ = fast_init
 
 sys.argv = ["rsoul.py", "-c", CFG]
+
+if os.environ.get("SCENARIO") == "dry_run":
+    # A dry run searches and reports, and must leave slskd, Chaptarr and the data folder alone
+    before = sorted(os.listdir(CFG))
+    sys.argv.append("--dry-run")
+    code = main_mod.main()
+    report_path = os.path.join(CFG, "dry_run_report.txt")
+    report = open(report_path).read() if os.path.exists(report_path) else ""
+    print("exit code:", code)
+    print("downloads queued:", sum(1 for c in LOG["slskd"] if c[0] == "POST" and "/transfers/downloads/" in c[1]))
+    print("transfers cancelled or removed:", sum(1 for c in LOG["slskd"] if c[0] == "DELETE" and "/transfers/" in c[1]))
+    print("import commands:", sum(1 for c in LOG["chaptarr"] if c[0] == "POST"))
+    print("books changed in Chaptarr:", sum(1 for c in LOG["chaptarr"] if c[0] not in ("GET", "POST")))
+    print("new files in data folder:", sorted(set(os.listdir(CFG)) - set(before) - {".rsoul.lock", "health.json"}))
+    print("download folder:", sorted(os.listdir(DL)))
+    print("report names book 1 folder:", "WOULD DOWNLOAD from alice: 12 mp3 file(s)" in report and BOOK1_DIR in report)
+    print("report says how it matched:", "matched on: the folder name" in report)
+    print("report lists what was turned away:", "disc/part folders" in report and "CD1" in report)
+    print("report has book 2 without a match:", "The Way of Kings" in report and "NOTHING WOULD BE DOWNLOADED" in report)
+    print("report summary:", report.strip().splitlines()[-1])
+    sys.exit(0)
+
 t0 = time.time()
 main_mod.main()
 elapsed = time.time() - t0

@@ -168,7 +168,8 @@ How audiobooks are handled:
 - **Matching** uses the folder name (e.g. `Author - Title [Narrator]`), since chapter files are usually named `01.mp3`, `02.mp3`, ... Bracketed parts and release noise such as bitrates or "Unabridged" are ignored. A book can also match on its own file names when the folder is not named after it (`Audiobooks\\Author - Title.m4b`, or `Author - Title - 01.mp3`, `... - 02.mp3`). Then only the files sharing that name are downloaded, apart from evident chapter and part numbers (`- 02`, `02`, `Part 2`, `CD2`; not a bare `Title 2`), because the folder around them (`Audiobooks`, an author folder) usually holds other books too.
 - **The author must appear in the folder path** (e.g. `Brandon Sanderson\The Final Empire` or `Brandon Sanderson - The Final Empire`). Titles repeat across authors, so a folder named only after the title is not trusted.
 - **Title forms**: besides the full title, a shorter form can match, such as "The Final Empire" for "Mistborn: The Final Empire". Ebook matching is unchanged.
-- **Exact title required**: one part of the folder name (split at " - ", commas and folder boundaries) must be the title and nothing else except the author, the series name (from Chaptarr), numbers and words like "Book" or "Unabridged". So "Frontlines 2 - Lines of Departure" matches *Lines of Departure*, but "The Saints of Salvation" and "Salvation Lost" don't match *Salvation*. A bare number right behind the title makes it another book too: "Dune 2" does not match *Dune*, while "Dune 01" (a chapter), "Dune - 2", "Dune Part 2", "Dune Book 1" and "Dune 1965" do.
+- **Exact title required**: one part of the folder's own name (split at " - " and commas; a parent folder doesn't count) must be the title. In front of it, that part may hold the author, the series name (from Chaptarr), numbers and words like "Book"; behind it only the author, recording words like "Unabridged", a year, or the series together with the book's number. So "Frontlines 2 - Lines of Departure" matches *Lines of Departure*, but "The Saints of Salvation" and "Salvation Lost" don't match *Salvation*. A number right behind the title makes it another book too: "Dune 2" does not match *Dune*, while "Dune Book 1" and "Dune 1965" do, and in file names so do evident chapter numbers ("Dune 01", "Dune - 2", "Dune Part 2").
+- **Series named after their first book**: what follows the title must not name another book. "Red Rising 02 - Golden Son" is *Golden Son*, not *Red Rising*; "Red Rising Trilogy" and "Red Rising Saga" are the whole set. When Chaptarr reports the book's position ("Red Rising Saga #1"), a "Book 2" or "#2" anywhere in the name rules the folder out. The price: "Title - Narrator Name" is not matched unless it says "read by" or "narrated by", or the narrator is in brackets.
 - **Only complete folders are downloaded.** Candidates are tried best match first; each is listed in full on the peer's share, and every audio file in it is queued. A folder that can't be listed is skipped, because search results only show some of its files. If not every file can be queued, the download is cancelled and the next candidate is tried.
 - **Chapters spread over several formats are skipped.** A folder with `01.mp3` next to `02.m4a` can't be downloaded completely in one format, so it is left alone. A second complete copy in another format (an `.m4b` next to the mp3 chapters) is no obstacle.
 - **Multi-disc audiobooks are skipped.** Folders named like `CD1`, `Disc 2` or `Part 3` are one part of a larger book, so they are not downloaded.
@@ -183,6 +184,24 @@ How audiobooks are handled:
 - **Unfinished downloads in the same folder.** R:soul won't start a download into a local folder that any unfinished download is still writing into. When Soularr gives up on an album, it deletes that album's whole local folder.
 
 **slskd download folder layout.** R:soul expects slskd's default layout, where each file lands in `<download_dir>/<name of the peer's folder>/`, i.e. `transfers.download.destination.subdirectory` left at `${SOURCE_DIRECTORY}`. Downloads from different peers whose folders have the same name share one local folder, and slskd renames a new file if its name is taken. R:soul therefore won't start a download whose files already exist in, or are still downloading into, the same local folder; it retries on a later run.
+
+## Dry run
+
+Matching books by the names people give their folders is guesswork, so before letting R:soul download, look at what it would pick for your own wanted list:
+
+```
+python rsoul.py --dry-run
+```
+
+In Docker, set `RSOUL__GENERAL__DRY_RUN=true` (or `dry_run = True` under `[General]` in `config.ini`), let one run finish, read the report, and remove the setting again.
+
+A dry run fetches the wanted list, searches, matches and lists candidate folders on the peers' shares, exactly like a normal run, and then stops. For each book it logs, and writes to `dry_run_report.txt` in the data folder:
+
+- what it **would download**: the peer, the folder, the files, their size, and whether the folder name or the files' own names matched;
+- the **other matching folders**, in the order they would be tried;
+- what it **turned away** and why (another title, another author, a disc folder, ...), with the folder names.
+
+Nothing is changed: no download is queued, no saved download is resumed, nothing is imported, no book is unmonitored, no peer is recorded as failed, and the page counter of `search_type = incrementing_page` stays where it is, so the next real run sees the same books.
 
 ## Download timeouts
 
@@ -217,7 +236,8 @@ Each run can add up to `number_of_books_to_grab` new downloads. To keep slow dow
 - **Outages don't erase saved downloads.** If slskd can't be reached when a run starts, saved downloads are kept for the next run instead of being given up.
 - **A failed search isn't mistaken for an empty wanted list.** If Readarr/Chaptarr can't be reached, or a search setting is invalid, saved downloads are still followed up and the run ends with exit code `2`.
 - **One R:soul per data folder.** On filesystems that support OS file locks (local disks and ZFS datasets do), a lock on `.rsoul.lock` prevents two R:soul processes, or two containers sharing a data folder, from running at once. The lock is released automatically when R:soul exits, even after a crash. Where locking isn't supported, R:soul logs a warning and runs without it.
-- **Settings are checked at startup.** Time limits must be `0` or a positive number (decimals are fine), `monitor_window` and `max_active_downloads` must be whole numbers, and `number_of_books_to_grab` must be at least 1. Values like `-100`, `nan` or a `monitor_window` of `2.5` stop R:soul with a clear error instead of silently disabling a limit or failing later. So does a `download_dir` that is still the sample placeholder (`/path/to/...`); a placeholder `readarr_download_dir` falls back to `download_dir` with a warning.
+- **Books stay wanted unless nobody shares them.** With `remove_wanted_on_failure = True`, a book is not unmonitored when it couldn't be searched for at all (slskd unreachable, every search failing) or was found but couldn't be queued (its local folder is in use).
+- **Settings are checked at startup.** Every number and every True/False setting is checked, so a typo stops R:soul at once instead of making every search fail in the middle of a run. In detail: Time limits must be `0` or a positive number (decimals are fine), `monitor_window` and `max_active_downloads` must be whole numbers, and `number_of_books_to_grab` must be at least 1. Values like `-100`, `nan` or a `monitor_window` of `2.5` stop R:soul with a clear error instead of silently disabling a limit or failing later. So does a `download_dir` that is still the sample placeholder (`/path/to/...`); a placeholder `readarr_download_dir` falls back to `download_dir` with a warning.
 - **Exit codes.** Each run exits with `0` (finished), `1` (configuration or startup problem, another instance running, or a crash) or `2` (saved downloads were handled, but searching for new books failed). In Docker, `run.sh` logs any non-zero exit and stops promptly on `docker stop`.
 - **Health check.** R:soul writes `health.json` to its data folder at the start and end of each run, and about once a minute while it searches, monitors downloads or waits for imports. The Docker image's health check reports *unhealthy* when that file is older than `max(900, 2 × SCRIPT_INTERVAL + 120)` seconds (override with `RSOUL_HEALTH_MAX_AGE`), meaning R:soul is stuck or not running. Nothing is restarted automatically. This is a liveness check only: whether slskd and Chaptarr work is recorded separately in `health.json` under `last_run` (failures, pending imports, a failed search, downloads that couldn't be checked).
 

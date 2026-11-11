@@ -15,7 +15,8 @@ import slskd_api
 from rsoul.config import Context, setup_logging, validate_config, apply_env_overrides, ENV_PREFIX
 from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
-from rsoul.workflow import run_workflow
+from rsoul.workflow import run_workflow, build_targets
+from rsoul.dryrun import is_dry_run, run_dry_run
 from rsoul.search import get_books, SearchError
 from rsoul.media import get_media_mode
 from rsoul.net import apply_timeout
@@ -54,6 +55,12 @@ def main():
         nargs="?",
         type=str,
         help="Config directory (default: %(default)s)",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Search and report what would be downloaded, without downloading or changing anything (also: [General] dry_run = True)",
     )
 
     args = parser.parse_args()
@@ -164,6 +171,9 @@ def main():
         else:
             logger.warning("No backends available - downloads will fail")
 
+        if is_dry_run(config, args.dry_run):
+            return _dry_run(ctx, search_sources, search_type, page_size)
+
         # Check if we have saved state to resume (downloads, or imports awaiting confirmation)
         has_saved_state = state_manager.has_pending_state()
         saved_downloads = [i for i in state_manager.get_items() if not i.get("extra", {}).get("import_pending")]
@@ -233,6 +243,39 @@ def main():
     return exit_code
 
 
+def _dry_run(ctx, search_sources, search_type, page_size) -> int:
+    """Report what a run would download; see rsoul/dryrun.py. Changes nothing."""
+    console.print("\nDRY RUN: searching only. Nothing will be downloaded, imported or changed.", style="bold yellow")
+    if not ctx.orchestrator:
+        logger.error("No backend is enabled; nothing to search with")
+        return EXIT_ERROR
+    try:
+        wanted_books = []
+        for source in search_sources:
+            wanted_books.extend(get_books(ctx, source, search_type, page_size, advance_page=False))
+    except (ValueError, SearchError) as ex:
+        logger.error(f"Could not get the wanted list: {ex}")
+        return EXIT_ERROR if isinstance(ex, ValueError) else EXIT_PARTIAL
+
+    # Books still downloading from an earlier run would be skipped by a real run too
+    in_flight = {item.get("book_id") for item in ctx.state.get_tasks_for_orchestrator()} if ctx.state else set()
+    download_targets = []
+    for book in wanted_books:
+        if book.get("id") in in_flight:
+            logger.info(f"Skipping {book.get('title', '?')}: still downloading from an earlier run")
+            continue
+        try:
+            download_targets.append({"book": book, "author": ctx.readarr.get_author(book["authorId"])})
+        except Exception:
+            logger.exception(f"Error processing book {book.get('title', 'unknown')}")
+    if not download_targets:
+        console.print("No releases wanted. Nothing to check!", style="blue")
+        return EXIT_OK
+
+    LAST_RUN.update(dry_run=run_dry_run(ctx, build_targets(ctx, download_targets)))
+    return EXIT_OK
+
+
 def _main_with_status() -> int:
     LAST_RUN.clear()
     code = main()
@@ -250,6 +293,8 @@ def _main_with_status() -> int:
             "unchecked_downloads": LAST_RUN.get("unchecked_downloads", 0),
         },
     }
+    if "dry_run" in LAST_RUN:
+        details["last_dry_run"] = LAST_RUN["dry_run"]
     if code == EXIT_OK:
         details["last_success_at"] = details["last_run_ended_at"]
     health.write_status("idle", **details)

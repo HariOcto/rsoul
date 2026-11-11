@@ -119,11 +119,40 @@ NON_NEGATIVE_SETTINGS = [
     ("Download Settings", "queue_timeout"),
     ("Download Settings", "max_download_time"),
     ("Postprocessing", "import_failure_retry_days"),
+    ("Postprocessing", "match_ratio_exact"),
+    ("Postprocessing", "match_ratio_normalized"),
+    ("Postprocessing", "match_ratio_word"),
+    ("Postprocessing", "match_ratio_loose"),
+    ("Postprocessing", "match_ratio_jaccard"),
+    ("Search Settings", "minimum_filename_match_ratio"),
+    ("Search Settings", "min_length_ratio"),
+    ("Search Settings", "min_jaccard_ratio"),
+    ("Search Settings", "min_title_jaccard"),
+    ("Search Settings", "min_author_jaccard"),
+    ("Search Settings", "audiobook_min_size_mb"),
+    ("General", "batch_delay"),
 ]
 # Settings read as whole numbers, which must be >= 0
 NON_NEGATIVE_INT_SETTINGS = [
     ("Download Settings", "monitor_window"),
     ("Download Settings", "max_active_downloads"),
+    ("Search Settings", "search_timeout"),
+    ("Search Settings", "maximum_peer_queue"),
+    ("Search Settings", "minimum_peer_upload_speed"),
+    ("Search Settings", "min_word_overlap"),
+    ("Search Settings", "max_search_fallbacks"),
+    ("Search Settings", "audiobook_browse_limit"),
+]
+# On/off settings. Read in the middle of a run, a typo in one of these would otherwise make
+# every search or import fail, and each book look as if nobody shared it.
+BOOLEAN_SETTINGS = [
+    ("Readarr", "disable_sync"),
+    ("Slskd", "delete_searches"),
+    ("Backends", "slskd_enabled"),
+    ("Backends", "stacks_enabled"),
+    ("Search Settings", "remove_wanted_on_failure"),
+    ("Postprocessing", "skip_validation"),
+    ("General", "dry_run"),
 ]
 # Settings read as whole numbers, which must be >= 1
 POSITIVE_INT_SETTINGS = [
@@ -204,6 +233,13 @@ def validate_config(config: configparser.ConfigParser) -> None:
         for key in keys:
             if key not in config[section]:
                 raise ValueError(f"Configuration Error: Missing required key '{key}' in section '{section}'")
+
+    for section, option in BOOLEAN_SETTINGS:
+        if config.has_option(section, option):
+            try:
+                config.getboolean(section, option)
+            except ValueError:
+                raise ValueError(f"Configuration Error: [{section}] {option} = '{config.get(section, option)}' must be True or False")
 
     # Placeholders from the sample config (e.g. YOUR_READARR_API_KEY) were never replaced
     enabled_sections = ["Readarr"]

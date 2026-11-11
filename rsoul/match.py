@@ -419,60 +419,117 @@ def title_variants(title: str) -> List[str]:
     return variants
 
 
-# Words that may sit next to the title in a folder name without making it a different book
-_TITLE_NOISE = {
-    "book", "books", "bk", "vol", "volume", "part", "series", "sequence", "saga", "cycle", "trilogy",
+# Words about the recording, which may sit anywhere next to the title
+_FORMAT_NOISE = {
     "unabridged", "unabr", "abridged", "audiobook", "audio", "hoerbuch", "hörbuch", "retail",
-    "complete", "edition", "narrated", "read", "by", "m4b", "mp3", "m4a", "aac", "flac", "kbps",
+    "edition", "narrated", "read", "by", "m4b", "mp3", "m4a", "aac", "flac", "kbps",
 }
+# Words that introduce a position in a series ("Book 2", "Vol. 3")
+_BOOK_WORDS = {"book", "bk", "vol", "volume"}
+# Words about a series or collection. In front of the title they are a prefix ("Salvation
+# Sequence 1 Salvation"); behind it they describe something bigger than the one book
+# ("Red Rising Trilogy", "Dune Saga").
+_SERIES_NOISE = {"books", "part", "series", "sequence", "saga", "cycle", "trilogy", "complete"}
+# A segment that starts like this names the narrator, not another book
+_NARRATOR_LEAD = {"read", "narrated", "performed", "narrator", "gelesen"}
+
+_NUMBER_WORD = re.compile(r"\d+(?:[snrt][tdh])?")
+_YEAR_WORD = re.compile(r"(?:1[89]|20)\d\d")
+
+
+def series_positions(series_title: str) -> set:
+    """Positions of the book in its series, from Readarr/Chaptarr's "Red Rising Saga #1"
+    (several series are separated by ";"). Empty if unknown."""
+    return {int(float(n)) for n in re.findall(r"#\s*(\d+(?:\.\d+)?)", series_title or "")}
+
+
+_BOOK_NUMBER = re.compile(r"(?:\b(?:book|bk|vol|volume)\b\.?\s*|#\s*)(\d+)", re.IGNORECASE)
+
+
+def _check_trailing(words: List[str], allowed: set, series_words: set, positions: set) -> Optional[Dict[str, bool]]:
+    """Check the words behind the title (or in a later part of the name).
+
+    They leave it the same book if they are recording noise, the author, a year, the series
+    name, or "Book N" with this book's own number. Returns None if something else is there,
+    else which of the last two were seen.
+    """
+    seen = {"series": False, "book_number": False}
+    for i, word in enumerate(words):
+        if word in allowed or word in _BOOK_WORDS or _YEAR_WORD.fullmatch(word):
+            continue
+        if word in series_words:
+            seen["series"] = True
+            continue
+        if _NUMBER_WORD.fullmatch(word):
+            # "Book 2" / "Vol 2": fine for the second book of its series, or when the position
+            # isn't known. A number without such a word ("Dune 2", "Red Rising 02") is the
+            # series counting on: another book.
+            if i and words[i - 1] in _BOOK_WORDS and word.isdigit() and (not positions or int(word) in positions):
+                seen["book_number"] = True
+                continue
+            return None
+        return None
+    return seen
 
 
 def title_segment_match(title: str, candidate: str, author_name: str = "", series_title: str = "") -> bool:
-    """True if some part of the name is this title and nothing else.
+    """True if the name says this title, and nothing in it says a different book.
 
     The fuzzy score alone can't tell "Salvation" from "The Saints of Salvation" or "Salvation
     Lost": it compares the last words of a name with the title and scores 1.0. Here the name is
     split at " - ", commas, colons and folder boundaries, and one part must contain every word
-    of the title plus nothing except the author's name, the series name, numbers and noise such
-    as "Book", "Unabridged" or "m4b". "Frontlines 2 - Lines of Departure" and "Salvation
-    Sequence 1 - Salvation" pass; "The Saints of Salvation" and "Salvation Lost" don't.
+    of the title. Around the title, that part may only hold:
+
+    - in front: the author, the series name, numbers and words like "Book" or "Unabridged"
+      ("Frontlines 2 - Lines of Departure", "Salvation Sequence 1 Salvation");
+    - behind: the author, recording words, a year, and the series with the book's number
+      ("Knife Edge Empire's Corps, Book 17"). "Salvation Lost", "Dune 2", "Red Rising 02"
+      and "Red Rising Trilogy" (a series without a book number: the whole set) are not it.
+
+    The parts after it are held to the same rule, because many series are named after their
+    first book: "Red Rising 02 - Golden Son" is Golden Son, not Red Rising. A part that names
+    the narrator ("read by ...") is fine. If Readarr/Chaptarr gave the book's position in its
+    series ("Red Rising Saga #1"), a "Book 2" or "#2" anywhere in the name rules it out.
     """
     title_words = set(_meaningful_words(title))
     if not title_words:
         return True
 
+    positions = series_positions(series_title)
+    if positions and any(int(n) not in positions for n in _BOOK_NUMBER.findall(candidate)):
+        return False
+
     name = candidate
     if " " not in name.strip():
         name = re.sub(r"[-_.]+", " ", name)  # "Marko-Kloos-Lines-of-Departure-Unabr"
     name = _BRACKETED.sub(" ", name)
-    ignore = set(normalize_for_matching(author_name).split()) | set(_meaningful_words(series_title)) | _TITLE_NOISE
+    author_words = set(normalize_for_matching(author_name).split())
+    behind = author_words | _FORMAT_NOISE
+    series_words = ({w for w in _meaningful_words(series_title) if not _NUMBER_WORD.fullmatch(w)} | _SERIES_NOISE) - title_words
+    in_front = behind | series_words | _BOOK_WORDS
 
-    for segment in re.split(r"\s+[-–]\s+|\\|,|;|:", name):
-        words = [w for w in normalize_for_matching(segment).split() if w not in STOP_WORDS]
+    segments = [[w for w in normalize_for_matching(part).split() if w not in STOP_WORDS] for part in re.split(r"\s+[-–]\s+|\\|,|;|:", name)]
+    for index, words in enumerate(segments):
         if not title_words <= set(words):
             continue
-        # Numbers, including ordinals such as 1st, 3rd or 4th, don't make it a different title
-        extras = [w for w in words if w not in title_words and w not in ignore and not re.fullmatch(r"\d+(?:[snrt][tdh])?", w)]
-        if extras:
+        first = min(i for i, w in enumerate(words) if w in title_words)
+        last = max(i for i, w in enumerate(words) if w in title_words)
+        # Numbers, including ordinals such as 1st, 3rd or 4th, in front of the title don't make
+        # it a different title; words between the title's own words do
+        if any(w not in in_front and not _NUMBER_WORD.fullmatch(w) for w in words[:first]):
             continue
-        # ...except a bare number right behind the title: "Dune 2" is the next book, not "Dune".
-        # A number that is set apart is fine: zero-padded ("Dune 01", a chapter), a year
-        # ("Dune 1965"), after another word ("Dune Book 1") or in front ("1 Dune").
-        if any(_sequel_number(w, words[i - 1] if i else None, title_words) for i, w in enumerate(words) if w not in title_words):
+        if any(w not in title_words for w in words[first:last]):
+            continue
+        later = [part for part in segments[index + 1:] if part and part[0] not in _NARRATOR_LEAD]
+        checks = [_check_trailing(part, behind, series_words, positions) for part in [words[last + 1:]] + later]
+        if any(check is None for check in checks):
+            continue
+        # A series named behind the title needs the book's number with it; without one the
+        # name describes the whole series ("Red Rising Saga", "Dune Trilogy")
+        if any(check["series"] for check in checks) and not any(check["book_number"] for check in checks):
             continue
         return True
     return False
-
-
-def _sequel_number(word: str, previous: Optional[str], title_words: set) -> bool:
-    """True for a bare number (or ordinal) that directly follows a word of the title."""
-    if previous not in title_words or not re.fullmatch(r"\d+(?:[snrt][tdh])?", word):
-        return False
-    if word.startswith("0") and len(word) >= 2:
-        return False  # zero-padded: a chapter or track number
-    if re.fullmatch(r"(?:1[89]|20)\d\d", word):
-        return False  # a year
-    return True
 
 
 def author_in_name(author_name: str, candidate: str) -> bool:
@@ -494,10 +551,12 @@ def audiobook_folder_match(
     min_title_jaccard: float = 0.3,
     min_author_jaccard: float = 0.5,
     stats: Optional[Dict[str, int]] = None,
+    rejected: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Match an audiobook against one user's search results, folder by folder.
 
-    If `stats` is given, counts of what was found and why folders were rejected are added to it.
+    If `stats` is given, counts of what was found and why folders were rejected are added to it;
+    if `rejected` is given, each rejected folder is appended with its reason (for the dry run).
 
     Audiobooks usually arrive as a folder of chapter files ("01.mp3", "02.mp3"...)
     whose names say nothing about the book, so the folder name is matched instead.
@@ -533,11 +592,14 @@ def audiobook_folder_match(
     def note(reason: str, directory: str) -> None:
         if stats is not None:
             stats[reason] = stats.get(reason, 0) + 1
+        if rejected is not None:
+            rejected.append({"reason": reason, "directory": directory, "username": username})
         logger.debug(f"Audiobook folder rejected ({reason}): {directory} from {username}")
 
-    def best_score_for(names: List[str]) -> Optional[float]:
-        """Best fuzzy score of these names, or None if none of them is exactly this title."""
-        if not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
+    def best_score_for(names: List[str], checked: bool = False) -> Optional[float]:
+        """Best fuzzy score of these names, or None if none of them is exactly this title
+        (checked: the caller has already established that)."""
+        if not checked and not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
             return None
         best = None
         for name in names:
@@ -583,8 +645,12 @@ def audiobook_folder_match(
         # Was it the folder that matched, or only the names of files inside it? Files named
         # "Author - Title.m4b" or "Author - Title - 01.mp3" often sit in a folder full of other
         # books ("Audiobooks", "Brandon Sanderson"): then only they belong to the book.
-        folder_names = folder_name_candidates(directory, [])
-        if any(title_segment_match(title, name, author_name, series_title) for name in folder_names for title in titles):
+        # The folder's own name must be the title. Its parent only supplies the author for the
+        # score: series folders are often named after their first book ("Foundation\\Second
+        # Foundation"), so a parent that matches says nothing about this folder.
+        leaf = directory.split("\\")[-1]
+        leaf_names = [name for name in dict.fromkeys((leaf, clean_audiobook_name(leaf))) if name]
+        if any(title_segment_match(title, name, author_name, series_title) for name in leaf_names for title in titles):
             # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
             # authors, so the author's surname must appear somewhere in the path (or, for a
             # single-file book, the filename). This also rules out other books with the same title.
@@ -592,7 +658,7 @@ def audiobook_folder_match(
             if not author_in_name(author_name, path_text):
                 note("folders without the author's surname", directory)
                 continue
-            score = best_score_for(folder_name_candidates(directory, files))
+            score = best_score_for(folder_name_candidates(directory, files), checked=True)
             if score is None or score < minimum_match_ratio:
                 note("folders not matching the title", directory)
                 continue

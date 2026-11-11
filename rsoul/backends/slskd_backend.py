@@ -114,6 +114,8 @@ class SlskdBackend(DownloadBackend):
         self.config = ctx.config
         # book ID -> further usable audiobook results of the last search, produced on demand
         self._alternates: Dict[int, Any] = {}
+        # book ID -> what the last search considered and rejected (read by the dry run)
+        self.search_notes: Dict[int, Dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -170,6 +172,9 @@ class SlskdBackend(DownloadBackend):
 
         all_results: List[SearchResult] = []
         seen_queries = set()
+        searched_queries = failed_queries = 0
+        last_error: Optional[Exception] = None
+        self.search_notes.pop(target.book_id, None)
 
         # Prepare target dict for book_match
         target_dict = {
@@ -187,7 +192,10 @@ class SlskdBackend(DownloadBackend):
                 search_results, search_id = _execute_search(self.ctx, query, search_label)
             except Exception as e:
                 logger.error(f"Search failed for query '{query}': {e}")
+                failed_queries += 1
+                last_error = e
                 continue
+            searched_queries += 1
 
             if delete_searches:
                 try:
@@ -205,6 +213,10 @@ class SlskdBackend(DownloadBackend):
                 if all_results:
                     break
 
+        if failed_queries and not searched_queries:
+            # Not one search went through (slskd unreachable, a bad setting...). That is not the
+            # same as "nobody shares this book", and must not be reported as such.
+            raise RuntimeError(f"none of the {failed_queries} searches could be run: {last_error}")
         return all_results
 
     def _match_thresholds(self) -> Dict[str, Any]:
@@ -309,12 +321,13 @@ class SlskdBackend(DownloadBackend):
 
         candidates = []
         stats: Dict[str, int] = {}
+        rejected: List[Dict[str, str]] = []
         for result in search_results:
             username = result["username"]
             if self.ctx.history and self.ctx.history.is_failed(username, book_title):
                 stats["skipped (failed before)"] = stats.get("skipped (failed before)", 0) + 1
                 continue
-            for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, stats=stats, **thresholds):
+            for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, stats=stats, rejected=rejected, **thresholds):
                 candidates.append((username, match))
 
         if not candidates:
@@ -328,6 +341,14 @@ class SlskdBackend(DownloadBackend):
         # Candidates are browsed lazily, best first: search() gets the first usable one, and
         # download() asks for the next only if that one can't be started. Each browse is a slow
         # round trip to the peer, so none is made before it is needed.
+        self.search_notes[target.book_id] = {
+            "candidates": [
+                {"username": u, "directory": m["directory"], "extension": m["extension"], "score": m["score"], "file_based": bool(m.get("file_based")), "files_found": len(m["files"])}
+                for u, m in candidates
+            ],
+            "stats": dict(stats),
+            "rejected": rejected,
+        }
         usable = self._usable_audiobook_results(target, candidates[:browse_limit], min_size_bytes)
         first = next(usable, None)
         if first is None:

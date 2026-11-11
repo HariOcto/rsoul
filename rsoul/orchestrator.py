@@ -62,6 +62,8 @@ class DownloadOrchestrator:
                     "progress: see stall_timeout, queue_timeout and max_download_time in [Download Settings]."
                 )
         self.poll_interval = 10  # seconds between status checks
+        self.last_start_failure = "not_found"
+        self._found_results = False
         self.unchecked_task_ids: set = set()
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
@@ -119,22 +121,28 @@ class DownloadOrchestrator:
         Returns:
             Started DownloadTask if successful, None if all backends failed
         """
+        # Why nothing was started, for the caller: "not_searched" (no backend could be asked),
+        # "not_started" (found, but no download could be queued) or "not_found"
+        searched = False
+        self._found_results = False
         for backend in self.backends:
             if not backend.is_available():
-                logger.debug(f"Backend {backend.name} not available, skipping")
+                logger.warning(f"Backend {backend.name} is not available, skipping")
                 continue
 
             logger.info(f"Trying backend: {backend.name}")
 
             try:
                 task = self._start_backend_download(backend, target)
+                searched = True
                 if task:
                     return task
             except Exception as e:
                 logger.warning(f"Backend {backend.name} failed: {e}")
                 continue
 
-        logger.warning(f"All backends failed to start download for: {target.book_title}")
+        self.last_start_failure = "not_searched" if not searched else "not_started" if self._found_results else "not_found"
+        logger.warning(f"All backends failed to start download for: {target.book_title} ({self.last_start_failure.replace('_', ' ')})")
         return None
 
     def _try_backend(self, backend: DownloadBackend, target: DownloadTarget) -> Optional[DownloadTask]:
@@ -175,6 +183,7 @@ class DownloadOrchestrator:
             return None
 
         logger.info(f"Found {len(results)} results from {backend.name}")
+        self._found_results = True
 
         # 2. Download the best result; if it can't be started (peer gone, its local folder is
         # in use...), try the next ones instead of failing on the same result run after run
@@ -384,6 +393,7 @@ class DownloadOrchestrator:
                     series_title=target.series_title,
                     filename="",
                     error_message="No backend could find or start download",
+                    extra={"start_failure": self.last_start_failure},
                 )
                 try:
                     on_complete(failed_task)

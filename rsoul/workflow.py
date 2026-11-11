@@ -185,7 +185,13 @@ class _RunResults:
             except Exception as e:
                 logger.warning(f"Could not clean up after failed download of {task.book_title}: {e}")
 
-        if self.remove_wanted_on_failure:
+        # A book nobody could be asked about (slskd unreachable, a setting that breaks every
+        # search), or one that was found but couldn't be queued (its local folder is in use),
+        # hasn't failed for good: it stays wanted
+        start_failure = task.extra.get("start_failure")
+        if self.remove_wanted_on_failure and start_failure in ("not_searched", "not_started"):
+            logger.error(f"Could not {'search for' if start_failure == 'not_searched' else 'start'} {task.book_title} by {task.author_name}; it stays on the wanted list")
+        elif self.remove_wanted_on_failure:
             failed_target = self.targets_by_id.get(task.book_id)
             if failed_target:
                 book = failed_target.readarr_book

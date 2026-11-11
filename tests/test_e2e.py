@@ -52,3 +52,21 @@ def test_other_tool_clearing_finished_transfers_end_to_end():
     out = run("soularr_clears")
     assert "book 1 imported files: 12 of 12" in out
     assert "state file left behind: False" in out
+
+
+def test_dry_run_end_to_end():
+    out = run("dry_run")
+    assert "exit code: 0" in out
+    # Nothing is touched...
+    assert "downloads queued: 0" in out
+    assert "transfers cancelled or removed: 0" in out
+    assert "import commands: 0" in out
+    assert "books changed in Chaptarr: 0" in out
+    assert "new files in data folder: ['dry_run_report.txt']" in out
+    assert "download folder: []" in out
+    # ...and the report says what a real run would do
+    assert "report names book 1 folder: True" in out
+    assert "report says how it matched: True" in out
+    assert "report lists what was turned away: True" in out
+    assert "report has book 2 without a match: True" in out
+    assert "report summary: Dry run finished: 1 would be downloaded, 1 without a match, 0 not searched (of 2 wanted)" in out

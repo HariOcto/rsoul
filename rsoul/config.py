@@ -241,6 +241,10 @@ def validate_config(config: configparser.ConfigParser) -> None:
             except ValueError:
                 raise ValueError(f"Configuration Error: [{section}] {option} = '{config.get(section, option)}' must be True or False")
 
+    tag_check = config.get("Postprocessing", "audiobook_tag_check", fallback="reject").strip().lower()
+    if tag_check not in ("reject", "warn", "off"):
+        raise ValueError(f"Configuration Error: [Postprocessing] audiobook_tag_check = '{tag_check}' must be reject, warn or off")
+
     # Placeholders from the sample config (e.g. YOUR_READARR_API_KEY) were never replaced
     enabled_sections = ["Readarr"]
     if config.getboolean("Backends", "slskd_enabled", fallback=True):

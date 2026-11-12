@@ -12,6 +12,9 @@ import ebookmeta
 from .utils import sanitize_folder_name, jaccard_similarity, extract_author_title
 from .display import print_import_summary, print_section_header
 from . import health
+from . import audiotags
+from .library import sibling_titles
+from .match import book_narrators
 
 logger = logging.getLogger("readarr_soul")
 
@@ -535,6 +538,58 @@ def to_local_path(path: str, readarr_download_dir: str, local_download_dir: str)
     return path
 
 
+TAG_CHECK_MODES = ("reject", "warn", "off")
+
+
+def audiobook_tag_check_mode(config: Any) -> str:
+    """[Postprocessing] audiobook_tag_check: reject (default), warn or off. skip_validation = True
+    switches it off together with the ebook checks."""
+    if config.getboolean("Postprocessing", "skip_validation", fallback=False):
+        return "off"
+    mode = config.get("Postprocessing", "audiobook_tag_check", fallback="reject").strip().lower()
+    return mode if mode in TAG_CHECK_MODES else "reject"
+
+
+def audiobook_tags_contradict(ctx: Any, book_download: dict, local_download_dir: str) -> str:
+    """Check a downloaded audiobook's audio tags against the wanted book (see audiotags.py).
+
+    Returns what the tags say if they name another book and the check is set to reject, else
+    "". Never raises: a check that can't be made is not a reason to stop an import.
+    """
+    mode = audiobook_tag_check_mode(ctx.config)
+    if mode == "off":
+        return ""
+    try:
+        title = book_download.get("title", "")
+        author_name = book_download.get("author_name", "")
+        folder = os.path.join(local_download_dir, book_download.get("dir", ""))
+        names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
+        paths = [os.path.join(folder, name) for name in names if os.path.isfile(os.path.join(folder, name))]
+        if not paths:
+            return ""
+
+        # What Chaptarr knows about the book: series position, narrators, the author's other titles
+        book: dict = {}
+        try:
+            fetched = ctx.readarr.get_book(book_download.get("bookId")) if ctx.readarr else None
+            book = fetched if isinstance(fetched, dict) else {}
+        except Exception as e:
+            logger.debug(f"Could not fetch book {book_download.get('bookId')} for the tag check: {e}")
+        series_title = book.get("seriesTitle") or book_download.get("seriesTitle") or ""
+        siblings = sibling_titles(ctx, dict(book, title=title), author_name) if book.get("authorId") else []
+
+        verdict, detail = audiotags.check_audiobook_tags(paths, title, author_name, series_title, book_narrators(book), siblings)
+        if verdict == audiotags.MISMATCH:
+            if mode == "warn":
+                logger.warning(f"Audio tags of {title} name another book ({detail}); importing anyway (audiobook_tag_check = warn)")
+                return ""
+            return detail
+        logger.info(f"Audio tag check for {title}: {'tags name this book' if verdict == audiotags.AGREE else 'no usable tags' if verdict == audiotags.UNTAGGED else 'tags are inconclusive'}")
+    except Exception:
+        logger.exception(f"Audio tag check failed for {book_download.get('title', 'audiobook')}; continuing without it")
+    return ""
+
+
 def import_failure_retry_days(config: Any) -> float:
     """Days before a peer whose files weren't imported is tried again (0 = never again).
 
@@ -811,6 +866,18 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                 book_title = book_download.get("title", "")
                 source_id = book_download.get("source_id", book_download.get("username", ""))
                 logger.info(f"Processing audiobook: {book_title}")
+                wrong_book = audiobook_tags_contradict(ctx, book_download, local_download_dir)
+                if wrong_book:
+                    # The files themselves say they are another book. Unlike a failed move, this
+                    # is about the peer's files: they are not tried again.
+                    logger.warning(f"Audiobook rejected: {book_title} - {wrong_book}")
+                    names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
+                    moved_to = move_files_aside(local_download_dir, book_download.get("dir", ""), names)
+                    if moved_to:
+                        logger.info(f"The files were moved to {moved_to}")
+                    if ctx.history and source_id and book_title:
+                        ctx.history.add_failure(source_id, book_title, f"Audio tags name another book ({wrong_book})")
+                    continue
                 relative, reason = organize_audiobook(book_download, local_download_dir)
                 if relative:
                     author_folders.add(relative)

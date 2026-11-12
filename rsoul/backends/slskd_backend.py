@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
 from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number, books_in_folder, missing_parts
 from ..media import AUDIO_EXTENSIONS
+from ..library import sibling_titles
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
 from .. import health
@@ -58,6 +59,9 @@ def _strip_initials(author_name: str) -> str:
     words = [w for w in author_name.split() if not re.fullmatch(r"(?:[A-Za-z]\.)+|[A-Za-z]", w)]
     return " ".join(words)
 
+
+# Below this average bitrate over the book's known duration, a download can't be the whole book
+MIN_AUDIOBOOK_KBPS = 8
 
 # Extra seconds, beyond the 10 s head start and slskd's own search_timeout, to wait for a search
 SEARCH_WAIT_MARGIN = 60
@@ -181,6 +185,9 @@ class SlskdBackend(DownloadBackend):
             "book": target.readarr_book or {"title": target.book_title, "id": target.book_id, "seriesTitle": target.series_title},
             "author": target.readarr_author or {"authorName": target.author_name},
         }
+        if target.is_audiobook:
+            # The author's other titles tell a shelf of books from a folder of chapters
+            target_dict["sibling_titles"] = sibling_titles(self.ctx, target_dict["book"], target.author_name)
 
         for i, query in enumerate(queries):
             if query in seen_queries:
@@ -446,6 +453,11 @@ class SlskdBackend(DownloadBackend):
                 skip(f"{total_size / 1048576:.1f} MB is below audiobook_min_size_mb", label=label)
                 continue
 
+            too_short = self._too_small_for_duration(target, total_size)
+            if too_short:
+                skip(too_short, label=label)
+                continue
+
             if self._local_clashes(directory, files):
                 # download() would refuse these files; the next candidate may be fine
                 skip("its local download folder is in use", temporary=True, label=label)
@@ -453,6 +465,25 @@ class SlskdBackend(DownloadBackend):
 
             logger.info(f"Audiobook candidate: {label} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
             yield self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], file_based=file_based)
+
+    @staticmethod
+    def _too_small_for_duration(target: DownloadTarget, total_size: int) -> str:
+        """Say so if the files are far too small for the length Chaptarr gives for the book.
+
+        Even heavily compressed speech needs about 16 kbit/s, so anything below
+        MIN_AUDIOBOOK_KBPS for the book's whole duration is a fragment or an abridgement, not
+        the book. Returns "" when it is plausible or Chaptarr gives no duration.
+        """
+        try:
+            minutes = float((target.readarr_book or {}).get("durationMinutes") or 0)
+        except (TypeError, ValueError):
+            return ""
+        if minutes < 30:
+            return ""
+        kbps = total_size * 8 / 1000 / (minutes * 60)
+        if kbps >= MIN_AUDIOBOOK_KBPS:
+            return ""
+        return f"{total_size / 1048576:.0f} MB is too small for a book of {minutes / 60:.1f} hours ({kbps:.0f} kbit/s)"
 
     @staticmethod
     def _chapters_in_other_formats(directory: str, ext: str, files: List[Dict[str, Any]], browsed: List[Dict[str, Any]]) -> bool:

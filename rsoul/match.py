@@ -1,7 +1,7 @@
 import difflib
 import logging
 import re
-from typing import Any, Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Sequence, Tuple
 from .display import print_match_details
 from .utils import normalize_for_matching, title_contained_in_filename, jaccard_similarity, length_ratio, extract_author_title, STOP_WORDS
 
@@ -388,29 +388,43 @@ def books_in_folder(target: Dict[str, Any], files: List[Tuple[str, int]]) -> Tup
         ("folder", [])     the folder is the book: take every file (chapters).
         ("own", names)     one or more book-sized files carry the title themselves and the
                            others are named differently: only those files are the book.
-        ("several", [])    no file carries the title, and the files are book-sized and named
-                           differently from each other: several other books, not this one.
+        ("several", [])    no file carries the title, and the files are other books: each is
+                           named like another book by the author (target["sibling_titles"],
+                           where Chaptarr provides them), or they are book-sized and named
+                           differently from each other.
     """
-    if len(files) < 2:
+    if not files:
         return "folder", []
     author_name = target["author"]["authorName"]
     series_title = target["book"].get("seriesTitle") or ""
     titles = title_variants(target["book"]["title"])
-    known = set(normalize_for_matching(author_name).split()) | _FORMAT_NOISE | _CHAPTER_WORDS
+    narrators = book_narrators(target["book"])
+    known = _people_words(author_name, narrators) | _FORMAT_NOISE | _CHAPTER_WORDS
     for title in titles:
         known |= set(_meaningful_words(title))
 
     def carries_title(basename: str) -> bool:
-        if names_another_release(target["book"]["title"], basename, author_name, series_title):
+        if names_another_release(target["book"]["title"], basename, author_name, series_title, narrators):
             return False
-        return any(title_segment_match(title, name, author_name, series_title) for name in file_name_candidates(basename) for title in titles)
+        return any(title_segment_match(title, name, author_name, series_title, narrators) for name in file_name_candidates(basename) for title in titles)
 
     def own_name(basename: str) -> bool:
         words = _meaningful_words(clean_audiobook_name(strip_part_numbers(_stem(basename))))
         return any(w not in known and not _NUMBER_WORD.fullmatch(w) for w in words)
 
+    siblings = target.get("sibling_titles") or []
+
+    def names_sibling(basename: str) -> bool:
+        """The file is named like another book by the author (and not like this one)."""
+        return any(title_segment_match(variant, name, author_name, "", narrators) for sibling in siblings for variant in title_variants(sibling) for name in file_name_candidates(basename))
+
     sizes = dict(files)
     own = [name for name, _ in files if carries_title(name)]
+    if not own and all(names_sibling(name) for name, _ in files):
+        # Certain, whatever the sizes: "Dune\\Dune Messiah.m4b", or a shelf without the book
+        return "several", []
+    if len(files) < 2:
+        return "folder", []
     others = [name for name, _ in files if name not in own and own_name(name)]
     if own and others and all(sizes[name] >= BOOK_SIZED_BYTES for name in own):
         return "own", same_book_files(own, [name for name, _ in files])
@@ -530,6 +544,41 @@ _NUMBER_WORD = re.compile(r"\d+(?:[snrt][tdh])?")
 _YEAR_WORD = re.compile(r"(?:1[89]|20)\d\d")
 
 
+def book_narrators(book: Dict[str, Any]) -> List[str]:
+    """Narrator names Chaptarr reports for a book (none for ebooks, or when it knows none)."""
+    names: List[str] = []
+    for key in ("narratorNames", "availableNarrators"):
+        value = book.get(key) or []
+        for name in [value] if isinstance(value, str) else value:
+            if isinstance(name, str) and name.strip() and name not in names:
+                names.append(name)
+    narrator = book.get("narrator")
+    if isinstance(narrator, str) and narrator.strip() and narrator not in names:
+        names.append(narrator)
+    return names
+
+
+def without_narrators(name: str, narrators: Sequence[str]) -> str:
+    """The name with the narrators (and a "read by" / "narrated by" before them) taken out:
+    "Author - Title - read by Narrator" -> "Author - Title"."""
+    stripped = name
+    for narrator in narrators:
+        if narrator.strip():
+            stripped = re.sub(rf"(?:\b(?:read|narrated|performed)\s+by\s+)?{re.escape(narrator.strip())}", " ", stripped, flags=re.IGNORECASE)
+    if stripped == name:
+        return name
+    stripped = re.sub(r"[(\[{]\s*[)\]}]", " ", stripped)  # brackets left empty
+    stripped = re.sub(r"(?:\s+[-–]\s*)+$|^(?:\s*[-–]\s+)+", "", re.sub(r"\s+", " ", stripped).strip())
+    return re.sub(r"(\s[-–])+\s+(?=[-–]\s)", " ", stripped).strip() or name
+
+
+def _people_words(author_name: str, narrators: Sequence[str] = ()) -> set:
+    words = set(normalize_for_matching(author_name).split())
+    for narrator in narrators:
+        words |= set(normalize_for_matching(narrator).split())
+    return words
+
+
 def series_positions(series_title: str) -> set:
     """Positions of the book in its series, from Readarr/Chaptarr's "Red Rising Saga #1"
     (several series are separated by ";"). Empty if unknown."""
@@ -565,7 +614,7 @@ def _check_trailing(words: List[str], allowed: set, series_words: set, positions
     return seen
 
 
-def names_another_release(title: str, raw_name: str, author_name: str = "", series_title: str = "") -> bool:
+def names_another_release(title: str, raw_name: str, author_name: str = "", series_title: str = "", narrators: Sequence[str] = ()) -> bool:
     """True if a name, read as the peer wrote it, says "not this single book".
 
     This must see the name before brackets and release details are stripped from it, because
@@ -583,7 +632,7 @@ def names_another_release(title: str, raw_name: str, author_name: str = "", seri
         return True
     if _BOOK_RANGE.search(raw_name):
         return True
-    known = set(_meaningful_words(title)) | set(normalize_for_matching(author_name).split()) | set(_meaningful_words(series_title)) | _FORMAT_NOISE
+    known = set(_meaningful_words(title)) | _people_words(author_name, narrators) | set(_meaningful_words(series_title)) | _FORMAT_NOISE
     for groups in _BRACKET_CONTENT.findall(raw_name):
         content = next((g for g in groups if g), "")
         words = {w for w in _meaningful_words(content) if w not in known and not _NUMBER_WORD.fullmatch(w)}
@@ -592,7 +641,7 @@ def names_another_release(title: str, raw_name: str, author_name: str = "", seri
     return False
 
 
-def title_segment_match(title: str, candidate: str, author_name: str = "", series_title: str = "") -> bool:
+def title_segment_match(title: str, candidate: str, author_name: str = "", series_title: str = "", narrators: Sequence[str] = ()) -> bool:
     """True if the name says this title, and nothing in it says a different book.
 
     The fuzzy score alone can't tell "Salvation" from "The Saints of Salvation" or "Salvation
@@ -615,7 +664,7 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
     if not title_words:
         return True
 
-    if names_another_release(title, candidate, author_name, series_title):
+    if names_another_release(title, candidate, author_name, series_title, narrators):
         return False
 
     positions = series_positions(series_title)
@@ -623,8 +672,8 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
     if " " not in name.strip():
         name = re.sub(r"[-_.]+", " ", name)  # "Marko-Kloos-Lines-of-Departure-Unabr"
     name = _BRACKETED.sub(" ", name)
-    author_words = set(normalize_for_matching(author_name).split())
-    behind = author_words | _FORMAT_NOISE
+    # The author, and the narrators where Chaptarr knows them ("Red Rising - Tim Gerard Reynolds")
+    behind = _people_words(author_name, narrators) | _FORMAT_NOISE
     series_words = ({w for w in _meaningful_words(series_title) if not _NUMBER_WORD.fullmatch(w)} | _SERIES_NOISE) - title_words
     in_front = behind | series_words | _BOOK_WORDS
 
@@ -699,6 +748,7 @@ def audiobook_folder_match(
     allowed = [ext.split(" ")[0].lower() for ext in allowed_filetypes]
 
     titles = title_variants(book_title)
+    narrators = book_narrators(target["book"])
 
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for slskd_file in slskd_files:
@@ -719,8 +769,11 @@ def audiobook_folder_match(
     def best_score_for(names: List[str], checked: bool = False) -> Optional[float]:
         """Best fuzzy score of these names, or None if none of them is exactly this title
         (checked: the caller has already established that)."""
-        if not checked and not any(title_segment_match(title, name, author_name, series_title) for name in names for title in titles):
+        if not checked and not any(title_segment_match(title, name, author_name, series_title, narrators) for name in names for title in titles):
             return None
+        # The fuzzy score reads "Author - Title - Narrator" as author, then a title it doesn't
+        # know. Where Chaptarr names the narrators, score the name without them as well.
+        names = list(dict.fromkeys(names + [without_narrators(name, narrators) for name in names]))
         best = None
         for name in names:
             for title in titles:
@@ -769,12 +822,12 @@ def audiobook_folder_match(
         # score: series folders are often named after their first book ("Foundation\\Second
         # Foundation"), so a parent that matches says nothing about this folder.
         leaf = directory.split("\\")[-1]
-        if names_another_release(book_title, leaf, author_name, series_title):
+        if names_another_release(book_title, leaf, author_name, series_title, narrators):
             # Judged on the name as written: stripping its brackets would hide the evidence
             note("folders for a different title", directory)
             continue
         leaf_names = [name for name in dict.fromkeys((leaf, clean_audiobook_name(leaf))) if name]
-        if any(title_segment_match(title, name, author_name, series_title) for name in leaf_names for title in titles):
+        if any(title_segment_match(title, name, author_name, series_title, narrators) for name in leaf_names for title in titles):
             # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
             # authors, so the author's surname must appear somewhere in the path (or, for a
             # single-file book, the filename). This also rules out other books with the same title.
@@ -801,7 +854,7 @@ def audiobook_folder_match(
             if not author_in_name(author_name, directory + " " + basename):
                 reasons.add("author")
                 continue
-            if names_another_release(book_title, basename, author_name, series_title):
+            if names_another_release(book_title, basename, author_name, series_title, narrators):
                 reasons.add("title")
                 continue
             score = best_score_for(file_name_candidates(basename))

@@ -1,0 +1,4 @@
+# ID3 frame names read by rsoul/audiotags.py (artist and album artist), not misspellings
+[default.extend-identifiers]
+TPE1 = "TPE1"
+TPE2 = "TPE2"

@@ -12,7 +12,9 @@ if TYPE_CHECKING:
 
 from .display import print_section_header, print_run_summary
 from .backends import DownloadTarget, DownloadTask, DownloadStatus
-from .media import get_media_mode, resolve_book_media_type, get_formats, EBOOK, BOTH
+from .media import get_media_mode, resolve_book_media_type, get_formats, EBOOK, AUDIOBOOK, BOTH
+from .match import normalize_for_matching, title_key
+from .library import record_with_files
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +50,46 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Lis
             f"Treating them as {EBOOK}s; use media_mode = audiobook for an audiobook-only instance."
         )
 
+    # Titles R:soul is already dealing with: downloads saved from earlier runs, and (below)
+    # the books accepted so far in this run
+    seen = set()
+    state = getattr(ctx, "state", None)
+    for item in state.get_tasks_for_orchestrator() if state else []:
+        saved_media = (item.get("extra") or {}).get("media_type", EBOOK)
+        seen.add((normalize_for_matching(item.get("author_name", "")), title_key(item.get("book_title", "")), saved_media))
+    saved_ids = {item.get("book_id") for item in state.get_tasks_for_orchestrator()} if state else set()
+
     for target_dict in download_targets:
         book = target_dict["book"]
         author = target_dict["author"]
+        label = f"{author.get('authorName', '?')} - {book.get('title', '?')} (book {book.get('id')})"
 
         # Ebook or audiobook decides the formats (priority order) and how results are grabbed
         media_type = resolve_book_media_type(book, media_mode)
         filetypes = get_formats(ctx.config, media_type)
+
+        # A record of the other media type has no business in an ebook-only or audiobook-only
+        # run: the download would be imported for its counterpart and this record stay wanted
+        own_type = str(book.get("mediaType") or "").strip().lower()
+        if media_mode in (EBOOK, AUDIOBOOK) and own_type in (EBOOK, AUDIOBOOK) and own_type != media_mode:
+            logger.warning(f"Skipping {label}: it is an {own_type} record, and media_mode = {media_mode}")
+            continue
+
+        # The same author and title twice (Readarr/Chaptarr can hold two records for one book)
+        # would be downloaded twice. Books resumed from an earlier run are not new duplicates.
+        key = (normalize_for_matching(author.get("authorName", "")), title_key(book.get("title", "")), media_type)
+        if book.get("id") not in saved_ids:
+            if key in seen:
+                logger.warning(f"Skipping {label}: another wanted record with the same author and title is already being downloaded")
+                continue
+            duplicate = record_with_files(ctx, book)
+            if duplicate:
+                logger.warning(
+                    f"Skipping {label}: Chaptarr already has files for another record of this title (book {duplicate['id']}). "
+                    "Unmonitor or remove the duplicate record there to stop it showing up as wanted."
+                )
+                continue
+        seen.add(key)
 
         # Fetch editions for this book (contains ISBNs, ASINs, etc.)
         try:

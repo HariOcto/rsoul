@@ -598,7 +598,7 @@ class SlskdBackend(DownloadBackend):
         if is_audiobook:
             extra["media_type"] = "audiobook"
             extra["expected_files"] = [f["filename"].split("\\")[-1] for f in files]
-            logger.info(f"Enqueued audiobook folder: {local_dir} ({len(downloads)} files) from {username}")
+            logger.info(f"Enqueued audiobook: {len(downloads)} file(s) from {username}, into the local folder {local_dir}")
 
         return DownloadTask(
             task_id=task_id,
@@ -707,18 +707,41 @@ class SlskdBackend(DownloadBackend):
         # Unfinished downloads (from any peer or tool) headed for the same local folder. Any such
         # download counts, not only same-named files: Soularr deletes the whole local folder of an
         # album it gives up on, which would take R:soul's files with it.
+        # R:soul's own downloads are the exception. Several wanted books often sit in one folder
+        # of a peer ("Christopher G Nuttall\\A Savage War Of Peace.mp3", "...\\A Small Colonial
+        # War.mp3") and so share a local folder; R:soul only ever moves the files it expects by
+        # name, so they don't disturb each other unless the names are the same.
+        own = self._own_transfers()
         try:
             for user_transfer in self.client.transfers.get_all_downloads():
+                peer = user_transfer.get("username", "?")
                 for directory in user_transfer.get("directories", []):
                     if directory.get("directory", "").split("\\")[-1] != leaf:
                         continue
                     for f in directory.get("files", []):
-                        if not str(f.get("state", "")).startswith("Completed"):
-                            clashes.add(f"{f.get('filename', '').split(chr(92))[-1]} (still downloading from {user_transfer.get('username', '?')})")
+                        if str(f.get("state", "")).startswith("Completed"):
+                            continue
+                        basename = f.get("filename", "").split("\\")[-1]
+                        if (peer, basename) in own and basename not in names:
+                            continue
+                        clashes.add(f"{basename} (still downloading from {peer})")
         except Exception as e:
             logger.warning(f"Could not check slskd's transfer list for clashing downloads: {e}")
 
         return sorted(clashes)
+
+    def _own_transfers(self) -> set:
+        """(peer, file name) of every file R:soul itself is downloading, from its saved tasks."""
+        own = set()
+        state = getattr(self.ctx, "state", None)
+        try:
+            for item in state.get_tasks_for_orchestrator() if state else []:
+                extra = item.get("extra") or {}
+                for f in extra.get("files", []):
+                    own.add((f.get("username") or extra.get("username"), str(f.get("filename", "")).split("\\")[-1]))
+        except Exception as e:
+            logger.debug(f"Could not read R:soul's own downloads from the state: {e}")
+        return own
 
     def discard(self, task: DownloadTask) -> None:
         """Move files a failed download left in the local folder (e.g. finished chapters)

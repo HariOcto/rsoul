@@ -28,8 +28,17 @@ def move_failed_import(src_path: str, base_dir: str = ""):
                   the parent directory of src_path.
     """
     try:
+        staging_parent = None
         if not base_dir:
-            base_dir = os.path.dirname(src_path)
+            # An audiobook is imported from <download_dir>/rsoul_audiobooks/<Author>/<Title>. Its
+            # failed imports belong in <download_dir>/failed_imports like all others, not in a
+            # failed_imports folder inside the staging area.
+            parts = os.path.normpath(src_path).split(os.sep)
+            if AUDIOBOOK_STAGING_DIR in parts[:-1]:
+                base_dir = os.sep.join(parts[: parts.index(AUDIOBOOK_STAGING_DIR)]) or os.sep
+                staging_parent = os.path.dirname(os.path.normpath(src_path))
+            else:
+                base_dir = os.path.dirname(src_path)
         failed_imports_dir = os.path.join(base_dir, "failed_imports")
         if not os.path.exists(failed_imports_dir):
             os.makedirs(failed_imports_dir)
@@ -46,6 +55,9 @@ def move_failed_import(src_path: str, base_dir: str = ""):
         if os.path.exists(src_path):
             shutil.move(src_path, target_path)
             logger.info(f"Failed import moved to: {target_path}")
+            # Don't leave an empty <Author> folder behind in the staging area
+            if staging_parent and os.path.isdir(staging_parent) and not os.listdir(staging_parent):
+                os.rmdir(staging_parent)
         else:
             logger.warning(f"Failed import source not found: {src_path}")
 

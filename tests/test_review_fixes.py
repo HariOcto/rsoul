@@ -300,7 +300,9 @@ def test_failed_import_folder_is_moved_locally(tmp_path):
     postprocess.monitor_imports(Client(), [{"id": 1}], "/chaptarr/dl", str(local))
 
     assert not book_dir.exists()
-    assert (local / "rsoul_audiobooks" / "Author" / "failed_imports" / "Title" / "01.mp3").exists()
+    # In <download_dir>/failed_imports like every other failed import, not inside the staging area
+    assert (local / "failed_imports" / "Title" / "01.mp3").exists()
+    assert not (local / "rsoul_audiobooks" / "Author").exists()
 
 
 # 9. Folders named without the series part of the title still match

@@ -176,7 +176,7 @@ class DownloadOrchestrator:
             DownloadTask if started, None if failed
         """
         # 1. Search
-        logger.info(f"Beginning search for: {target.author_name} - {target.book_title}")
+        logger.info(f"Beginning search for: {target.author_name} - {target.book_title} (book {target.book_id}, {target.media_type})")
         results = backend.search(target)
         if not results and getattr(backend, "found_but_unavailable", lambda book_id: False)(target.book_id):
             # Matches exist, but none could be used right now (peer not answering, local folder

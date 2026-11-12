@@ -302,7 +302,7 @@ class NoEditions:
 
 
 def wanted(*ids):
-    return [{"book": {"id": i, "title": f"Book {i}", "mediaType": "audiobook"}, "author": {"authorName": "Author"}} for i in ids]
+    return [{"book": {"id": i, "title": f"Book {i}"}, "author": {"authorName": "Author"}} for i in ids]
 
 
 def test_handoff_persists_unfinished_and_next_run_resumes_and_searches(clock, tmp_path, monkeypatch):

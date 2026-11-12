@@ -544,6 +544,11 @@ _NUMBER_WORD = re.compile(r"\d+(?:[snrt][tdh])?")
 _YEAR_WORD = re.compile(r"(?:1[89]|20)\d\d")
 
 
+def title_key(title: str) -> str:
+    """A title reduced to what makes it the same title: case, punctuation and "&" / "and" aside."""
+    return normalize_for_matching((title or "").replace("&", " and "))
+
+
 def book_narrators(book: Dict[str, Any]) -> List[str]:
     """Narrator names Chaptarr reports for a book (none for ebooks, or when it knows none)."""
     names: List[str] = []
@@ -774,6 +779,11 @@ def audiobook_folder_match(
         # The fuzzy score reads "Author - Title - Narrator" as author, then a title it doesn't
         # know. Where Chaptarr names the narrators, score the name without them as well.
         names = list(dict.fromkeys(names + [without_narrators(name, narrators) for name in names]))
+        # A name without the author ("Cry Wolf (Empire's Corps 15).mp3" in the author's folder)
+        # is too short for the fuzzy score, which expects "Title - Author" and wants two words
+        # in common. The author is established by now (author_in_name on the path), so the
+        # score is also taken with the author in front; it then measures the title alone.
+        names += [f"{author_name} - {name}" for name in names if author_name and not author_in_name(author_name, name)]
         best = None
         for name in names:
             for title in titles:
@@ -811,8 +821,12 @@ def audiobook_folder_match(
 
     for (directory, ext), files in groups.items():
         if is_disc_folder(directory):
-            logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
-            note("disc/part folders", directory)
+            if author_in_name(author_name, directory):
+                logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
+                note("disc/part folders", directory)
+            else:
+                # Somebody else's "CD2" (broad fallback searches bring in music): not worth a log line
+                note("folders without the author's surname", directory)
             continue
 
         # Was it the folder that matched, or only the names of files inside it? Files named

@@ -67,7 +67,7 @@ def get_books(ctx: "Context", search_source: str, search_type: str, page_size: i
     elif search_type == "incrementing_page":
         last_page = max(1, math.ceil(total_wanted / page_size))
         # (a dry run only reads the counter; it doesn't create or repair the file either)
-        page = get_current_page(current_page_file_path) if advance_page or os.path.exists(current_page_file_path) else 1
+        page = get_current_page(current_page_file_path, repair=advance_page)
         if page > last_page:
             page = 1  # the list got shorter since the last run: don't waste a run on an empty page
         try:

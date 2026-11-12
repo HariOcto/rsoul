@@ -7,9 +7,15 @@ normal run does up to the point of queueing: it fetches the wanted list, searche
 and lists candidate folders on the peers' shares. Then it writes down, per book, what it
 would have downloaded and what it turned away, and stops.
 
-Nothing is changed: no download is queued, no saved download is resumed or dropped, nothing
-is imported, no book is unmonitored, no peer is recorded as failed, and the page counter of
-search_type = incrementing_page stays where it is (so the next real run sees the same books).
+It is a search preview that downloads nothing: no download is queued, no saved download is
+resumed or dropped, nothing is imported, no book is unmonitored, no peer is recorded as
+failed, and the page counter and the saved-download file are only read (a damaged one is
+reported, not repaired). What it does write: the report, the lock file and health.json
+(as "last_dry_run"; the record of the last real run stays).
+
+Two ways it differs from the next real run: searches on Soulseek give different answers at
+different times, and with monitor_window = 0 a real run that still has saved downloads
+resumes those and does not search for new books at all (the report says so).
 """
 
 import logging
@@ -62,10 +68,20 @@ def _describe_choice(target: DownloadTarget, result: SearchResult) -> List[str]:
 def _describe_notes(notes: Dict[str, Any], chosen: List[SearchResult]) -> List[str]:
     """What the audiobook matcher considered besides the choice, and what it turned away."""
     lines: List[str] = []
-    picked = {(r.username, r.extra.get("file_dir")) for r in chosen}
+    skipped = notes.get("skipped") or []
+    if skipped:
+        lines.append(f"  matching folders that could not be used ({len(skipped)}):")
+        for skip in skipped[:MAX_LISTED]:
+            lines.append(f"    {skip['username']}: {skip['directory']}  [{skip['extension']}]")
+            lines.append(f"      -> {skip['reason']}" + ("  (may work on a later run)" if skip["temporary"] else ""))
+        if len(skipped) > MAX_LISTED:
+            lines.append(f"    ... and {len(skipped) - MAX_LISTED} more")
+    if notes.get("not_tried"):
+        lines.append(f"  {notes['not_tried']} more matching folder(s) were not looked at (audiobook_browse_limit)")
+    picked = {(r.username, r.extra.get("file_dir")) for r in chosen} | {(skip["username"], skip["directory"]) for skip in skipped}
     others = [c for c in notes.get("candidates", []) if (c["username"], c["directory"]) not in picked]
     if others:
-        lines.append(f"  other matching folders ({len(others)}), in the order they would be tried:")
+        lines.append(f"  other matching folders ({len(others)}), not looked into; they would be tried in this order:")
         for c in others[:MAX_LISTED]:
             how = "file names" if c["file_based"] else "folder name"
             lines.append(f"    {c['score']:.2f}  {c['username']}: {c['directory']}  [{c['extension']}, matched on {how}]")
@@ -91,15 +107,20 @@ def _describe_notes(notes: Dict[str, Any], chosen: List[SearchResult]) -> List[s
     return lines
 
 
-def run_dry_run(ctx: "Context", targets: List[DownloadTarget]) -> Dict[str, int]:
-    """Search for each target and report the outcome. Returns counts for the run summary."""
+def run_dry_run(ctx: "Context", targets: List[DownloadTarget], remarks: List[str] = ()) -> Dict[str, int]:
+    """Search for each target and report the outcome. Returns counts for the run summary.
+
+    remarks: lines for the top of the report (e.g. how the next real run will differ)."""
     orchestrator = ctx.orchestrator
     report: List[str] = [
         f"R:soul dry run, {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        "Nothing was downloaded, imported or changed. Check each WOULD DOWNLOAD entry: is it the right",
-        "book, and all of it? Check the folders that were turned away: should one of them have matched?",
+        "Nothing was downloaded or imported. Check each WOULD DOWNLOAD entry: is it the right book,",
+        "and all of it? Check the folders that were turned away: should one of them have matched?",
+        *(f"NOTE: {remark}" for remark in remarks),
         "",
     ]
+    for remark in remarks:
+        logger.warning(remark)
     would_download = nothing = not_searched = 0
     batch_delay = ctx.config.getfloat("General", "batch_delay", fallback=3.0)
 
@@ -137,6 +158,11 @@ def run_dry_run(ctx: "Context", targets: List[DownloadTarget]) -> Dict[str, int]
             if not target.is_audiobook and len(results) > 1:
                 entry.append(f"  other matching files ({len(results) - 1}), tried in this order if the first can't be started:")
                 entry.extend(f"    {r.username}: {r.filename} ({_mb(r.size_bytes)})" for r in results[1:MAX_LISTED])
+        elif searched and notes.get("skipped"):
+            nothing += 1
+            usable_later = any(skip["temporary"] for skip in notes["skipped"]) or notes.get("not_tried")
+            entry.append("  NOTHING WOULD BE DOWNLOADED: matching folders were found, but none could be used")
+            entry.append("    (the book stays wanted: a later run may succeed)" if usable_later else "    (counts as not found)")
         elif searched:
             nothing += 1
             entry.append("  NOTHING WOULD BE DOWNLOADED: no file or folder matched")

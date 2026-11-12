@@ -178,6 +178,10 @@ class DownloadOrchestrator:
         # 1. Search
         logger.info(f"Beginning search for: {target.author_name} - {target.book_title}")
         results = backend.search(target)
+        if not results and getattr(backend, "found_but_unavailable", lambda book_id: False)(target.book_id):
+            # Matches exist, but none could be used right now (peer not answering, local folder
+            # in use): the book was found, just not started
+            self._found_results = True
         if not results:
             logger.info(f"No results from {backend.name} for: {target.book_title}")
             return None

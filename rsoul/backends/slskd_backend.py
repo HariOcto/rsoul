@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..config import Context
 
 from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
-from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number
+from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number, books_in_folder, missing_parts
 from ..media import AUDIO_EXTENSIONS
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
@@ -341,33 +341,63 @@ class SlskdBackend(DownloadBackend):
         # Candidates are browsed lazily, best first: search() gets the first usable one, and
         # download() asks for the next only if that one can't be started. Each browse is a slow
         # round trip to the peer, so none is made before it is needed.
-        self.search_notes[target.book_id] = {
-            "candidates": [
-                {"username": u, "directory": m["directory"], "extension": m["extension"], "score": m["score"], "file_based": bool(m.get("file_based")), "files_found": len(m["files"])}
-                for u, m in candidates
-            ],
-            "stats": dict(stats),
-            "rejected": rejected,
-        }
-        usable = self._usable_audiobook_results(target, candidates[:browse_limit], min_size_bytes)
+        notes = self.search_notes.setdefault(target.book_id, {"candidates": [], "stats": {}, "rejected": [], "skipped": [], "not_tried": 0})
+        listed = {(c["username"], c["directory"], c["extension"]) for c in notes["candidates"]}
+        for u, m in candidates:
+            if (u, m["directory"], m["extension"]) not in listed:
+                notes["candidates"].append(
+                    {"username": u, "directory": m["directory"], "extension": m["extension"], "score": m["score"], "file_based": bool(m.get("file_based")), "files_found": len(m["files"])}
+                )
+        # Fallback queries mostly bring back the same folders: count them once
+        for reason, count in stats.items():
+            notes["stats"][reason] = max(notes["stats"].get(reason, 0), count)
+        notes["rejected"].extend(entry for entry in rejected if entry not in notes["rejected"])
+        # Folders already looked into for an earlier query of this search are not listed again
+        tried = {(skip["username"], skip["directory"], skip["extension"]) for skip in notes["skipped"]}
+        candidates = [(u, m) for u, m in candidates if (u, m["directory"], m["extension"]) not in tried]
+        # Matching folders beyond the browse limit are never looked at: not proof of anything
+        notes["not_tried"] = max(len(candidates) - browse_limit, 0)
+
+        usable = self._usable_audiobook_results(target, target_dict, candidates[:browse_limit], min_size_bytes)
         first = next(usable, None)
         if first is None:
             return []
         self._alternates[target.book_id] = usable
         return [first]
 
-    def _usable_audiobook_results(self, target: DownloadTarget, candidates: List[Tuple[str, Dict[str, Any]]], min_size_bytes: int):
-        """Yield a SearchResult for each candidate whose complete file list could be fetched."""
+    def found_but_unavailable(self, book_id: int) -> bool:
+        """After a search without results: were there matches that just couldn't be used right now?
+
+        True if a matching folder couldn't be listed (peer offline or busy), its local folder
+        was in use, or it was never looked at (browse limit). Such a book is still out there;
+        only a search where nothing matched, or every match was unsuitable for good, says
+        "not found".
+        """
+        notes = self.search_notes.get(book_id) or {}
+        return bool(notes.get("not_tried")) or any(skip["temporary"] for skip in notes.get("skipped", []))
+
+    def _usable_audiobook_results(self, target: DownloadTarget, target_dict: Dict[str, Any], candidates: List[Tuple[str, Dict[str, Any]]], min_size_bytes: int):
+        """Yield a SearchResult for each candidate that is, as far as its file list shows, the
+        complete book and can be downloaded now. Why the others were passed over is noted in
+        search_notes (temporary: the reason may be gone on the next run)."""
+        notes = self.search_notes.setdefault(target.book_id, {"candidates": [], "stats": {}, "rejected": [], "skipped": [], "not_tried": 0})
+
         for username, match in candidates:
             directory = match["directory"]
             ext = match["extension"]
             file_based = bool(match.get("file_based"))
 
+            def skip(reason: str, temporary: bool = False, label: str = "") -> None:
+                logger.info(f"Skipping {label or directory or '(share root)'} from {username}: {reason}")
+                entry = {"username": username, "directory": directory, "extension": ext, "reason": reason, "temporary": temporary}
+                if entry not in notes["skipped"]:
+                    notes["skipped"].append(entry)
+
             browsed = self._browse_directory(username, directory) if directory else None
             if browsed is None:
                 # Search results list only the files that matched the query, so without the full
                 # listing we can't know the book is complete. Try the next candidate instead.
-                logger.info(f"Skipping {directory or '(share root)'} from {username}: could not list the full folder")
+                skip("could not list the full folder (peer offline or busy)", temporary=True)
                 continue
 
             files = [
@@ -377,31 +407,48 @@ class SlskdBackend(DownloadBackend):
                 # Only this folder's own files, not ones from subfolders
                 and split_slskd_path(f["filename"])[0] == directory
             ]
+            names = [split_slskd_path(f["filename"])[1] for f in files]
             if file_based:
                 # The files' own names matched, not the folder's: the folder may be a whole library
                 # ("Audiobooks", an author folder). Take the files that share the matched name,
                 # i.e. the one file of a single-file book or every chapter of
                 # "Author - Title - 01.mp3", "... - 02.mp3", and nothing else.
                 matched = [split_slskd_path(f["filename"])[1] for f in match["files"]]
-                own = set(same_book_files(matched, [split_slskd_path(f["filename"])[1] for f in files]))
+                own = set(same_book_files(matched, names))
                 files = [f for f in files if split_slskd_path(f["filename"])[1] in own]
             elif files and self._chapters_in_other_formats(directory, ext, files, browsed):
                 # "01.mp3" next to "02.m4a": this format alone is not the whole book
-                logger.info(f"Skipping {directory} from {username}: its chapters are spread over several audio formats")
+                skip("its chapters are spread over several audio formats")
                 continue
+            elif files:
+                # A folder named after the book can still be a shelf of several books
+                verdict, own_files = books_in_folder(target_dict, [(name, f["size"]) for name, f in zip(names, files)])
+                if verdict == "several":
+                    skip("its files look like several other books, none of them this one")
+                    continue
+                if verdict == "own":
+                    files = [f for f in files if split_slskd_path(f["filename"])[1] in set(own_files)]
+                    file_based = True
             if not files:
+                skip(f"no {ext} files of this book in the folder listing")
                 continue
 
             files.sort(key=lambda f: f["filename"].lower())
             total_size = sum(f["size"] for f in files)
             label = f"{files[0]['filename']} (+{len(files) - 1} more)" if file_based else directory
+
+            missing = missing_parts([split_slskd_path(f["filename"])[1] for f in files])
+            if missing:
+                skip(f"incomplete ({missing})", label=label)
+                continue
+
             if total_size < min_size_bytes:
-                logger.info(f"Skipping {label} from {username}: {total_size / 1048576:.1f} MB is below audiobook_min_size_mb")
+                skip(f"{total_size / 1048576:.1f} MB is below audiobook_min_size_mb", label=label)
                 continue
 
             if self._local_clashes(directory, files):
                 # download() would refuse these files; the next candidate may be fine
-                logger.info(f"Skipping {label} from {username}: its local download folder is in use")
+                skip("its local download folder is in use", temporary=True, label=label)
                 continue
 
             logger.info(f"Audiobook candidate: {label} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")

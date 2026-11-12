@@ -157,7 +157,8 @@ def main():
         history_manager = HistoryManager(config_dir)
 
         # Initialize State Manager for resume functionality
-        state_manager = StateManager(config_dir)
+        dry_run = is_dry_run(config, args.dry_run)
+        state_manager = StateManager(config_dir, read_only=dry_run)
 
         # Initialize Context
         ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir, history=history_manager, state=state_manager)
@@ -171,7 +172,7 @@ def main():
         else:
             logger.warning("No backends available - downloads will fail")
 
-        if is_dry_run(config, args.dry_run):
+        if dry_run:
             return _dry_run(ctx, search_sources, search_type, page_size)
 
         # Check if we have saved state to resume (downloads, or imports awaiting confirmation)
@@ -272,7 +273,11 @@ def _dry_run(ctx, search_sources, search_type, page_size) -> int:
         console.print("No releases wanted. Nothing to check!", style="blue")
         return EXIT_OK
 
-    LAST_RUN.update(dry_run=run_dry_run(ctx, build_targets(ctx, download_targets)))
+    remarks = []
+    saved = [item for item in (ctx.state.get_tasks_for_orchestrator() if ctx.state else []) if not item.get("extra", {}).get("import_pending")]
+    if saved and ctx.config.getint("Download Settings", "monitor_window", fallback=0) == 0:
+        remarks.append(f"{len(saved)} saved download(s) are waiting to be resumed. With monitor_window = 0, the next real run resumes them and does not search for new books; this report shows the run after that.")
+    LAST_RUN.update(dry_run=run_dry_run(ctx, build_targets(ctx, download_targets), remarks))
     return EXIT_OK
 
 
@@ -294,7 +299,9 @@ def _main_with_status() -> int:
         },
     }
     if "dry_run" in LAST_RUN:
-        details["last_dry_run"] = LAST_RUN["dry_run"]
+        # A dry run is not a run: the record of the last real one (and of its success) stays
+        health.write_status("idle", last_dry_run=dict(LAST_RUN["dry_run"], ended_at=time.time()))
+        return code
     if code == EXIT_OK:
         details["last_success_at"] = details["last_run_ended_at"]
     health.write_status("idle", **details)

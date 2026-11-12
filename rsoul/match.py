@@ -1,7 +1,7 @@
 import difflib
 import logging
 import re
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Tuple
 from .display import print_match_details
 from .utils import normalize_for_matching, title_contained_in_filename, jaccard_similarity, length_ratio, extract_author_title, STOP_WORDS
 
@@ -366,6 +366,92 @@ def same_book_files(matched: List[str], basenames: List[str]) -> List[str]:
     return sure
 
 
+# Words that name a chapter rather than a work of its own
+_CHAPTER_WORDS = {
+    "chapter", "chap", "ch", "part", "pt", "track", "cd", "disc", "disk", "kapitel", "teil", "prologue", "epilogue", "prolog", "epilog",
+    "intro", "introduction", "preface", "foreword", "afterword", "credits", "opening", "closing", "end", "book",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+}
+# From this size on, a single file is taken for a whole book rather than a chapter
+BOOK_SIZED_BYTES = 100 * 1024 * 1024
+_OF_TOTAL = re.compile(r"(?<!\d)(\d{1,3})\s*(?:of|von|/)\s*(\d{1,3})(?!\d)", re.IGNORECASE)
+
+
+def books_in_folder(target: Dict[str, Any], files: List[Tuple[str, int]]) -> Tuple[str, List[str]]:
+    """Decide what a folder named after the wanted book really holds.
+
+    A folder called "Dune" is usually the book as chapters. It can also be the author's shelf
+    for the series: "Dune.m4b", "Dune Messiah.m4b", "Children of Dune.m4b". The file names and
+    sizes tell the two apart (files: (basename, size) of the folder's audio files).
+
+    Returns:
+        ("folder", [])     the folder is the book: take every file (chapters).
+        ("own", names)     one or more book-sized files carry the title themselves and the
+                           others are named differently: only those files are the book.
+        ("several", [])    no file carries the title, and the files are book-sized and named
+                           differently from each other: several other books, not this one.
+    """
+    if len(files) < 2:
+        return "folder", []
+    author_name = target["author"]["authorName"]
+    series_title = target["book"].get("seriesTitle") or ""
+    titles = title_variants(target["book"]["title"])
+    known = set(normalize_for_matching(author_name).split()) | _FORMAT_NOISE | _CHAPTER_WORDS
+    for title in titles:
+        known |= set(_meaningful_words(title))
+
+    def carries_title(basename: str) -> bool:
+        if names_another_release(target["book"]["title"], basename, author_name, series_title):
+            return False
+        return any(title_segment_match(title, name, author_name, series_title) for name in file_name_candidates(basename) for title in titles)
+
+    def own_name(basename: str) -> bool:
+        words = _meaningful_words(clean_audiobook_name(strip_part_numbers(_stem(basename))))
+        return any(w not in known and not _NUMBER_WORD.fullmatch(w) for w in words)
+
+    sizes = dict(files)
+    own = [name for name, _ in files if carries_title(name)]
+    others = [name for name, _ in files if name not in own and own_name(name)]
+    if own and others and all(sizes[name] >= BOOK_SIZED_BYTES for name in own):
+        return "own", same_book_files(own, [name for name, _ in files])
+    if not own and len({book_key(name) for name in others}) >= 2 and len(others) == len(files) and all(sizes[name] >= BOOK_SIZED_BYTES for name in others):
+        return "several", []
+    return "folder", []
+
+
+def missing_parts(basenames: List[str]) -> Optional[str]:
+    """Say what is missing if the files' own numbering shows the book is incomplete, else None.
+
+    Listing a folder shows everything the peer has, not everything the book has: a lone
+    "Title - Part 2 of 4" or chapters 02 and 03 without 01 are complete listings of an
+    incomplete book. Only plain numberings are judged (every file numbered, below 100).
+    """
+    stems = [_stem(name) for name in basenames]
+    totals = [(int(n), int(total)) for n, total in (found.groups() for found in (_OF_TOTAL.search(stem) for stem in stems) if found)]
+    if totals:
+        total = max(t for _, t in totals)
+        missing = sorted(set(range(1, total + 1)) - {n for n, _ in totals})
+        if missing and total < 100:
+            return f"part {', '.join(map(str, missing))} of {total} missing"
+        return None
+    if len(stems) == 1:
+        # A number in front is the book's place in a series ("02 Golden Son"); only one set
+        # apart at the end says "this is part N"
+        found = _TRAILING_EVIDENT.search(stems[0])
+        number = int(found.group("n")) if found else None
+        return f"only part {number} is there" if number is not None and number > 1 else None
+    numbers = [part_number(name) for name in basenames]
+    if any(n is None or n >= 100 for n in numbers):
+        return None
+    first, last = min(numbers), max(numbers)
+    if first > 1:
+        return f"the numbering starts at {first}"
+    missing = sorted(set(range(max(first, 1), last + 1)) - set(numbers))
+    if missing:
+        return f"number {', '.join(map(str, missing[:5]))}{'...' if len(missing) > 5 else ''} missing"
+    return None
+
+
 def file_name_candidates(basename: str) -> List[str]:
     """Names to match a book's own file on: with and without part numbers and release noise."""
     stem = _stem(basename)
@@ -429,7 +515,14 @@ _BOOK_WORDS = {"book", "bk", "vol", "volume"}
 # Words about a series or collection. In front of the title they are a prefix ("Salvation
 # Sequence 1 Salvation"); behind it they describe something bigger than the one book
 # ("Red Rising Trilogy", "Dune Saga").
-_SERIES_NOISE = {"books", "part", "series", "sequence", "saga", "cycle", "trilogy", "complete"}
+_COLLECTION_WORDS = {
+    "books", "series", "sequence", "saga", "cycle", "complete", "collection", "omnibus", "boxset", "anthology",
+    "duology", "trilogy", "tetralogy", "quartet", "quintet",
+}
+_SERIES_NOISE = _COLLECTION_WORDS | {"part"}
+# "Books 1-6", "Vol. 1 & 2", "#1-3": several books in one
+_BOOK_RANGE = re.compile(r"(?:\bbooks?|\bbks?|\bvols?|\bvolumes?|#)\.?\s*\d+\s*(?:[-–&+,]|\bto\b|\band\b|\bbis\b|\bund\b)\s*\d+", re.IGNORECASE)
+_BRACKET_CONTENT = re.compile(r"\[([^\]]*)\]|\(([^)]*)\)|\{([^}]*)\}")
 # A segment that starts like this names the narrator, not another book
 _NARRATOR_LEAD = {"read", "narrated", "performed", "narrator", "gelesen"}
 
@@ -472,6 +565,33 @@ def _check_trailing(words: List[str], allowed: set, series_words: set, positions
     return seen
 
 
+def names_another_release(title: str, raw_name: str, author_name: str = "", series_title: str = "") -> bool:
+    """True if a name, read as the peer wrote it, says "not this single book".
+
+    This must see the name before brackets and release details are stripped from it, because
+    that is where the evidence usually sits (clean_audiobook_name would turn "Red Rising
+    (Books 1-6)" into a perfect "Red Rising"):
+
+    - another position in the series, where Readarr/Chaptarr gave this book's: "(Book 2)", "#2";
+    - several books in one: "Books 1-6", "Vol. 1 & 2";
+    - a bracket that says collection and nothing else: "[Complete Series]", "(Trilogy)",
+      "(Box Set)". A bracket naming the series with this book's number ("(Red Rising Saga
+      #1)") or holding anything else ("(Unabridged)", "(2014)", "[Tim Gerard Reynolds]") is fine.
+    """
+    positions = series_positions(series_title)
+    if positions and any(int(n) not in positions for n in _BOOK_NUMBER.findall(raw_name)):
+        return True
+    if _BOOK_RANGE.search(raw_name):
+        return True
+    known = set(_meaningful_words(title)) | set(normalize_for_matching(author_name).split()) | set(_meaningful_words(series_title)) | _FORMAT_NOISE
+    for groups in _BRACKET_CONTENT.findall(raw_name):
+        content = next((g for g in groups if g), "")
+        words = {w for w in _meaningful_words(content) if w not in known and not _NUMBER_WORD.fullmatch(w)}
+        if words and words <= _COLLECTION_WORDS | {"box", "set"} and not _BOOK_NUMBER.search(content):
+            return True
+    return False
+
+
 def title_segment_match(title: str, candidate: str, author_name: str = "", series_title: str = "") -> bool:
     """True if the name says this title, and nothing in it says a different book.
 
@@ -495,10 +615,10 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
     if not title_words:
         return True
 
-    positions = series_positions(series_title)
-    if positions and any(int(n) not in positions for n in _BOOK_NUMBER.findall(candidate)):
+    if names_another_release(title, candidate, author_name, series_title):
         return False
 
+    positions = series_positions(series_title)
     name = candidate
     if " " not in name.strip():
         name = re.sub(r"[-_.]+", " ", name)  # "Marko-Kloos-Lines-of-Departure-Unabr"
@@ -649,6 +769,10 @@ def audiobook_folder_match(
         # score: series folders are often named after their first book ("Foundation\\Second
         # Foundation"), so a parent that matches says nothing about this folder.
         leaf = directory.split("\\")[-1]
+        if names_another_release(book_title, leaf, author_name, series_title):
+            # Judged on the name as written: stripping its brackets would hide the evidence
+            note("folders for a different title", directory)
+            continue
         leaf_names = [name for name in dict.fromkeys((leaf, clean_audiobook_name(leaf))) if name]
         if any(title_segment_match(title, name, author_name, series_title) for name in leaf_names for title in titles):
             # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
@@ -676,6 +800,9 @@ def audiobook_folder_match(
             basename = split_slskd_path(book_files[0]["filename"])[1]
             if not author_in_name(author_name, directory + " " + basename):
                 reasons.add("author")
+                continue
+            if names_another_release(book_title, basename, author_name, series_title):
+                reasons.add("title")
                 continue
             score = best_score_for(file_name_candidates(basename))
             if score is None:

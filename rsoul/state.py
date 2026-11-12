@@ -25,12 +25,15 @@ STATE_FILENAME = "grab_list_state.json"
 class StateManager:
     """Manages persistence of grab_list for resume functionality."""
 
-    def __init__(self, config_dir: str):
+    def __init__(self, config_dir: str, read_only: bool = False):
         """Initialize StateManager.
 
         Args:
             config_dir: Directory to store state file
+            read_only: Only read the file (dry run): a damaged file is reported but neither
+                moved aside nor copied, and nothing is ever saved
         """
+        self.read_only = read_only
         self.filepath = Path(config_dir) / STATE_FILENAME
         self.items: List[Dict[str, Any]] = []
         # Imports finish on a background thread while the monitoring thread handles failures;
@@ -119,6 +122,8 @@ class StateManager:
 
     def _keep_damaged_copy(self, move: bool) -> str:
         """Set the damaged state file aside for troubleshooting. Returns its new name ("" on failure)."""
+        if self.read_only:
+            return ""
         target = self.filepath.with_name(f"{self.filepath.name}.damaged-{time.strftime('%Y%m%d-%H%M%S')}")
         try:
             if move:
@@ -132,6 +137,8 @@ class StateManager:
 
     def _save(self) -> None:
         """Atomic write to disk using temp file + rename."""
+        if self.read_only:
+            return
         with self._lock:
             try:
                 temp_path = self.filepath.with_suffix(".tmp")
@@ -261,7 +268,7 @@ class StateManager:
         """Clear all state and delete file."""
         with self._lock:
             self.items = []
-            if self.filepath.exists():
+            if self.filepath.exists() and not self.read_only:
                 self.filepath.unlink()
                 logger.info("State file deleted - all items processed")
 

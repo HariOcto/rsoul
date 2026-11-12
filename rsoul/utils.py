@@ -15,9 +15,9 @@ def is_docker():
     return os.getenv("IN_DOCKER") is not None
 
 
-def get_current_page(path: str, default_page=1) -> int:
+def get_current_page(path: str, default_page=1, repair: bool = True) -> int:
     """The page to fetch next. A missing, empty or damaged page file starts again at page 1
-    instead of stopping every run with an error."""
+    instead of stopping every run with an error. repair=False (dry run) only reads."""
     try:
         with open(path, "r") as file:
             page = int(file.read().strip())
@@ -25,7 +25,8 @@ def get_current_page(path: str, default_page=1) -> int:
             return page
     except (OSError, ValueError):
         pass
-    update_current_page(path, default_page)
+    if repair:
+        update_current_page(path, default_page)
     return default_page
 
 

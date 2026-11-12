@@ -21,23 +21,38 @@ logger = logging.getLogger(__name__)
 _CACHE_KEY = "author_titles"
 
 
-def _author_titles(ctx: "Context", author_id: Any) -> List[str]:
-    """Titles of all books Readarr/Chaptarr lists for the author; [] if they can't be fetched."""
-    cache: Dict[Any, List[str]] = ctx.stats.setdefault(_CACHE_KEY, {}) if isinstance(ctx.stats, dict) else {}
+def _author_books(ctx: "Context", author_id: Any) -> Dict[str, List[str]]:
+    """Titles and series of all books Readarr/Chaptarr lists for the author; empty lists if
+    they can't be fetched."""
+    cache: Dict[Any, Dict[str, List[str]]] = ctx.stats.setdefault(_CACHE_KEY, {}) if isinstance(ctx.stats, dict) else {}
     if author_id in cache:
         return cache[author_id]
-    titles: List[str] = []
+    found: Dict[str, List[str]] = {"titles": [], "series": []}
     try:
         books = ctx.readarr._get("book", ctx.readarr.ver_uri, params={"authorId": author_id})
         for book in books if isinstance(books, list) else []:
-            title = book.get("title") if isinstance(book, dict) else None
             # Only this author's: a server that ignores the filter would hand back everything
-            if isinstance(title, str) and title.strip() and book.get("authorId", author_id) == author_id and title not in titles:
-                titles.append(title)
+            if not isinstance(book, dict) or book.get("authorId", author_id) != author_id:
+                continue
+            for key, value in (("titles", book.get("title")), ("series", book.get("seriesTitle"))):
+                if isinstance(value, str) and value.strip() and value not in found[key]:
+                    found[key].append(value)
     except Exception as e:
         logger.debug(f"Could not fetch the other books of author {author_id}: {e}")
-    cache[author_id] = titles
-    return titles
+    cache[author_id] = found
+    return found
+
+
+def author_series(ctx: "Context", book: Dict[str, Any]) -> List[str]:
+    """The series of the author's books as Readarr/Chaptarr labels them ("Red Rising Saga #1").
+
+    Album tags often hold the series rather than the book. Knowing the author's series tells
+    such an album ("Red Rising" on the files of "Golden Son") from the name of another book.
+    """
+    author_id = book.get("authorId")
+    if not author_id or not getattr(ctx, "readarr", None):
+        return []
+    return list(_author_books(ctx, author_id)["series"])
 
 
 def sibling_titles(ctx: "Context", book: Dict[str, Any], author_name: str = "") -> List[str]:
@@ -52,7 +67,7 @@ def sibling_titles(ctx: "Context", book: Dict[str, Any], author_name: str = "") 
         return []
     own = title_variants(title)
     siblings = []
-    for other in _author_titles(ctx, author_id):
+    for other in _author_books(ctx, author_id)["titles"]:
         same_book = any(title_segment_match(variant, other, author_name) for variant in own) or any(title_segment_match(variant, title, author_name) for variant in title_variants(other))
         if not same_book:
             siblings.append(other)

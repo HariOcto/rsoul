@@ -92,10 +92,9 @@ def test_files_without_tags_or_audio_give_no_tags(tmp_path):
         ("Red Rising (Red Rising Saga #1)", "Red Rising", "Red Rising Saga #1", [], AGREE),
         # Clearly another book
         ("Dune Messiah", "Dune", "", ["Dune Messiah", "Children of Dune"], MISMATCH),
-        ("Golden Son", "Red Rising", "Red Rising Saga #1", [], MISMATCH),
+        ("Golden Son", "Red Rising", "Red Rising Saga #1", ["Golden Son"], MISMATCH),
         ("Red Rising (Books 1-3)", "Red Rising", "", [], MISMATCH),
         ("Red Rising, Book 2", "Red Rising", "Red Rising Saga #1", [], MISMATCH),
-        ("Der Wüstenplanet", "Dune", "", [], MISMATCH),  # another edition, by its own account
         # Not clear enough to turn a download away
         ("Dune Messiah", "Dune", "", [], UNCLEAR),  # without Chaptarr's list it could be a subtitle
         ("Dune Disc 1", "Dune", "", [], UNCLEAR),
@@ -103,6 +102,8 @@ def test_files_without_tags_or_audio_give_no_tags(tmp_path):
         ("The Stormlight Archive", "The Way of Kings", "The Stormlight Archive #1", [], UNCLEAR),  # the series as album
         ("Frank Herbert", "Dune", "", [], UNCLEAR),
         ("Unknown Album", "Dune", "", [], UNCLEAR),
+        ("Golden Son", "Red Rising", "Red Rising Saga #1", [], UNCLEAR),  # not a book Chaptarr lists: no proof
+        ("Der Wüstenplanet", "Dune", "", [], UNCLEAR),  # a title in another language
     ],
 )
 def test_what_a_tag_says_about_the_book(text, title, series, siblings, verdict):
@@ -118,8 +119,8 @@ def test_sibling_does_not_overrule_the_wanted_title():
 def test_single_file_may_carry_the_book_in_either_tag(tmp_path):
     ok = audio_file(tmp_path / "a" / "book.m4b", album="Dune Chronicles", title="Dune")
     assert check_audiobook_tags([ok], "Dune", HERBERT)[0] == AGREE
-    wrong = audio_file(tmp_path / "b" / "book.m4b", album="Golden Son", title="Golden Son")
-    verdict, detail = check_audiobook_tags([wrong], "Red Rising", BROWN)
+    wrong = audio_file(tmp_path / "b" / "book.m4b", album="Golden Son")
+    verdict, detail = check_audiobook_tags([wrong], "Red Rising", BROWN, "Red Rising Saga #1", siblings=["Golden Son"])
     assert verdict == MISMATCH and "album tag of book.m4b" in detail and "Golden Son" in detail
 
 
@@ -130,7 +131,8 @@ def test_chapters_are_judged_by_their_album_not_their_chapter_titles(tmp_path):
 
 def test_one_file_of_another_book_is_enough(tmp_path):
     paths = [audio_file(tmp_path / f"{i:02d}.mp3", album="Golden Son" if i == 5 else "Red Rising") for i in range(1, 6)]
-    assert check_audiobook_tags(paths, "Red Rising", BROWN)[0] == MISMATCH
+    assert check_audiobook_tags(paths, "Red Rising", BROWN, "Red Rising Saga #1", siblings=["Golden Son"])[0] == MISMATCH
+    assert check_audiobook_tags(paths, "Red Rising", BROWN)[0] == AGREE  # not a known book: the other files decide
 
 
 def test_untagged_and_vague_downloads_are_not_a_mismatch(tmp_path):
@@ -150,6 +152,7 @@ class Chaptarr:
     def __init__(self, book=None, author_books=(), takes_files=True):
         self.book = book or {}
         self.author_books = list(author_books)
+        self.author_series = {}  # title -> seriesTitle of the author's other books
         self.takes_files = takes_files
         self.commands = []
         self.ver_uri = "/api/v1"
@@ -159,7 +162,7 @@ class Chaptarr:
 
     def _get(self, path, ver_uri="", params=None):
         assert path == "book" and params == {"authorId": self.book.get("authorId")}
-        return [{"title": t, "authorId": self.book.get("authorId")} for t in self.author_books]
+        return [{"title": t, "authorId": self.book.get("authorId"), "seriesTitle": self.author_series.get(t, "")} for t in self.author_books]
 
     def post_command(self, name, **kwargs):
         self.commands.append(kwargs["path"])
@@ -188,8 +191,12 @@ def run_import(tmp_path, album, title="Red Rising", author=BROWN, chaptarr=None,
     return postprocess.process_imports(ctx, [item]), chaptarr, history, local
 
 
+def red_rising_chaptarr():
+    return Chaptarr(book={"authorId": 3, "title": "Red Rising", "seriesTitle": "Red Rising Saga #1"}, author_books=["Red Rising", "Golden Son", "Morning Star"])
+
+
 def test_download_tagged_as_another_book_is_not_imported(tmp_path):
-    result, chaptarr, history, local = run_import(tmp_path, album="Golden Son")
+    result, chaptarr, history, local = run_import(tmp_path, album="Golden Son", chaptarr=red_rising_chaptarr())
 
     assert result == {7: False}
     assert chaptarr.commands == []  # never handed to Chaptarr
@@ -214,7 +221,7 @@ def test_untagged_or_vague_download_is_imported(tmp_path, album):
 
 
 def test_other_book_of_the_author_is_recognised_from_chaptarrs_list(tmp_path):
-    chaptarr = Chaptarr(book={"authorId": 3, "title": "Dune"}, author_books=["Dune", "Dune Messiah", "Children of Dune"])
+    chaptarr = Chaptarr(book={"authorId": 3, "title": "Dune", "seriesTitle": "Dune #1"}, author_books=["Dune", "Dune Messiah", "Children of Dune"])
     result, chaptarr, history, _ = run_import(tmp_path, album="Dune Messiah", title="Dune", author=HERBERT, chaptarr=chaptarr)
     assert result == {7: False}
     assert chaptarr.commands == []
@@ -229,7 +236,7 @@ def test_series_position_from_chaptarr_is_used(tmp_path):
 
 @pytest.mark.parametrize("setting", [{"audiobook_tag_check": "warn"}, {"audiobook_tag_check": "off"}, {"skip_validation": True}])
 def test_check_can_be_softened_or_switched_off(tmp_path, setting):
-    result, chaptarr, history, _ = run_import(tmp_path, album="Golden Son", **setting)
+    result, chaptarr, history, _ = run_import(tmp_path, album="Golden Son", chaptarr=red_rising_chaptarr(), **setting)
     assert result == {7: True}
     assert len(chaptarr.commands) == 1
     assert history.history == []
@@ -237,7 +244,7 @@ def test_check_can_be_softened_or_switched_off(tmp_path, setting):
 
 def test_tag_check_trouble_never_stops_an_import(tmp_path, monkeypatch):
     monkeypatch.setattr(audiotags, "check_audiobook_tags", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    result, chaptarr, _, _ = run_import(tmp_path, album="Golden Son")
+    result, chaptarr, _, _ = run_import(tmp_path, album="Golden Son", chaptarr=red_rising_chaptarr())
     assert result == {7: True}
 
 
@@ -245,7 +252,7 @@ def test_missing_mutagen_skips_the_check(tmp_path, monkeypatch):
     path = audio_file(tmp_path / "book.m4b", album="Golden Son")
     monkeypatch.setitem(sys.modules, "mutagen", None)  # importing it now fails
     assert read_tags(path) == {}
-    assert check_audiobook_tags([path], "Red Rising", BROWN)[0] == UNTAGGED
+    assert check_audiobook_tags([path], "Red Rising", BROWN, siblings=["Golden Son"])[0] == UNTAGGED
 
 
 def test_tag_check_setting_is_validated():

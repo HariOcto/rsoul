@@ -13,7 +13,7 @@ from .utils import sanitize_folder_name, jaccard_similarity, extract_author_titl
 from .display import print_import_summary, print_section_header
 from . import health
 from . import audiotags
-from .library import sibling_titles
+from .library import author_series, sibling_titles
 from .match import book_narrators
 
 logger = logging.getLogger("readarr_soul")
@@ -577,8 +577,9 @@ def audiobook_tags_contradict(ctx: Any, book_download: dict, local_download_dir:
             logger.debug(f"Could not fetch book {book_download.get('bookId')} for the tag check: {e}")
         series_title = book.get("seriesTitle") or book_download.get("seriesTitle") or ""
         siblings = sibling_titles(ctx, dict(book, title=title), author_name) if book.get("authorId") else []
+        series = author_series(ctx, book)
 
-        verdict, detail = audiotags.check_audiobook_tags(paths, title, author_name, series_title, book_narrators(book), siblings)
+        verdict, detail = audiotags.check_audiobook_tags(paths, title, author_name, series_title, book_narrators(book), siblings, series)
         if verdict == audiotags.MISMATCH:
             if mode == "warn":
                 logger.warning(f"Audio tags of {title} name another book ({detail}); importing anyway (audiobook_tag_check = warn)")
@@ -868,8 +869,9 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                 logger.info(f"Processing audiobook: {book_title}")
                 wrong_book = audiobook_tags_contradict(ctx, book_download, local_download_dir)
                 if wrong_book:
-                    # The files themselves say they are another book. Unlike a failed move, this
-                    # is about the peer's files: they are not tried again.
+                    # The files themselves say they are another book (confirmed, not merely
+                    # unclear tags). Unlike a failed move, this is about the peer's files: they
+                    # are not tried again.
                     logger.warning(f"Audiobook rejected: {book_title} - {wrong_book}")
                     names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
                     moved_to = move_files_aside(local_download_dir, book_download.get("dir", ""), names)

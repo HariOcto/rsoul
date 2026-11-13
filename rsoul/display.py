@@ -112,8 +112,8 @@ def print_section_header(title, style=None):
     logger.info("=" * 40 + f" {title} " + "=" * 40)
 
 
-def print_run_summary(grabbed_count, failed_count, failed_books=None, failed_imports=None):
-    """Print a final run summary with counts, unfound books, and import failures."""
+def print_run_summary(grabbed_count, failed_count, failed_books=None, failed_imports=None, failed_downloads=None):
+    """Print a final run summary with counts, unfound books, failed downloads and import failures."""
     logger.info("=" * 40 + " RUN SUMMARY " + "=" * 40)
     logger.info(f"Books grabbed: {grabbed_count}")
     logger.info(f"Books failed:  {failed_count}")
@@ -121,6 +121,10 @@ def print_run_summary(grabbed_count, failed_count, failed_books=None, failed_imp
         logger.info(f"Not found ({len(failed_books)}):")
         for author, title in failed_books:
             logger.info(f"  - {author} — {title}")
+    if failed_downloads:
+        logger.info(f"Download failed ({len(failed_downloads)}):")
+        for author, title, reason in failed_downloads:
+            logger.info(f"  - {author} — {title}" + (f" ({reason})" if reason else ""))
     if failed_imports:
         logger.info(f"Import failed ({len(failed_imports)}):")
         for author, title in failed_imports:

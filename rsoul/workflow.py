@@ -38,9 +38,24 @@ def task_to_grab_item(task: DownloadTask, download_dir: str) -> Dict[str, Any]:
     }
 
 
-def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> List[DownloadTarget]:
-    """Turn wanted books into DownloadTargets with the right media type and formats."""
+# How long a peer is left alone for a book after it refused or broke off the download. Long
+# enough for the next runs to try other peers, short enough to come back to it.
+DOWNLOAD_FAILURE_RETRY_DAYS = 1
+# How the backends report a failure on the peer's side (see slskd_backend.get_status)
+PEER_FAILURE_PREFIX = "File(s) failed"
+
+
+def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]], use_ledger: bool = True) -> List[DownloadTarget]:
+    """Turn wanted books into DownloadTargets with the right media type and formats.
+
+    Books that should not be searched for right now are left out, each with a log line:
+    records of the other media type, duplicates, and (use_ledger) books R:soul imported a
+    short while ago or searched for in vain recently."""
     batch_targets: List[DownloadTarget] = []
+    ledger = getattr(ctx, "ledger", None) if use_ledger else None
+    redownload_days = ctx.config.getfloat("Search Settings", "redownload_after_days", fallback=30)
+    not_found_days = ctx.config.getfloat("Search Settings", "not_found_retry_days", fallback=1)
+    resting: List[str] = []
     media_mode = get_media_mode(ctx.config)
 
     missing_media_type = sum(1 for t in download_targets if not t["book"].get("mediaType"))
@@ -80,7 +95,7 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Lis
         key = (normalize_for_matching(author.get("authorName", "")), title_key(book.get("title", "")), media_type)
         if book.get("id") not in saved_ids:
             if key in seen:
-                logger.warning(f"Skipping {label}: another wanted record with the same author and title is already being downloaded")
+                logger.warning(f"Skipping {label}: another wanted record with the same author and title is already being handled (downloading, or earlier in this run)")
                 continue
             duplicate = record_with_files(ctx, book)
             if duplicate:
@@ -89,6 +104,21 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Lis
                     "Unmonitor or remove the duplicate record there to stop it showing up as wanted."
                 )
                 continue
+            if ledger:
+                # Wanted again although R:soul imported it? Only a book without files counts:
+                # one that has files is wanted for a better quality, which is a real request.
+                has_files = bool(book.get("hasFiles")) or bool((book.get("statistics") or {}).get("bookFileCount"))
+                imported = None if has_files else ledger.imported_recently(book.get("id"), author.get("authorName", ""), book.get("title", ""), media_type, redownload_days)
+                if imported:
+                    logger.warning(
+                        f"Skipping {label}: R:soul downloaded this title and it was imported on {imported:%Y-%m-%d %H:%M}, yet it is wanted again. "
+                        "Check the book in Readarr/Chaptarr: the file may be attached to another record. "
+                        f"Not downloaded again for {redownload_days:g} days (redownload_after_days); delete its entry in book_ledger.json to retry sooner."
+                    )
+                    continue
+                if ledger.not_found_recently(book.get("id"), not_found_days):
+                    resting.append(f"{author.get('authorName', '?')} - {book.get('title', '?')}")
+                    continue
         seen.add(key)
 
         # Fetch editions for this book (contains ISBNs, ASINs, etc.)
@@ -111,6 +141,8 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Lis
                 media_type=media_type,
             )
         )
+    if resting:
+        logger.info(f"Not searching again yet for {len(resting)} book(s) that were not found in the last {not_found_days:g} day(s) (not_found_retry_days): " + "; ".join(resting))
     return batch_targets
 
 
@@ -126,7 +158,8 @@ class _RunResults:
         self.ctx = ctx
         self.targets_by_id = {t.book_id: t for t in targets}
         self.completed_tasks: List[DownloadTask] = []
-        self.failed_books: List[tuple] = []  # (author, title) - not found / download failed
+        self.failed_books: List[tuple] = []  # (author, title) - not found, or not started
+        self.failed_downloads: List[tuple] = []  # (author, title, reason) - started, then failed
         self.failed_imports: List[tuple] = []  # (author, title) - downloaded but import failed
         self.failed_download = 0
         self.remove_wanted_on_failure = ctx.config.getboolean("Search Settings", "remove_wanted_on_failure", fallback=False)
@@ -195,6 +228,9 @@ class _RunResults:
             logger.info(f"Import of {task.book_title} not confirmed yet; it will be checked on the next run")
             return
 
+        if imported and getattr(self.ctx, "ledger", None):
+            self.ctx.ledger.note_imported(task.book_id, task.author_name, task.book_title, task.extra.get("media_type", EBOOK))
+
         with self._lock:
             if imported:
                 self.completed_tasks.append(task)
@@ -224,6 +260,21 @@ class _RunResults:
         # search), or one that was found but couldn't be queued (its local folder is in use),
         # hasn't failed for good: it stays wanted
         start_failure = task.extra.get("start_failure")
+        ledger = getattr(self.ctx, "ledger", None)
+        if ledger and start_failure == "not_found":
+            ledger.note_not_found(task.book_id, task.author_name, task.book_title, task.extra.get("media_type", ""))
+        elif ledger and not start_failure:
+            ledger.note_found(task.book_id)
+
+        # A download the peer itself refused or broke off ("Completed, Rejected", "Errored"...):
+        # leave that peer alone for this book for a while, so the next run picks another one
+        # instead of the same top candidate again. A download R:soul gave up on (stalled, too
+        # long in a queue) is different: the peer may just have been busy, and is tried again.
+        peer = task.extra.get("username")
+        refused = (task.error_message or "").startswith(PEER_FAILURE_PREFIX)
+        if not start_failure and refused and peer and self.ctx.history:
+            self.ctx.history.add_failure(peer, task.book_title, f"Download failed: {task.error_message or 'unknown reason'}", retry_after_days=DOWNLOAD_FAILURE_RETRY_DAYS)
+
         if self.remove_wanted_on_failure and start_failure in ("not_searched", "not_started"):
             logger.error(f"Could not {'search for' if start_failure == 'not_searched' else 'start'} {task.book_title} by {task.author_name}; it stays on the wanted list")
         elif self.remove_wanted_on_failure:
@@ -258,7 +309,10 @@ class _RunResults:
 
         with self._lock:
             self.failed_download += 1
-            self.failed_books.append((task.author_name, task.book_title))
+            if start_failure:
+                self.failed_books.append((task.author_name, task.book_title))
+            else:
+                self.failed_downloads.append((task.author_name, task.book_title, task.error_message or ""))
 
 
 def unmonitor_book(ctx: "Context", book: Dict[str, Any], media_type: str) -> None:
@@ -288,6 +342,8 @@ def _follow_up_pending_imports(ctx: "Context", results: "_RunResults") -> int:
         outcome = postprocess.check_pending_import(ctx.readarr, item["extra"]["import_pending"])
         if outcome is True:
             results.completed_tasks.append(DownloadTask(item["task_id"], item.get("backend_name", ""), DownloadStatus.COMPLETED, title, author, item.get("book_id"), item.get("filename", "")))
+            if getattr(ctx, "ledger", None):
+                ctx.ledger.note_imported(item.get("book_id"), author, title, item.get("extra", {}).get("media_type", EBOOK))
             ctx.state.remove_task(item["task_id"])
         elif outcome is False:
             results.failed_download += 1
@@ -444,6 +500,7 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         results.failed_download,
         results.failed_books if results.failed_books else None,
         results.failed_imports if results.failed_imports else None,
+        results.failed_downloads if results.failed_downloads else None,
     )
     if results.pending_imports:
         logger.info(f"Imports not confirmed yet ({len(results.pending_imports)}), checked again next run: " + ", ".join(f"{a} — {t}" for a, t in results.pending_imports))

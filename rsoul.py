@@ -17,6 +17,7 @@ from rsoul.display import print_startup_banner, console
 from rsoul.utils import is_docker
 from rsoul.workflow import run_workflow, build_targets
 from rsoul.dryrun import is_dry_run, run_dry_run
+from rsoul.ledger import BookLedger
 from rsoul.search import get_books, SearchError
 from rsoul.media import get_media_mode
 from rsoul.net import apply_timeout
@@ -162,6 +163,7 @@ def main():
 
         # Initialize Context
         ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir, history=history_manager, state=state_manager)
+        ctx.ledger = BookLedger(config_dir, read_only=dry_run)
 
         # Initialize backends and orchestrator
         backends = create_backends_from_config(ctx)
@@ -277,7 +279,8 @@ def _dry_run(ctx, search_sources, search_type, page_size) -> int:
     saved = [item for item in (ctx.state.get_tasks_for_orchestrator() if ctx.state else []) if not item.get("extra", {}).get("import_pending")]
     if saved and ctx.config.getint("Download Settings", "monitor_window", fallback=0) == 0:
         remarks.append(f"{len(saved)} saved download(s) are waiting to be resumed. With monitor_window = 0, the next real run resumes them and does not search for new books; this report shows the run after that.")
-    LAST_RUN.update(dry_run=run_dry_run(ctx, build_targets(ctx, download_targets), remarks))
+    # (a dry run shows every wanted book, also the ones a real run would leave alone for now)
+    LAST_RUN.update(dry_run=run_dry_run(ctx, build_targets(ctx, download_targets, use_ledger=False), remarks))
     return EXIT_OK
 
 

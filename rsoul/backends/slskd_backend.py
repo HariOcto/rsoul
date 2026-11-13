@@ -60,6 +60,9 @@ def _strip_initials(author_name: str) -> str:
     return " ".join(words)
 
 
+# Seconds to wait when slskd answers a search with 429 Too Many Requests
+RATE_LIMIT_WAIT = 15
+
 # Below this average bitrate over the book's known duration, a download can't be the whole book
 MIN_AUDIOBOOK_KBPS = 8
 
@@ -196,7 +199,15 @@ class SlskdBackend(DownloadBackend):
 
             search_label = "main" if i == 0 else f"fallback-{i}"
             try:
-                search_results, search_id = _execute_search(self.ctx, query, search_label)
+                try:
+                    search_results, search_id = _execute_search(self.ctx, query, search_label)
+                except Exception as e:
+                    if "429" not in str(e):
+                        raise
+                    # slskd limits how fast searches may be started: wait and ask once more
+                    logger.info(f"slskd is rate-limiting searches; waiting {RATE_LIMIT_WAIT}s before repeating '{query}'")
+                    time.sleep(RATE_LIMIT_WAIT)
+                    search_results, search_id = _execute_search(self.ctx, query, search_label)
             except Exception as e:
                 logger.error(f"Search failed for query '{query}': {e}")
                 failed_queries += 1

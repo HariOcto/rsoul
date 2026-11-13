@@ -119,6 +119,8 @@ NON_NEGATIVE_SETTINGS = [
     ("Download Settings", "queue_timeout"),
     ("Download Settings", "max_download_time"),
     ("Postprocessing", "import_failure_retry_days"),
+    ("Search Settings", "redownload_after_days"),
+    ("Search Settings", "not_found_retry_days"),
     ("Postprocessing", "match_ratio_exact"),
     ("Postprocessing", "match_ratio_normalized"),
     ("Postprocessing", "match_ratio_word"),
@@ -350,4 +352,5 @@ class Context:
     stats: Optional[Dict[str, Any]] = field(default_factory=dict)
     history: Any = None
     state: Any = None  # StateManager for resume functionality
+    ledger: Any = None  # BookLedger: books R:soul imported, or searched for in vain
     orchestrator: Any = None  # DownloadOrchestrator for backend management

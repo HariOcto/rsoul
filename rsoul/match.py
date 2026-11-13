@@ -802,6 +802,20 @@ def audiobook_folder_match(
                     best = score
         return -1.0 if best is None else best  # -1: the title is there, but the fuzzy score rejects it
 
+    def accepted_score(score: Optional[float], name: str) -> float:
+        """The score to rank a candidate by, once its name passed the title and author checks.
+
+        Those checks are the strict ones (title_segment_match, author_in_name). The fuzzy score
+        was built for "Author - Title" file names and trips over perfectly good audiobook names
+        ("Frontlines 7.5 - Corvus", a one-word title behind a long series prefix), so it only
+        ranks here and no longer rejects: a low score is lifted to the threshold, which puts
+        the candidate behind every better-scoring one.
+        """
+        if score is not None and score >= minimum_match_ratio:
+            return score
+        logger.info(f"Audiobook match on title and author with a low fuzzy score, kept as a last choice: {name} from {username}")
+        return minimum_match_ratio
+
     best_per_ext: Dict[str, Dict[str, Any]] = {}
 
     def offer(directory: str, ext: str, files: List[Dict[str, Any]], score: float, file_based: bool) -> None:
@@ -849,10 +863,7 @@ def audiobook_folder_match(
             if not author_in_name(author_name, path_text):
                 note("folders without the author's surname", directory)
                 continue
-            score = best_score_for(folder_name_candidates(directory, files), checked=True)
-            if score is None or score < minimum_match_ratio:
-                note("folders not matching the title", directory)
-                continue
+            score = accepted_score(best_score_for(folder_name_candidates(directory, files), checked=True), directory)
             offer(directory, ext, files, score, file_based=False)
             continue
 
@@ -874,10 +885,8 @@ def audiobook_folder_match(
             score = best_score_for(file_name_candidates(basename))
             if score is None:
                 reasons.add("title")
-            elif score < minimum_match_ratio:
-                reasons.add("score")
             else:
-                offer(directory, ext, book_files, score, file_based=True)
+                offer(directory, ext, book_files, accepted_score(score, f"{directory}\\{basename}"), file_based=True)
                 reasons.add("matched")
         if "matched" not in reasons:
             if "score" in reasons:

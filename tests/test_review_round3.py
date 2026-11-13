@@ -349,7 +349,7 @@ def test_failed_task_leaves_state_even_if_the_failure_list_cannot_be_written(tmp
     results.on_complete(task)
     results.wait_for_imports()
     assert state.get_items() == []
-    assert results.failed_books == [(AUTHOR, TITLE)]
+    assert results.failed_downloads == [(AUTHOR, TITLE, "")]  # a started download that failed
 
 
 # ---------------------------------------------------------------------------

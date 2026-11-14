@@ -506,10 +506,98 @@ def organize_audiobook(book_download: dict, local_download_dir: str) -> tuple:
     return relative, None
 
 
-def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folders: list) -> list:
+IMPORT_METHODS = ("scan", "targeted")
+
+
+def import_method(config: Any) -> str:
+    """[Readarr] import_method: "scan" (default) or "targeted".
+
+    scan      hands the folder to Readarr/Chaptarr, which works out from the files' tags and
+              names which book they are. It may decide differently from R:soul: file a book
+              under another title of the same series, or create a new record and leave the
+              wanted one wanted.
+    targeted  tells Readarr/Chaptarr which book the files are (a manual import with author,
+              book and edition filled in), so they are attached to the record that was wanted.
     """
-    Trigger Readarr scan commands for processed author folders.
+    method = config.get("Readarr", "import_method", fallback="scan").strip().lower()
+    return method if method in IMPORT_METHODS else "scan"
+
+
+def targeted_import_command(readarr_client: Any, readarr_path: str, book_id: Any, filenames: list) -> Optional[dict]:
+    """Start an import of the files in readarr_path for exactly this book.
+
+    Does what the "Manual Import" dialog does: ask for the importable files of the folder
+    (which also gives each file's quality), fill in author, book and edition, and post that
+    as a ManualImport command. Returns the command, or None if the import could not be
+    prepared (no edition, nothing importable...); the caller then falls back to a scan.
+    """
+    book = readarr_client.get_book(book_id)
+    author_id = book.get("authorId") if isinstance(book, dict) else None
+    editions = readarr_client.get_edition(book_id)
+    editions = [e for e in editions if isinstance(e, dict) and e.get("id")] if isinstance(editions, list) else []
+    edition = next((e for e in editions if e.get("monitored")), editions[0] if editions else None)
+    if not author_id or not edition:
+        logger.warning(f"Targeted import not possible for book {book_id}: {'no edition' if author_id else 'no author'} in Readarr/Chaptarr")
+        return None
+
+    preview = readarr_client._get("manualimport", readarr_client.ver_uri, params={"folder": readarr_path, "filterExistingFiles": "false"})
+    wanted = set(filenames)
+    files = []
+    for item in preview if isinstance(preview, list) else []:
+        path = item.get("path") if isinstance(item, dict) else None
+        # Only the files R:soul staged for this book, and only ones Readarr/Chaptarr can rate
+        if not path or os.path.basename(path.replace("\\", "/")) not in wanted or not item.get("quality"):
+            continue
+        files.append(
+            {
+                "path": path,
+                "authorId": author_id,
+                "bookId": book_id,
+                "editionId": edition["id"],  # Chaptarr
+                "foreignEditionId": edition.get("foreignEditionId"),  # Readarr
+                "quality": item["quality"],
+                "releaseGroup": item.get("releaseGroup"),
+                "indexerFlags": item.get("indexerFlags") or 0,
+                "disableReleaseSwitching": True,  # keep the edition chosen here
+            }
+        )
+    if len(files) < len(wanted):
+        logger.warning(f"Targeted import not possible for book {book_id}: Readarr/Chaptarr lists {len(files)} of {len(wanted)} file(s) in {readarr_path} as importable")
+        return None
+
+    logger.info(f"Importing {len(files)} file(s) for book {book_id} ('{book.get('title', '?')}', edition {edition['id']})")
+    return readarr_client.post_command(name="ManualImport", files=files, importMode="move", replaceExistingFiles=False)
+
+
+def wanted_record_still_empty(readarr_client: Any, book_id: Any) -> bool:
+    """After a successful import: does the record that was wanted still have no files?
+
+    True only if Readarr/Chaptarr says so in as many words. It means the files went to
+    another record (a duplicate, another book of the series, a newly created one).
+    """
+    try:
+        book = readarr_client.get_book(book_id)
+    except Exception as e:
+        logger.debug(f"Could not check book {book_id} after its import: {e}")
+        return False
+    if not isinstance(book, dict):
+        return False
+    if "hasFiles" in book:
+        return book["hasFiles"] is False
+    statistics = book.get("statistics")
+    if isinstance(statistics, dict) and "bookFileCount" in statistics:
+        return statistics["bookFileCount"] == 0
+    return False
+
+
+def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folders: list, method: str = "scan", folder_books: Optional[dict] = None, folder_files: Optional[dict] = None) -> list:
+    """
+    Trigger Readarr import commands for processed folders.
     Returns a list of command objects.
+
+    method "targeted" imports a folder that holds one book for exactly that book (see
+    import_method); folders with several books, and imports that can't be prepared that way,
+    are scanned as before.
     """
     commands = []
     if not author_folders:
@@ -521,7 +609,16 @@ def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folde
             download_dir = os.path.join(readarr_download_dir, author_folder)
             logger.info(f"Importing from: {download_dir}")
 
-            command = readarr_client.post_command(name="DownloadedBooksScan", path=download_dir)
+            command = None
+            books = (folder_books or {}).get(author_folder, [])
+            if method == "targeted" and len(books) == 1:
+                try:
+                    names = [os.path.basename(p) for p in (folder_files or {}).get(author_folder, [])]
+                    command = targeted_import_command(readarr_client, download_dir, books[0], names)
+                except Exception as e:
+                    logger.warning(f"Targeted import could not be prepared for {author_folder} ({e}); scanning the folder instead")
+            if command is None:
+                command = readarr_client.post_command(name="DownloadedBooksScan", path=download_dir)
             command["_rsoul_folder"] = author_folder  # lets process_imports map results back to books
             commands.append(command)
             logger.info(f"Import command created - ID: {command['id']} for folder: {author_folder}")
@@ -1008,7 +1105,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         # Trigger imports for this backend's successful folders using the mapped path
         if author_folders:
             logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
-            commands = trigger_imports(readarr, readarr_download_dir, list(author_folders))
+            commands = trigger_imports(readarr, readarr_download_dir, list(author_folders), import_method(ctx.config), folder_books, folder_files)
             poll_timeout = ctx.config.getfloat("Readarr", "import_poll_timeout", fallback=IMPORT_TIMEOUT_SECONDS)
             command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir, timeout=poll_timeout) if commands else {}
             command_for = {c.get("_rsoul_folder"): c for c in commands}
@@ -1034,6 +1131,13 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                         outcome = False
                 for book_id in folder_books.get(folder, []):
                     results[book_id] = outcome
+                    if outcome is True and wanted_record_still_empty(readarr, book_id):
+                        source_id, title = book_sources.get(book_id, ("", ""))
+                        logger.warning(
+                            f"{title or folder}: the files were imported, but not for the record that was wanted (book {book_id} still has no files). "
+                            "Readarr/Chaptarr filed them under another record; look for the files in its library. "
+                            "Setting [Readarr] import_method = targeted makes R:soul name the book for each import."
+                        )
                     if outcome is False and ctx.history:
                         # Readarr/Chaptarr rejected these files. Without a record of the peer the
                         # next run would find, download and fail on exactly the same files again.

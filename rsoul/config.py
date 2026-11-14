@@ -243,6 +243,10 @@ def validate_config(config: configparser.ConfigParser) -> None:
             except ValueError:
                 raise ValueError(f"Configuration Error: [{section}] {option} = '{config.get(section, option)}' must be True or False")
 
+    method = config.get("Readarr", "import_method", fallback="scan").strip().lower()
+    if method not in ("scan", "targeted"):
+        raise ValueError(f"Configuration Error: [Readarr] import_method = '{method}' must be scan or targeted")
+
     tag_check = config.get("Postprocessing", "audiobook_tag_check", fallback="reject").strip().lower()
     if tag_check not in ("reject", "warn", "off"):
         raise ValueError(f"Configuration Error: [Postprocessing] audiobook_tag_check = '{tag_check}' must be reject, warn or off")

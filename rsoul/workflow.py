@@ -116,7 +116,7 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]], use_le
                         f"Not downloaded again for {redownload_days:g} days (redownload_after_days); delete its entry in book_ledger.json to retry sooner."
                     )
                     continue
-                if ledger.not_found_recently(book.get("id"), not_found_days):
+                if ledger.not_found_recently(book.get("id"), not_found_days, author.get("authorName", ""), book.get("title", ""), media_type):
                     resting.append(f"{author.get('authorName', '?')} - {book.get('title', '?')}")
                     continue
         seen.add(key)
@@ -228,7 +228,7 @@ class _RunResults:
             logger.info(f"Import of {task.book_title} not confirmed yet; it will be checked on the next run")
             return
 
-        if imported and getattr(self.ctx, "ledger", None):
+        if imported and getattr(self.ctx, "ledger", None) and not self.ctx.config.getboolean("Readarr", "disable_sync", fallback=False):
             self.ctx.ledger.note_imported(task.book_id, task.author_name, task.book_title, task.extra.get("media_type", EBOOK))
 
         with self._lock:
@@ -262,7 +262,11 @@ class _RunResults:
         start_failure = task.extra.get("start_failure")
         ledger = getattr(self.ctx, "ledger", None)
         if ledger and start_failure == "not_found":
-            ledger.note_not_found(task.book_id, task.author_name, task.book_title, task.extra.get("media_type", ""))
+            media_type = task.extra.get("media_type") or (
+                self.targets_by_id[task.book_id].media_type if task.book_id in self.targets_by_id else get_media_mode(self.ctx.config)
+            )
+            if media_type in (EBOOK, AUDIOBOOK):
+                ledger.note_not_found(task.book_id, task.author_name, task.book_title, media_type)
         elif ledger and not start_failure:
             ledger.note_found(task.book_id)
 
@@ -342,7 +346,7 @@ def _follow_up_pending_imports(ctx: "Context", results: "_RunResults") -> int:
         outcome = postprocess.check_pending_import(ctx.readarr, item["extra"]["import_pending"])
         if outcome is True:
             results.completed_tasks.append(DownloadTask(item["task_id"], item.get("backend_name", ""), DownloadStatus.COMPLETED, title, author, item.get("book_id"), item.get("filename", "")))
-            if getattr(ctx, "ledger", None):
+            if getattr(ctx, "ledger", None) and not ctx.config.getboolean("Readarr", "disable_sync", fallback=False):
                 ctx.ledger.note_imported(item.get("book_id"), author, title, item.get("extra", {}).get("media_type", EBOOK))
             ctx.state.remove_task(item["task_id"])
         elif outcome is False:
@@ -454,10 +458,14 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
     targets: List[DownloadTarget] = []
     kept = [i for i in (ctx.state.get_items() if ctx.state else []) if i.get("task_id") in getattr(ctx.orchestrator, "unchecked_task_ids", set())]
     if monitor_window > 0 or not (resumed or kept):
-        in_flight = {t.book_id for t in resumed} | {i.get("book_id") for i in kept}
+        pending_book_ids = {
+            i.get("book_id") for i in (ctx.state.get_tasks_for_orchestrator() if ctx.state else [])
+            if i.get("extra", {}).get("import_pending")
+        }
+        in_flight = {t.book_id for t in resumed} | {i.get("book_id") for i in kept} | pending_book_ids
         wanted = [t for t in download_targets if t["book"]["id"] not in in_flight]
         if in_flight:
-            logger.info(f"Skipping {len(in_flight)} book(s) that are still downloading from an earlier run")
+            logger.info(f"Skipping {len(in_flight)} book(s) that are still downloading or awaiting import confirmation")
 
         # Optional cap on downloads running at once (resumed ones included)
         max_active = ctx.config.getint("Download Settings", "max_active_downloads", fallback=0)

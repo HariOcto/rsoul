@@ -5,8 +5,8 @@ A folder scan lets Chaptarr decide which book the files are. On the first real r
 six other books while the wanted records stayed wanted.
 
 1. import_method = targeted names the book for the import
-2. When that can't be prepared, the folder is scanned as before
-3. An import that lands on another record is reported
+2. When that can't be prepared, files remain pending; no dangerous scan fallback
+3. An import that lands on another record is not falsely marked successful
 """
 
 import logging
@@ -34,13 +34,14 @@ class Chaptarr:
 
     def __init__(self, local_root, editions=None, preview=None, has_files=True, takes_files=True, preview_error=None):
         self.local_root = str(local_root)
-        self.editions = [{"id": 21610, "foreignEditionId": "az:B00KS8G4ZO", "monitored": True}] if editions is None else editions
+        self.editions = [{"id": 21610, "foreignEditionId": "az:B00KS8G4ZO", "monitored": True, "readingFormatId": 2}] if editions is None else editions
         self.preview = preview
         self.preview_error = preview_error
         self.has_files = has_files
         self.takes_files = takes_files
         self.commands = []
         self.previews = []
+        self.bookfiles = []
 
     def get_book(self, book_id):
         return {"id": book_id, "title": "The Trafalgar Gambit", "authorId": 37, "hasFiles": self.has_files}
@@ -49,6 +50,8 @@ class Chaptarr:
         return self.editions
 
     def _get(self, path, ver_uri="", params=None):
+        if path == "bookfile":
+            return list(self.bookfiles)
         assert path == "manualimport"
         self.previews.append(params)
         if self.preview_error:
@@ -62,6 +65,8 @@ class Chaptarr:
     def post_command(self, name, **kwargs):
         self.commands.append((name, kwargs))
         if self.takes_files:
+            if name == "ManualImport":
+                self.bookfiles.append({"id": len(self.bookfiles) + 100, "bookId": kwargs["files"][0]["bookId"], "editionId": kwargs["files"][0]["editionId"]})
             for root, _, files in os.walk(os.path.join(self.local_root, postprocess.AUDIOBOOK_STAGING_DIR)):
                 for f in files:
                     os.remove(os.path.join(root, f))
@@ -129,7 +134,7 @@ def test_targeted_import_covers_every_chapter_and_nothing_else(tmp_path):
 
 
 def test_monitored_edition_is_preferred(tmp_path):
-    editions = [{"id": 1, "foreignEditionId": "a", "monitored": False}, {"id": 2, "foreignEditionId": "b", "monitored": True}]
+    editions = [{"id": 1, "foreignEditionId": "a", "monitored": False, "readingFormatId": 2}, {"id": 2, "foreignEditionId": "b", "monitored": True, "readingFormatId": 2}]
     chaptarr = Chaptarr(tmp_path / "dl", editions=editions)
     run_import(tmp_path, chaptarr)
     assert chaptarr.commands[0][1]["files"][0]["editionId"] == 2
@@ -144,7 +149,7 @@ def test_scan_stays_the_default(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. Falling back to a scan
+# 2. Fail closed instead of falling back to a scan
 # ---------------------------------------------------------------------------
 
 
@@ -158,11 +163,12 @@ def test_scan_stays_the_default(tmp_path):
         {"preview_error": RuntimeError("404 Not Found: no such endpoint")},  # a server without manual import
     ],
 )
-def test_import_that_cannot_be_targeted_is_scanned(tmp_path, kwargs):
+def test_import_that_cannot_be_targeted_stays_pending(tmp_path, kwargs):
     chaptarr = Chaptarr(tmp_path / "dl", **kwargs)
     result, _ = run_import(tmp_path, chaptarr)
-    assert result == {4020: True}
-    assert [name for name, _ in chaptarr.commands] == ["DownloadedBooksScan"]
+    assert isinstance(result[4020], dict) and result[4020]["method"] == "targeted"
+    assert chaptarr.commands == []
+    assert (tmp_path / "dl" / "rsoul_audiobooks" / "Christopher G Nuttall" / "The Trafalgar Gambit").is_dir()
 
 
 def test_failed_targeted_import_is_a_failed_import(tmp_path):
@@ -175,11 +181,10 @@ def test_failed_targeted_import_is_a_failed_import(tmp_path):
     assert ctx.history.is_failed("peer", "The Trafalgar Gambit")
 
 
-def test_folder_with_several_books_is_scanned(tmp_path):
+def test_folder_with_several_books_is_not_scanned_in_targeted_mode(tmp_path):
     chaptarr = Chaptarr(tmp_path / "dl")
     commands = postprocess.trigger_imports(chaptarr, "/chaptarr-side", ["Author"], "targeted", {"Author": [1, 2]}, {"Author": ["/x/a.epub", "/x/b.epub"]})
-    assert [name for name, _ in chaptarr.commands] == ["DownloadedBooksScan"]
-    assert commands[0]["_rsoul_folder"] == "Author"
+    assert chaptarr.commands == [] and commands == []
 
 
 def test_import_method_is_validated():
@@ -201,8 +206,8 @@ def test_import_that_lands_on_another_record_is_reported(tmp_path, caplog):
     chaptarr = Chaptarr(tmp_path / "dl", has_files=False)  # the wanted record stays empty
     with caplog.at_level(logging.WARNING):
         result, _ = run_import(tmp_path, chaptarr, method="scan")
-    assert result == {4020: True}  # the files are in the library; the ledger keeps them from being fetched again
-    assert "imported, but not for the record that was wanted (book 4020 still has no files)" in caplog.text
+    assert result == {4020: False}  # wrong destination must not be marked as imported in the ledger
+    assert "not for the record that was wanted (book 4020 still has no files)" in caplog.text
     assert "import_method = targeted" in caplog.text
 
 

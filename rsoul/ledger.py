@@ -65,8 +65,25 @@ class BookLedger:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _same_identity(entry: Dict[str, Any], author: str, title: str, media_type: str) -> bool:
+        """IDs can be recycled, and a book can have separate ebook/audio records.
+
+        Never allow a previous book or format's history to suppress a new wanted item.
+        An untyped legacy entry is deliberately not sufficient evidence.
+        """
+        return (
+            title_key(entry.get("author") or "") == title_key(author)
+            and title_key(entry.get("title") or "") == title_key(title)
+            and str(entry.get("media_type") or "").lower() == str(media_type or "").lower()
+            and bool(media_type)
+        )
+
     def _entry(self, book_id: Any, author: str, title: str, media_type: str) -> Dict[str, Any]:
         entry = self.books.setdefault(str(book_id), {})
+        if entry and not self._same_identity(entry, author, title, media_type):
+            # This ID no longer represents the book whose timestamps were recorded.
+            entry.clear()
         entry.update({"author": author, "title": title, "media_type": media_type})
         return entry
 
@@ -108,15 +125,18 @@ class BookLedger:
                 when = self._when(entry.get("imported_at"))
                 if not when or when < limit:
                     continue
-                same_title = (title_key(entry.get("author", "")), title_key(entry.get("title", ""))) == key and (entry.get("media_type") or media_type) == media_type
-                if other_id == str(book_id) or same_title:
+                same_title = (title_key(entry.get("author", "")), title_key(entry.get("title", ""))) == key
+                if same_title and self._same_identity(entry, author, title, media_type):
                     return when
         return None
 
-    def not_found_recently(self, book_id: Any, days: float) -> bool:
+    def not_found_recently(self, book_id: Any, days: float, author: str = "", title: str = "", media_type: str = "") -> bool:
         """Whether a search for this book came up empty within the last `days`."""
         if not days or days <= 0:
             return False
         with self._lock:
-            when = self._when((self.books.get(str(book_id)) or {}).get("not_found_at"))
+            entry = self.books.get(str(book_id)) or {}
+            if (author or title or media_type) and not self._same_identity(entry, author, title, media_type):
+                return False
+            when = self._when(entry.get("not_found_at"))
         return bool(when and when >= datetime.now() - timedelta(days=days))

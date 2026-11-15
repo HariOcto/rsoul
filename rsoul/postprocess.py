@@ -13,6 +13,7 @@ from .utils import sanitize_folder_name, jaccard_similarity, extract_author_titl
 from .display import print_import_summary, print_section_header
 from . import health
 from . import audiotags
+from . import import_identity
 from .library import author_series, sibling_titles
 from .match import book_narrators
 
@@ -516,37 +517,44 @@ def import_method(config: Any) -> str:
               names which book they are. It may decide differently from R:soul: file a book
               under another title of the same series, or create a new record and leave the
               wanted one wanted.
-    targeted  tells Readarr/Chaptarr which book the files are (a manual import with author,
-              book and edition filled in), so they are attached to the record that was wanted.
+    targeted  requests a manual import naming the wanted book and correctly typed edition;
+              only NEW bookfile records on that exact book/edition confirm its success.
     """
     method = config.get("Readarr", "import_method", fallback="scan").strip().lower()
     return method if method in IMPORT_METHODS else "scan"
 
 
-def targeted_import_command(readarr_client: Any, readarr_path: str, book_id: Any, filenames: list) -> Optional[dict]:
+def targeted_import_command(readarr_client: Any, readarr_path: str, book_id: Any, filenames: list, media_type: str = "ebook") -> Optional[dict]:
     """Start an import of the files in readarr_path for exactly this book.
 
     Does what the "Manual Import" dialog does: ask for the importable files of the folder
     (which also gives each file's quality), fill in author, book and edition, and post that
-    as a ManualImport command. Returns the command, or None if the import could not be
-    prepared (no edition, nothing importable...); the caller then falls back to a scan.
+    as a ManualImport command. Returns the command with verification metadata, or None
+    if it cannot be prepared. NEVER fall back to a folder scan in targeted mode.
     """
     book = readarr_client.get_book(book_id)
     author_id = book.get("authorId") if isinstance(book, dict) else None
     editions = readarr_client.get_edition(book_id)
-    editions = [e for e in editions if isinstance(e, dict) and e.get("id")] if isinstance(editions, list) else []
-    edition = next((e for e in editions if e.get("monitored")), editions[0] if editions else None)
+    edition = import_identity.select_edition(book or {}, editions, media_type)
     if not author_id or not edition:
         logger.warning(f"Targeted import not possible for book {book_id}: {'no edition' if author_id else 'no author'} in Readarr/Chaptarr")
         return None
 
     preview = readarr_client._get("manualimport", readarr_client.ver_uri, params={"folder": readarr_path, "filterExistingFiles": "false"})
     wanted = set(filenames)
+    if not wanted or len(wanted) != len(filenames) or any(os.path.basename(n) != n for n in wanted):
+        logger.warning("Targeted import cannot safely identify all file names for book %s", book_id)
+        return None
     files = []
     for item in preview if isinstance(preview, list) else []:
         path = item.get("path") if isinstance(item, dict) else None
         # Only the files R:soul staged for this book, and only ones Readarr/Chaptarr can rate
-        if not path or os.path.basename(path.replace("\\", "/")) not in wanted or not item.get("quality"):
+        if (
+            not isinstance(path, str)
+            or os.path.normpath(os.path.dirname(path.replace("\\", "/"))) != os.path.normpath(readarr_path)
+            or os.path.basename(path.replace("\\", "/")) not in wanted
+            or not item.get("quality")
+        ):
             continue
         files.append(
             {
@@ -561,12 +569,25 @@ def targeted_import_command(readarr_client: Any, readarr_path: str, book_id: Any
                 "disableReleaseSwitching": True,  # keep the edition chosen here
             }
         )
-    if len(files) < len(wanted):
+    if len(files) != len(wanted) or {os.path.basename(f["path"].replace("\\", "/")) for f in files} != wanted:
         logger.warning(f"Targeted import not possible for book {book_id}: Readarr/Chaptarr lists {len(files)} of {len(wanted)} file(s) in {readarr_path} as importable")
         return None
 
+    # Capture BEFORE starting the command. Existing book files must not later be mistaken
+    # for files this import attached to the wanted record.
+    before_ids = import_identity.bookfile_ids_before(readarr_client, book_id)
+    if before_ids is None:
+        logger.error("Targeted import of book %s not submitted: its bookfile IDs cannot be read and the destination cannot be verified", book_id)
+        return None
     logger.info(f"Importing {len(files)} file(s) for book {book_id} ('{book.get('title', '?')}', edition {edition['id']})")
-    return readarr_client.post_command(name="ManualImport", files=files, importMode="move", replaceExistingFiles=False)
+    command = readarr_client.post_command(name="ManualImport", files=files, importMode="move", replaceExistingFiles=False)
+    if not isinstance(command, dict) or command.get("id") is None:
+        raise ValueError("Chaptarr did not return an import command ID; the import outcome is unknown")
+    command.update({
+        "_rsoul_method": "targeted", "_rsoul_book_id": book_id, "_rsoul_edition_id": edition["id"],
+        "_rsoul_before_ids": before_ids, "_rsoul_media_type": media_type,
+    })
+    return command
 
 
 def wanted_record_still_empty(readarr_client: Any, book_id: Any) -> bool:
@@ -590,14 +611,14 @@ def wanted_record_still_empty(readarr_client: Any, book_id: Any) -> bool:
     return False
 
 
-def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folders: list, method: str = "scan", folder_books: Optional[dict] = None, folder_files: Optional[dict] = None) -> list:
+def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folders: list, method: str = "scan", folder_books: Optional[dict] = None, folder_files: Optional[dict] = None, folder_media: Optional[dict] = None) -> list:
     """
     Trigger Readarr import commands for processed folders.
     Returns a list of command objects.
 
     method "targeted" imports a folder that holds one book for exactly that book (see
-    import_method); folders with several books, and imports that can't be prepared that way,
-    are scanned as before.
+    import_method). Any ambiguity or API failure in targeted mode keeps the staged files
+    pending for a later attempt or manual intervention. It must never trigger a scan.
     """
     commands = []
     if not author_folders:
@@ -611,15 +632,26 @@ def trigger_imports(readarr_client: Any, readarr_download_dir: str, author_folde
 
             command = None
             books = (folder_books or {}).get(author_folder, [])
-            if method == "targeted" and len(books) == 1:
+            if method == "targeted":
+                if len(books) != 1:
+                    logger.error("Targeted import of %s requires exactly one book ID; %s supplied. Keeping staged files.", author_folder, len(books))
+                    continue
                 try:
                     names = [os.path.basename(p) for p in (folder_files or {}).get(author_folder, [])]
-                    command = targeted_import_command(readarr_client, download_dir, books[0], names)
+                    media_type = (folder_media or {}).get(author_folder)
+                    if not media_type:
+                        media_type = "audiobook" if names and all(os.path.splitext(n)[1].lower() in (".m4b", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav") for n in names) else "ebook"
+                    command = targeted_import_command(readarr_client, download_dir, books[0], names, media_type)
                 except Exception as e:
-                    logger.warning(f"Targeted import could not be prepared for {author_folder} ({e}); scanning the folder instead")
-            if command is None:
+                    logger.warning("Targeted import could not be submitted for %s (%s); keeping staged files", author_folder, e)
+                if command is None:
+                    logger.warning("Targeted import of %s was not submitted; no folder scan fallback", author_folder)
+                    continue
+            else:
                 command = readarr_client.post_command(name="DownloadedBooksScan", path=download_dir)
+                command["_rsoul_method"] = "scan"
             command["_rsoul_folder"] = author_folder  # lets process_imports map results back to books
+            command["_rsoul_readarr_path"] = download_dir
             commands.append(command)
             logger.info(f"Import command created - ID: {command['id']} for folder: {author_folder}")
 
@@ -772,7 +804,9 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
             continue
 
         body = current_task.get("body") or {}
-        path = body.get("path", "")
+        # ManualImport commands commonly have files[] rather than body.path. Rely on our
+        # own staged folder, not on an optional server body which may omit the path.
+        path = task.get("_rsoul_readarr_path") or body.get("path", "")
         folder_name = os.path.basename(path) if path else f"Task {task['id']}"
         message = current_task.get("message", "")
 
@@ -783,7 +817,15 @@ def monitor_imports(readarr_client: Any, commands: list, readarr_download_dir: s
 
         logger.warning(f"{folder_name}: Import did not succeed (status: {current_task.get('status')}, result: {current_task.get('result', 'n/a')}): {message}")
         if path:
-            move_failed_import(to_local_path(path, readarr_download_dir, local_download_dir))
+            local_path = to_local_path(path, readarr_download_dir, local_download_dir)
+            # Never move an arbitrary path returned by a server command outside the
+            # configured download directory.
+            root = os.path.abspath(local_download_dir) if local_download_dir else ""
+            target = os.path.abspath(local_path)
+            if root and os.path.commonpath([root, target]) == root:
+                move_failed_import(target)
+            else:
+                logger.error("Cannot quarantine failed import outside the download directory: %s", local_path)
 
     return results
 
@@ -818,7 +860,9 @@ PENDING_IMPORT_MAX_AGE = 24 * 3600
 PENDING_IMPORT_MAX_SUBMITS = 3
 
 
-def pending_import_record(folder: str, readarr_download_dir: str, local_download_dir: str, files: list, command_id: Optional[int]) -> dict:
+def pending_import_record(folder: str, readarr_download_dir: str, local_download_dir: str, files: list, command_id: Optional[int],
+                          method: str = "scan", book_id: Any = None, media_type: str = "", edition_id: Any = None,
+                          before_ids: Optional[list] = None) -> dict:
     """Everything needed to finish an import on a later run."""
     return {
         "folder": folder,
@@ -828,6 +872,11 @@ def pending_import_record(folder: str, readarr_download_dir: str, local_download
         "command_id": command_id,
         "submits": 1 if command_id is not None else 0,
         "since": time.time(),
+        "method": method,
+        "book_id": book_id,
+        "media_type": media_type,
+        "edition_id": edition_id,
+        "before_ids": before_ids,
     }
 
 
@@ -849,9 +898,22 @@ def check_pending_import(readarr_client: Any, pending: dict, now: Optional[float
     local_dir, files = pending["local_dir"], pending.get("files", [])
     left = [p for p in files if os.path.exists(p)]
     label = pending.get("folder", local_dir)
+    targeted = pending.get("method", "scan") == "targeted"
+
+    def verified():
+        return import_identity.verify_new_bookfiles(
+            readarr_client, pending.get("book_id"), pending.get("edition_id"), pending.get("before_ids")
+        )
+
+    # A targeted import cannot be deemed successful merely because the staging files
+    # disappeared. They might have been attached to another record (Chaptarr #285).
+    if targeted and files and not left:
+        result = verified()
+        if result is not None:
+            return result
 
     if now - pending.get("since", now) > PENDING_IMPORT_MAX_AGE:
-        if files and not left:
+        if files and not left and not targeted:
             # Chaptarr moves the files when it imports them, even if R:soul never heard back
             logger.info(f"Files of {label} are gone from the download folder: treating the import as done")
             return True
@@ -874,16 +936,23 @@ def check_pending_import(readarr_client: Any, pending: dict, now: Optional[float
             if status not in ("completed", "failed", "aborted", "cancelled", "orphaned"):
                 logger.info(f"Import of {label} is still running; checking again next run")
                 return None
-            if _import_succeeded(command) and files_left_after_import(files, local_dir) is None:
-                logger.info(f"Import of {label} finished (result: {command.get('result', 'n/a')})")
-                return True
+            if _import_succeeded(command):
+                if files_left_after_import(files, local_dir) is None:
+                    if targeted:
+                        result = verified()
+                        if result is None:
+                            logger.warning("Import of %s finished but target book/edition cannot yet be verified; keeping the task pending", label)
+                            return None
+                        return result
+                    logger.info(f"Import of {label} finished (result: {command.get('result', 'n/a')})")
+                    return True
             logger.warning(f"Import of {label} did not succeed (status: {status}, result: {command.get('result', 'n/a')})")
             if left:
                 move_failed_import(local_dir)
             return False
 
     # No command (never submitted, or forgotten by the server)
-    if files and not left:
+    if files and not left and not targeted:
         logger.info(f"Files of {label} are gone from the download folder: treating the import as done")
         return True
     if pending.get("submits", 0) >= PENDING_IMPORT_MAX_SUBMITS:
@@ -891,12 +960,27 @@ def check_pending_import(readarr_client: Any, pending: dict, now: Optional[float
         _give_up(local_dir, left)
         return False
     try:
-        command = readarr_client.post_command(name="DownloadedBooksScan", path=pending["readarr_path"])
+        if targeted:
+            if pending.get("book_id") is None or not files:
+                logger.error("Cannot retry targeted import of %s: saved record has no book ID or files", label)
+                return None
+            command = targeted_import_command(
+                readarr_client, pending["readarr_path"], pending["book_id"],
+                [os.path.basename(p) for p in files], pending.get("media_type") or "ebook"
+            )
+            if command is None:
+                logger.warning("Targeted import of %s still cannot be prepared; NEVER retrying with a folder scan", label)
+                return None
+        else:
+            command = readarr_client.post_command(name="DownloadedBooksScan", path=pending["readarr_path"])
     except Exception as e:
         logger.warning(f"Could not submit import of {label} ({e}); trying again next run")
         return None
     logger.info(f"Submitted import of {label} again - command ID {command['id']}")
-    return dict(pending, command_id=command["id"], submits=pending.get("submits", 0) + 1)
+    updated = dict(pending, command_id=command["id"], submits=pending.get("submits", 0) + 1)
+    if targeted:
+        updated.update(edition_id=command.get("_rsoul_edition_id"), before_ids=command.get("_rsoul_before_ids"))
+    return updated
 
 
 def process_imports(ctx: Any, grab_list: list) -> dict:
@@ -969,6 +1053,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         folder_books: dict = {}  # import folder -> book IDs whose files were moved there
         book_sources: dict = {}  # book ID -> (source id, title), to record a peer whose files were rejected
         folder_files: dict = {}  # import folder -> local paths of the files handed to Readarr/Chaptarr
+        folder_media: dict = {}  # import folder -> ebook or audiobook for edition selection
 
         for book_download in items:
             if book_download.get("media_type") == "audiobook":
@@ -992,6 +1077,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                 relative, reason = organize_audiobook(book_download, local_download_dir)
                 if relative:
                     author_folders.add(relative)
+                    folder_media[relative] = "audiobook"
                     folder_books.setdefault(relative, []).append(book_download.get("bookId"))
                     book_sources[book_download.get("bookId")] = (source_id, book_title)
                     names = book_download.get("expected_files") or []
@@ -1047,6 +1133,7 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
                     if organize_file(source_file_path, author_name_sanitized, filename, folder, local_download_dir):
                         logger.info(f"Successfully processed {filename}")
                         author_folders.add(author_name_sanitized)
+                        folder_media[author_name_sanitized] = "ebook"
                         folder_books.setdefault(author_name_sanitized, []).append(book_id)
                         book_sources[book_id] = (source_id, book_title)
                         folder_files.setdefault(author_name_sanitized, []).append(os.path.join(local_download_dir, author_name_sanitized, filename))
@@ -1105,39 +1192,64 @@ def process_imports(ctx: Any, grab_list: list) -> dict:
         # Trigger imports for this backend's successful folders using the mapped path
         if author_folders:
             logger.info(f"Triggering imports for backend {backend_name} using path: {readarr_download_dir}")
-            commands = trigger_imports(readarr, readarr_download_dir, list(author_folders), import_method(ctx.config), folder_books, folder_files)
+            method = import_method(ctx.config)
+            commands = trigger_imports(readarr, readarr_download_dir, list(author_folders), method, folder_books, folder_files, folder_media)
             poll_timeout = ctx.config.getfloat("Readarr", "import_poll_timeout", fallback=IMPORT_TIMEOUT_SECONDS)
             command_results = monitor_imports(readarr, commands, readarr_download_dir, local_download_dir, timeout=poll_timeout) if commands else {}
             command_for = {c.get("_rsoul_folder"): c for c in commands}
 
             for folder in author_folders:
                 command = command_for.get(folder)
+                book_ids = folder_books.get(folder, [])
+                unique_id = book_ids[0] if len(set(book_ids)) == 1 and book_ids else None
+                tracked_files = folder_files.get(folder, [])
+
+                def pending_for(cmd):
+                    return pending_import_record(
+                        folder, readarr_download_dir, local_download_dir, tracked_files,
+                        cmd.get("id") if cmd else None,
+                        method=method, book_id=unique_id, media_type=folder_media.get(folder, ""),
+                        edition_id=cmd.get("_rsoul_edition_id") if cmd else None,
+                        before_ids=cmd.get("_rsoul_before_ids") if cmd else None,
+                    )
+
                 if command is None:
                     # Readarr/Chaptarr didn't accept the import (unreachable?): keep the files
-                    # staged and submit again on the next run instead of losing track of them
-                    outcome = pending_import_record(folder, readarr_download_dir, local_download_dir, folder_files.get(folder, []), None)
+                    # staged and try the SAME method next run, never a fallback scan.
+                    outcome = pending_for(None)
                 else:
                     ok = command_results.get(command["id"], False)
                     if ok is None:
-                        outcome = pending_import_record(folder, readarr_download_dir, local_download_dir, folder_files.get(folder, []), command["id"])
+                        outcome = pending_for(command)
                     elif ok:
-                        left = files_left_after_import(folder_files.get(folder, []), os.path.join(local_download_dir, folder))
+                        left = files_left_after_import(tracked_files, os.path.join(local_download_dir, folder))
                         outcome = left is None
                         if left:
                             # Like every other failed import: don't leave the files where the next
                             # import of this author or book would trip over them
                             move_files_aside(local_download_dir, folder, [os.path.basename(p) for p in left])
+                        elif method == "targeted":
+                            verified = import_identity.verify_new_bookfiles(
+                                readarr, unique_id, command.get("_rsoul_edition_id"), command.get("_rsoul_before_ids")
+                            )
+                            if verified is None:
+                                logger.warning("Import of %s finished, but the requested book/edition has not been verified; tracking across runs", folder)
+                                outcome = pending_for(command)
+                            else:
+                                outcome = verified
                     else:
                         outcome = False
                 for book_id in folder_books.get(folder, []):
-                    results[book_id] = outcome
-                    if outcome is True and wanted_record_still_empty(readarr, book_id):
+                    if outcome is True and method == "scan" and wanted_record_still_empty(readarr, book_id):
                         source_id, title = book_sources.get(book_id, ("", ""))
-                        logger.warning(
-                            f"{title or folder}: the files were imported, but not for the record that was wanted (book {book_id} still has no files). "
-                            "Readarr/Chaptarr filed them under another record; look for the files in its library. "
-                            "Setting [Readarr] import_method = targeted makes R:soul name the book for each import."
+                        logger.error(
+                            f"{title or folder}: import finished but not for the record that was wanted "
+                            f"(book {book_id} still has no files). It was probably attached to another record. "
+                            "Not counted as imported and not recorded in the ledger. "
+                            "Use [Readarr] import_method = targeted to avoid a scan selecting another book."
                         )
+                        outcome = False
+                    results[book_id] = outcome
                     if outcome is False and ctx.history:
                         # Readarr/Chaptarr rejected these files. Without a record of the peer the
                         # next run would find, download and fail on exactly the same files again.

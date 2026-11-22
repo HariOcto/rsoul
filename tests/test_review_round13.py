@@ -240,3 +240,46 @@ def test_run_workflow_does_not_redownload_a_book_awaiting_targeted_verification(
     ctx.orchestrator = Orch()
     workflow.run_workflow(ctx, [wanted(4020, "The Trafalgar Gambit", author=NUTTALL)])
     assert ctx.state.has_pending_state()
+
+
+# ---------------------------------------------------------------------------
+# Verification against what Chaptarr really returns
+# (BookFileResource in Chaptarr v0.9.1000: no editionId at all, and bookId is 0 when the
+# file's edition isn't loaded with it). The read-back must not require either field.
+# ---------------------------------------------------------------------------
+
+
+class BookFileServer:
+    ver_uri = "/api/v1"
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def _get(self, path, ver, params=None):
+        assert path == "bookfile"
+        return self.rows
+
+
+def chaptarr_row(file_id, book_id=4020):
+    return {"id": file_id, "authorId": 37, "bookId": book_id, "path": f"/audiobooks/x/{file_id}.mp3", "size": 1, "quality": {}}
+
+
+@pytest.mark.parametrize("reported_book", [4020, 0, None])
+def test_new_file_on_the_wanted_book_verifies_with_chaptarrs_fields(reported_book):
+    row = chaptarr_row(9001, reported_book)
+    if reported_book is None:
+        del row["bookId"]
+    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(1), row]), 4020, 21610, ["1"]) is True
+
+
+def test_contradicting_fields_still_fail_where_a_server_reports_them():
+    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(9001, 77)]), 4020, 21610, []) is False
+    wrong_edition = dict(chaptarr_row(9001), editionId=999)
+    assert import_identity.verify_new_bookfiles(BookFileServer([wrong_edition]), 4020, 21610, []) is False
+    right_edition = dict(chaptarr_row(9001), editionId=21610)
+    assert import_identity.verify_new_bookfiles(BookFileServer([right_edition]), 4020, 21610, []) is True
+
+
+def test_nothing_new_on_the_wanted_book_is_not_verified():
+    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(1)]), 4020, 21610, ["1"]) is None
+    assert import_identity.verify_new_bookfiles(BookFileServer([]), 4020, 21610, None) is None

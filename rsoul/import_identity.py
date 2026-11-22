@@ -33,34 +33,45 @@ def edition_type(edition: dict) -> Optional[str]:
 
 
 def select_edition(book: dict, editions: Any, media_type: str) -> Optional[dict]:
-    """Select one unambiguous edition of the right medium, or fail closed.
+    """Select the edition to import for, or None if there is no safe choice.
 
-    Legacy Readarr is ebook-only and may lack the Chaptarr format fields entirely.
-    Its untyped editions are acceptable for ebook-only records without mediaType.
-    Chaptarr records and all audiobooks require positively identified formats.
+    In order:
+    1. the one monitored edition of the right medium (readingFormatId: 2 audio, 3 ebook);
+    2. the only edition of the right medium;
+    3. on a server without media types (plain Readarr, ebooks only): the one monitored
+       edition, or the only one.
+    Several editions of the right medium with none or several monitored are a choice between
+    recordings or narrators that R:soul can't make: refused, with the editions in the log.
     """
     rows = [e for e in editions if isinstance(e, dict) and e.get("id")] if isinstance(editions, list) else []
     book_type = str(book.get("mediaType") or "").lower()
     if book_type and book_type in (AUDIOBOOK, EBOOK) and book_type != media_type:
         logger.warning("Targeted import rejected: book's media type %s is not %s", book_type, media_type)
         return None
-    candidates = [e for e in rows if edition_type(e) == media_type]
-    if media_type == EBOOK and not book_type and not candidates:
-        # The old Readarr endpoint is ebook-only. Do not accept an explicitly physical or
-        # explicitly audiobook edition just because it was returned beside an untyped one.
-        if rows and all(edition_type(e) is None for e in rows):
-            candidates = rows
-    if not candidates:
-        logger.warning("Targeted import: no positively identified %s edition for book %s", media_type, book.get("id", "?"))
-        return None
-    monitored = [e for e in candidates if e.get("monitored") is True]
-    if len(monitored) == 1:
-        return monitored[0]
-    if len(candidates) == 1:
-        return candidates[0]
+
+    typed = [e for e in rows if edition_type(e) == media_type]
+    monitored_typed = [e for e in typed if e.get("monitored") is True]
+    if len(monitored_typed) == 1:
+        return monitored_typed[0]
+    if len(typed) == 1:
+        return typed[0]
+
+    if not typed:
+        # No edition names the medium. Only plain Readarr (no media types at all, ebooks only)
+        # gets the benefit of the doubt: an untyped edition on Chaptarr may be a physical one.
+        record_is_right_medium = not book_type and media_type == EBOOK
+        untyped = [e for e in rows if edition_type(e) is None]
+        monitored_untyped = [e for e in untyped if e.get("monitored") is True]
+        if record_is_right_medium and len(untyped) == len(rows):
+            if len(monitored_untyped) == 1:
+                return monitored_untyped[0]
+            if len(untyped) == 1:
+                return untyped[0]
+
     logger.warning(
-        "Targeted import: book %s has %d possible %s editions (%d monitored); cannot select narrator/edition safely",
-        book.get("id", "?"), len(candidates), media_type, len(monitored),
+        "Targeted import: no safe %s edition for book %s among %d (%d of that medium, %d of them monitored): %s",
+        media_type, book.get("id", "?"), len(rows), len(typed), len(monitored_typed),
+        [(e.get("id"), e.get("readingFormatId"), "monitored" if e.get("monitored") else "", (e.get("title") or "")[:40]) for e in rows[:12]],
     )
     return None
 
@@ -86,11 +97,21 @@ def bookfile_ids_before(client: Any, book_id: Any) -> Optional[list]:
     return sorted({str(row["id"]) for row in rows}) if rows is not None else None
 
 
-def verify_new_bookfiles(client: Any, book_id: Any, edition_id: Any, before_ids: Any) -> Optional[bool]:
-    """True=new attachment on requested book+edition; False=provable misassignment;
-    None=not yet verifiable. In particular 'all staging files disappeared' is not proof.
+def verify_new_bookfiles(client: Any, book_id: Any, edition_id: Any, before_ids: Any, expected_files: int = 0) -> Optional[bool]:
+    """Did the import attach new files to the wanted book?
+
+    True  = new book files appeared on the wanted book.
+    False = a new file is there, but Chaptarr itself reports another book or edition for it.
+    None  = nothing new on the wanted book (yet), or it can't be checked.
+
+    What counts as proof is the query, not the rows: `bookfile?bookId=N` returns the files of
+    book N, so a file ID that wasn't there before the import is a file the import attached to
+    that book. The rows themselves say little. Chaptarr's book-file resource has no
+    `editionId` at all, and its `bookId` is 0 when the edition isn't loaded with the file
+    (checked against Chaptarr v0.9.1000), so neither field may be required. They are only
+    used where a server does report them and they contradict the request.
     """
-    if edition_id is None or before_ids is None:
+    if before_ids is None:
         return None
     rows = bookfile_rows(client, book_id)
     if rows is None:
@@ -98,18 +119,24 @@ def verify_new_bookfiles(client: Any, book_id: Any, edition_id: Any, before_ids:
     old = {str(i) for i in before_ids}
     fresh = [row for row in rows if str(row["id"]) not in old]
     if not fresh:
-        logger.warning("Book %s, edition %s: import completed but no NEW bookfile has appeared on the requested record", book_id, edition_id)
+        logger.warning("Book %s: the import finished, but no new book file has appeared on the wanted record", book_id)
         return None
-    # Some older endpoints omit the identifiers: do not infer them from the query filter.
-    if any(row.get("bookId") is None or row.get("editionId") is None for row in fresh):
-        logger.warning("Book %s: new bookfile is missing bookId/editionId; import remains unverified", book_id)
-        return None
-    mismatched = [row for row in fresh if str(row["bookId"]) != str(book_id) or str(row["editionId"]) != str(edition_id)]
+
+    def contradicts(row: dict) -> bool:
+        reported_book = row.get("bookId")
+        reported_edition = row.get("editionId")
+        wrong_book = reported_book not in (None, 0, "0", "") and str(reported_book) != str(book_id)
+        wrong_edition = edition_id is not None and reported_edition not in (None, 0, "0", "") and str(reported_edition) != str(edition_id)
+        return wrong_book or wrong_edition
+
+    mismatched = [row for row in fresh if contradicts(row)]
     if mismatched:
         logger.error(
             "WRONG IMPORT DESTINATION: wanted book %s edition %s, but new bookfile(s) reported %s",
             book_id, edition_id, [(r.get("id"), r.get("bookId"), r.get("editionId")) for r in mismatched],
         )
         return False
-    logger.info("Verified new bookfile(s) %s on book %s, edition %s", [row["id"] for row in fresh], book_id, edition_id)
+    if expected_files and len(fresh) < expected_files:
+        logger.warning("Book %s: %d file(s) were imported, %d new book file(s) appeared on the wanted record", book_id, expected_files, len(fresh))
+    logger.info("Verified %d new book file(s) %s on book %s", len(fresh), [row["id"] for row in fresh], book_id)
     return True

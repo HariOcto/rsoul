@@ -55,3 +55,8 @@ that the live Chaptarr API returns bookfile records with the fields `id`, `bookI
 `editionId` on your installed release, or that it handles multi-part files in the same
 way as the test double. If those fields are missing, targeted imports fail closed.
 Test first using a small, dispensable book or a disposable Chaptarr library.
+
+## v10.3 corrections to v10.2
+
+- **Import verification against Chaptarr's real fields.** v10.2 required every new book file to report `bookId` and `editionId` matching the request. Chaptarr's `BookFileResource` (v0.9.1000) has no `editionId` at all, and reports `bookId` 0 when the file's edition isn't loaded, so every targeted import would have stayed unverified and pending. The proof is now the query itself: a new file ID under `bookfile?bookId=N` is a file attached to book N. `bookId`/`editionId` still fail the check where a server reports them and they contradict the request.
+- **Edition selection explains a refusal** by logging the editions it saw (ID, reading format, monitored, title), so a refused import can be fixed in Chaptarr.

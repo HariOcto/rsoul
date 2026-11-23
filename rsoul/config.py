@@ -136,6 +136,7 @@ NON_NEGATIVE_SETTINGS = [
     ("Search Settings", "min_author_jaccard"),
     ("Search Settings", "audiobook_min_size_mb"),
     ("Search Settings", "audiobook_min_bitrate_kbps"),
+    ("Search Settings", "audiobook_min_duration_minutes"),
     ("Search Settings", "audiobook_duration_tolerance"),
     ("Postprocessing", "failed_retention_days"),
     ("General", "batch_delay"),

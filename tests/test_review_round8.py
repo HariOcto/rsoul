@@ -72,7 +72,8 @@ def audio_file(path, album=None, title=None, artist=None):
 @pytest.mark.parametrize("name", ["book.m4b", "chapter.mp3"])
 def test_tags_are_read_from_real_files(tmp_path, name):
     path = audio_file(tmp_path / name, album="Dune (Unabridged)", title="Chapter 1", artist=HERBERT)
-    assert read_tags(path) == {"album": "Dune (Unabridged)", "title": "Chapter 1", "artist": HERBERT}
+    # "credits" holds every artist and album-artist value (multi-value frames), for the identity check
+    assert read_tags(path) == {"album": "Dune (Unabridged)", "title": "Chapter 1", "artist": HERBERT, "credits": HERBERT}
 
 
 def test_files_without_tags_or_audio_give_no_tags(tmp_path):

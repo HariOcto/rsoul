@@ -490,6 +490,39 @@ def _migrate_legacy(pending):
     return value
 
 
+def _source_item(value):
+    saved = value.get("source_task") or {}
+    extra = saved.get("extra") or {}
+    return dict(extra, title=saved.get("book_title", ""), author_name=saved.get("author_name", ""),
+                bookId=saved.get("book_id"), dir=saved.get("local_dir", ""), filename=saved.get("filename", ""),
+                backend_name=saved.get("backend_name", "slskd"), seriesTitle=saved.get("series_title", ""),
+                full_dir=extra.get("full_dir") or extra.get("file_dir", ""))
+
+
+def _revalidate_owned(client, value, config):
+    """Run validate_inputs on the files a transaction owns, at their current place."""
+    root = value.get("download_root", "")
+    shadow = copy.deepcopy(value)
+    folders = set()
+    for entry in shadow.get("manifest") or []:
+        here = next((p for p in (entry.get("stage_path"), entry.get("source_path")) if p and os.path.isfile(p) and not os.path.islink(p)), None)
+        if not here:
+            return f"{entry.get('name')} is neither staged nor at its source"
+        entry["source_path"] = here
+        folders.add(os.path.dirname(here))
+    if len(folders) != 1 or not root or not _inside(root, next(iter(folders))):
+        return "The owned files are not in one folder inside the download mount"
+    item = _source_item(value)
+    item["dir"] = os.path.relpath(next(iter(folders)), root)
+    item["expected_files"] = [e["name"] for e in shadow["manifest"]]
+    item["filename"] = item["expected_files"][0] if item["expected_files"] else ""
+    error = validate_inputs(SimpleNamespace(config=config, readarr=client), item, shadow)
+    for key in ("audio_validation", "recording_policy"):
+        if key in shadow:
+            value[key] = shadow[key]
+    return error
+
+
 def check_pending(client, pending, now=None, config=None, persist=None):
     """Read-only reconciliation first; retained dicts never imply success or peer fault."""
     now = time.time() if now is None else now
@@ -512,12 +545,7 @@ def check_pending(client, pending, now=None, config=None, persist=None):
     if value.get("phase") == "validating" and not value.get("attempts"):
         if config is None or _disabled(config) or not writable:
             return keep("validating", "Input validation is paused; no filesystem mutation permitted")
-        saved = value.get("source_task") or {}
-        extra = saved.get("extra") or {}
-        item = dict(extra, title=saved.get("book_title", ""), author_name=saved.get("author_name", ""),
-                    bookId=saved.get("book_id"), dir=saved.get("local_dir", ""), filename=saved.get("filename", ""),
-                    backend_name=saved.get("backend_name", "slskd"), seriesTitle=saved.get("series_title", ""),
-                    full_dir=extra.get("full_dir") or extra.get("file_dir", ""))
+        item = _source_item(value)
         try:
             error = validate_inputs(SimpleNamespace(config=config, readarr=client), item, value)
         except StatePersistenceError:
@@ -528,7 +556,26 @@ def check_pending(client, pending, now=None, config=None, persist=None):
             error = f"Input validation is unavailable: {exc}"
         if error:
             return keep("needs_review", error)
-        value.update(inputs_validated=True, phase="staging")
+        value.update(inputs_validated=True, phase="staging", validation_policy=VALIDATION_POLICY)
+        _checkpoint(value, persist)
+
+    if (value.get("phase") in ("staging", "staged") and not value.get("attempts") and value.get("command_id") is None
+            and not value.get("legacy") and int(value.get("validation_policy") or 1) < VALIDATION_POLICY):
+        # Validated under older rules and never submitted: validate the files it owns now, wherever
+        # they are (staged or still at the source), before anything is moved further or submitted.
+        if config is None or _disabled(config) or not writable:
+            return keep(value["phase"], "Validation under the current rules is paused; nothing is submitted")
+        try:
+            error = _revalidate_owned(client, value, config)
+        except StatePersistenceError:
+            raise
+        except CatalogUnavailable as exc:
+            return keep(value["phase"], f"Validation under the current rules is deferred: {exc}")
+        except Exception as exc:
+            error = f"Validation under the current rules is unavailable: {exc}"
+        if error:
+            return keep("needs_review", "Validation under the current rules: " + error)
+        value["validation_policy"] = VALIDATION_POLICY
         _checkpoint(value, persist)
 
     if value.get("phase") == "staging" and not value.get("attempts"):
@@ -585,6 +632,25 @@ def check_pending(client, pending, now=None, config=None, persist=None):
     return keep("submission_unknown", reason)
 
 
+# Default for [Search Settings] audiobook_min_duration_minutes
+DEFAULT_MIN_AUDIOBOOK_MINUTES = 15
+
+
+def _too_short(ctx, records):
+    """[Search Settings] audiobook_min_duration_minutes (default 15; 0 = off): a download whose
+    files play for less than this in total is not an audiobook (a song, a sample), whatever its
+    name says. Durations that can't be read are not evidence either way."""
+    minimum = ctx.config.getfloat("Search Settings", "audiobook_min_duration_minutes", fallback=DEFAULT_MIN_AUDIOBOOK_MINUTES)
+    seconds = [r.get("duration_seconds") for r in records]
+    if not minimum or minimum <= 0 or not seconds or any(not isinstance(s, (int, float)) or s <= 0 for s in seconds):
+        return ""
+    total = float(sum(seconds))
+    if total < minimum * 60:
+        return (f"The files play for {total / 60:.1f} minutes in total, less than audiobook_min_duration_minutes "
+                f"({minimum:g}): not an audiobook")
+    return ""
+
+
 def _runtime_drift(ctx, pending, records):
     """[Search Settings] audiobook_duration_tolerance (off by default): set the files aside when
     their total running time is further from Chaptarr's length for the book than the tolerance.
@@ -613,6 +679,42 @@ def _runtime_drift(ctx, pending, records):
     return ""
 
 
+# Version of the rules validate_inputs applies. Work validated under an older version and not
+# yet submitted is validated again before submission (see check_pending).
+VALIDATION_POLICY = 2
+
+
+def _catalog_narrators(ctx, item):
+    from .match import book_narrators
+    readarr = getattr(ctx, "readarr", None)
+    if readarr is None:
+        raise CatalogUnavailable("No catalog connection to read the book's narrators")
+    try:
+        book = readarr.get_book(item.get("bookId"))
+    except Exception as exc:
+        raise CatalogUnavailable(f"Cannot read the book's narrators: {exc}") from exc
+    return book_narrators(book if isinstance(book, dict) else {})
+
+
+def _evidence_problem(ctx, item, source, names, title):
+    """The search-time evidence decision again, on the peer's folder, with the same inputs
+    (the book's title and its narrators from the catalog). "" when the files may be imported."""
+    from .match import CONFLICT, audiobook_evidence, author_verdict, music_library
+    author = item.get("author_name", "")
+    ext = os.path.splitext(names[0])[1].lstrip(".") if names else ""
+    path = source + "\\" + " ".join(names[:3])
+    if audiobook_evidence(author, path, ext, (), title, directory=source):
+        return ""
+    narrators = _catalog_narrators(ctx, item)  # only needed when nothing else shows it
+    if audiobook_evidence(author, path, ext, narrators, title, directory=source):
+        return ""
+    if author_verdict(author, path, title, narrators) == CONFLICT:
+        return f"The source folder ({source}) names another person with the author's surname"
+    if music_library(source):
+        return f"The files come from a music library folder ({source}), not this author's audiobook"
+    return f"Nothing in the source folder ({source}) marks it as {author}'s audiobook"
+
+
 def validate_inputs(ctx, item, pending):
     paths = [f["source_path"] for f in pending["manifest"]]
     if pending["media_type"] == "audiobook":
@@ -625,10 +727,20 @@ def validate_inputs(ctx, item, pending):
         names = [f["name"] for f in pending["manifest"]]
         if (folder and fragment_release(title, folder)) or (names and all(fragment_release(title, n) for n in names)):
             return "The selected files are a fragment (sample, prologue or excerpt), not the complete book"
+        # The search-time evidence rules again, on the peer's folder: a download queued before
+        # they existed (or resumed from saved state) gets the same scrutiny before import
+        source = item.get("full_dir") or ""
+        if source:
+            reason = _evidence_problem(ctx, item, source, names, title)
+            if reason:
+                return reason
         valid, detail, records = audiotags.validate_audio_files(paths)
         pending["audio_validation"] = records
         if not valid:
             return "Invalid or unreadable audio: " + detail
+        short = _too_short(ctx, records)
+        if short:
+            return short
         drift = _runtime_drift(ctx, pending, records)
         if drift:
             return drift
@@ -688,7 +800,7 @@ def process_one(ctx, item, local_root, server_root, method, poll=True):
         error = f"Input validation is unavailable: {exc}"
     if error:
         return _retain(pending, "needs_review", error, persist)
-    pending.update(inputs_validated=True, phase="staging")
+    pending.update(inputs_validated=True, phase="staging", validation_policy=VALIDATION_POLICY)
     _checkpoint(pending, persist)
     recover_staging(pending, persist)
     if pending["phase"] != "staged":

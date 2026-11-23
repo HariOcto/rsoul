@@ -1,6 +1,8 @@
 import difflib
 import logging
+import os
 import re
+import unicodedata
 from typing import Any, Optional, Dict, List, Sequence, Tuple
 from .display import print_match_details
 from .utils import normalize_for_matching, title_contained_in_filename, jaccard_similarity, length_ratio, extract_author_title, STOP_WORDS
@@ -763,10 +765,228 @@ def title_segment_match(title: str, candidate: str, author_name: str = "", serie
     return False
 
 
-def author_in_name(author_name: str, candidate: str) -> bool:
-    """True if the author's surname appears in the candidate name (or path)."""
-    words = [w for w in normalize_for_matching(author_name).split() if len(w) > 1 and w not in _NAME_SUFFIXES]
-    return bool(words) and words[-1] in normalize_for_matching(candidate.replace("\\", " ")).split()
+# Words that may stand right before an author's surname without naming another person
+# ("read by Brown", "01 Brown - ...")
+_NAME_CONNECTORS = {
+    "by", "from", "read", "narrated", "written", "and", "und", "et", "y", "the", "of", "feat", "ft", "with", "mit",
+    "dr", "prof", "mr", "mrs", "ms", "sir", "audiobook", "audiobooks", "audio", "books", "book", "hoerbuch",
+    "hoerbuecher", "horbuch", "horbucher", "ebooks", "unabridged", "abridged",
+}
+# Particles that belong to a surname ("Le Guin", "van Vogt", "de Camp")
+_SURNAME_PARTICLES = {"le", "la", "de", "du", "des", "van", "von", "der", "den", "del", "della", "di", "da", "ter", "ten", "st"}
+# Field separators inside one folder or file name: "Title - Author", "Author_-_Title", "A; B", "A & B"
+_FIELD_SPLIT = re.compile(r"\s+[-\u2013\u2014]+\s+|_+-+_+|\s+[-\u2013\u2014]+(?=[^\W\d_])|(?<=[^\W_])[-\u2013\u2014]+\s+|[;|&+]|\(|\)|\[|\]")
+
+FULL, BARE, CONFLICT, NONE = "full", "bare", "conflict", "none"
+
+
+def _plain(text: str) -> str:
+    """Lower case, punctuation as spaces, accents removed ("Música" -> "musica")."""
+    text = unicodedata.normalize("NFKD", normalize_for_matching(text or ""))
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def _person_words(name: str) -> List[str]:
+    return [w for w in _plain(name).split() if w not in _NAME_SUFFIXES]
+
+
+def _split_author(author_name: str) -> Tuple[List[str], List[str]]:
+    """(given names and initials, surname words): "Ursula K. Le Guin" -> (["ursula", "k"], ["le", "guin"])."""
+    words = _person_words(author_name)
+    if not words:
+        return [], []
+    end = len(words) - 1
+    start = end
+    while start > 1 and words[start - 1] in _SURNAME_PARTICLES:
+        start -= 1
+    return words[:start], words[start:]
+
+
+def _fields(candidate: str) -> List[List[str]]:
+    """The words of every name field: path segments, then "Title - Author" parts, "&" lists ...
+    A comma stays as its own token so "Brown, Ryk" can be read surname-first."""
+    fields = []
+    for segment in re.split(r"[\\/]", candidate or ""):
+        segment = re.sub(r"\.(m4b|m4a|mp3|aac|flac|ogg|opus|wma|wav|aax|aa)$", "", segment.strip(), flags=re.IGNORECASE)
+        for part in _FIELD_SPLIT.split(segment):
+            tokens = []
+            for raw in re.findall(r"[^\W_]+|,", part):
+                tokens.append(raw if raw == "," else _plain(raw))
+            tokens = [t for t in tokens if t]
+            if tokens:
+                fields.append(tokens)
+    return fields
+
+
+def _is_name_word(token: str, stop: set) -> bool:
+    return bool(token) and token != "," and not token.isdigit() and token not in _NAME_CONNECTORS and token not in stop
+
+
+def _classify(person: List[str], given: List[str], narrators: List[List[str]], surname: List[str]) -> str:
+    """One mention of the surname, with the name words that go with it (in reading order)."""
+    if not person:
+        return BARE
+    full_words = person + surname
+    for narrator in narrators:
+        if full_words == narrator or (len(person) >= 1 and set(full_words) == set(narrator)):
+            return "narrator"
+    initials = {g[0] for g in given}
+    for word in person:
+        if word in given:
+            continue
+        if len(word) == 1 and word in initials:
+            continue
+        return CONFLICT  # a first name or initial the author doesn't have: another person
+    first = given[0] if given else ""
+    if first and (first in person or first[0] in [w for w in person if len(w) == 1]):
+        return FULL
+    return BARE  # only a middle initial ("F. Hamilton"): compatible but not the author named in full
+
+
+def author_mentions_detail(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> Dict[str, int]:
+    """Count the author's surname mentions in a name or path by what they show.
+
+    full      the author's first name (or its initial) with the surname: "Ryk Brown", "Brown, Ryk", "C. Nuttall"
+    bare      the surname alone ("Brown", "Resistance - Brown"), or with only a matching middle initial
+    conflict  the surname with a given name or initial the author doesn't have: "Scott Brown",
+              "Brown, Scott", "Michael F. Hamilton", "Anne Le Guin"
+    narrator  a narrator Chaptarr lists for the book, who happens to share the surname
+
+    Name words are read within one field only (a path segment, or one side of " - "), and the
+    book's own title words never count as a given name ("Resistance Brown" is title + author).
+    """
+    given, surname = _split_author(author_name)
+    counts = {FULL: 0, BARE: 0, CONFLICT: 0, "narrator": 0}
+    if not surname:
+        return counts
+    narrator_words = [w for w in (_person_words(n) for n in narrators) if w]
+    stop = set(_plain(title).split()) - set(given) - set(surname)
+    last, particles = surname[-1], set(surname[:-1])
+    for tokens in _fields(candidate):
+        for j, token in enumerate(tokens):
+            if token != last:
+                continue
+            if not given:
+                counts[FULL] += 1  # one-name authors: nothing to compare
+                continue
+            # The surname's own particles ("Le" Guin) belong to it, written before or, in the
+            # "Guin, Ursula K. Le" form, after the given names
+            start = j
+            while start > 0 and tokens[start - 1] in particles:
+                start -= 1
+            before: List[str] = []
+            i = start - 1
+            while i >= 0 and len(before) < 4 and _is_name_word(tokens[i], stop):
+                before.insert(0, tokens[i])
+                i -= 1
+            after: List[str] = []
+            if not before and j + 1 < len(tokens) and tokens[j + 1] == ",":
+                k = j + 2
+                while k < len(tokens) and len(after) < 5 and _is_name_word(tokens[k], stop):
+                    after.append(tokens[k])
+                    k += 1
+                while after and after[-1] in particles:
+                    after.pop()
+            counts[_classify(before or after, given, narrator_words, surname)] += 1
+    return counts
+
+
+def author_verdict(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> str:
+    """FULL, BARE, CONFLICT or NONE for a whole name or path.
+
+    A conflicting person is decisive unless the same path also names the author in full
+    (a co-credit); a bare surname never outweighs it ("Audiobooks\\Brown\\Scott Brown").
+    """
+    counts = author_mentions_detail(author_name, candidate, title, narrators)
+    if counts[CONFLICT] and not counts[FULL]:
+        return CONFLICT
+    if counts[FULL]:
+        return FULL
+    if counts[BARE]:
+        return BARE
+    return NONE
+
+
+def author_mentions(author_name: str, candidate: str) -> Tuple[int, int]:
+    """(compatible, conflicting) mentions: kept for callers that only need the two counts."""
+    counts = author_mentions_detail(author_name, candidate)
+    return counts[FULL] + counts[BARE], counts[CONFLICT]
+
+
+def author_named_in_full(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> bool:
+    return author_verdict(author_name, candidate, title, narrators) == FULL
+
+
+def author_in_name(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> bool:
+    """True if the candidate names this author (in full, or by surname alone) and no other person
+    with the same surname: "Scott Brown" does not stand for Ryk Brown."""
+    return author_verdict(author_name, candidate or "", title, narrators) in (FULL, BARE)
+
+
+# Words and phrases that mark spoken word, matched as whole words ("Booker" is not "book")
+_SPOKEN_TOKENS = {
+    "audiobook", "audiobooks", "audiobk", "hoerbuch", "horbuch", "hoerbuecher", "horbucher", "hoerspiel", "horspiel",
+    "audible", "libation", "unabridged", "abridged", "narrated", "spoken", "audiolibro", "audiolibros", "luisterboek",
+    "luisterboeken", "book", "books", "ebooks", "novel", "novels",
+}
+_SPOKEN_PHRASES = ("audio book", "audio books", "read by", "spoken word", "livre audio", "livres audio")
+_MUSIC_FOLDERS = {"music", "musik", "musique", "musica", "muziek", "musiikki", "soundtrack", "soundtracks", "ost", "discography", "albums"}
+# Containers used for audiobooks and hardly ever for music
+_AUDIOBOOK_EXTENSIONS = {"m4b", "aax", "aa"}
+
+
+def spoken_word_marked(text: str) -> bool:
+    plain = " ".join(_plain((text or "").replace("\\", " ").replace("/", " ")).split())
+    return bool(set(plain.split()) & _SPOKEN_TOKENS) or any(f" {p} " in f" {plain} " for p in _SPOKEN_PHRASES)
+
+
+def music_library(directory: str) -> bool:
+    """True when a folder sits in a music library and nothing in its path marks it as spoken word."""
+    segments = [" ".join(_plain(s).split()) for s in re.split(r"[\\/]", directory or "") if s.strip()]
+    music = any(s in _MUSIC_FOLDERS or (s.split(" ")[0] in _MUSIC_FOLDERS and len(s.split()) <= 2) for s in segments)
+    return music and not spoken_word_marked(directory)
+
+
+def narrator_named(text: str, narrators: Sequence[str]) -> bool:
+    plain = " " + " ".join(_plain((text or "").replace("\\", " ").replace("/", " ")).split()) + " "
+    for narrator in narrators:
+        words = _person_words(narrator)
+        if len(words) >= 2 and f" {' '.join(words)} " in plain:
+            return True
+    return False
+
+
+def audiobook_evidence(author_name: str, path: str, extension: str, narrators: Sequence[str] = (), title: str = "", directory: Optional[str] = None) -> str:
+    """Why a matched folder or file looks like this author's audiobook, or "" if nothing does.
+
+    A title match plus the author's surname is not enough on its own: Soulseek searches match
+    words anywhere in a path, so "Brown - Resistance" brings up every song called Resistance by
+    anyone called Brown. Any other person with the author's surname rules it out; otherwise one
+    of these is needed:
+    - the author named in full ("Ryk Brown", "Brown, Ryk", "C. Nuttall");
+    - a spoken-word folder or file name (Audiobooks, Audio Books, Hörbücher, Unabridged, read by ...);
+    - an audiobook container (m4b);
+    - a narrator Chaptarr lists for the book.
+    In a music library, the author named in full and an m4b or a listed narrator are both needed.
+    The same function decides at search time and again before import.
+    """
+    verdict = author_verdict(author_name, path, title, narrators)
+    if verdict == CONFLICT:
+        return ""
+    in_music = music_library(path if directory is None else directory)
+    format_ok = (extension or "").lower() in _AUDIOBOOK_EXTENSIONS
+    narrated = narrator_named(path, narrators)
+    if in_music:
+        return "author named in full, in a music folder" if verdict == FULL and (format_ok or narrated) else ""
+    if verdict == FULL:
+        return "author named in full"
+    if spoken_word_marked(path):
+        return "spoken-word folder or name"
+    if format_ok:
+        return "audiobook format"
+    if narrated:
+        return "narrator named"
+    return ""
 
 
 def audiobook_folder_match(
@@ -879,6 +1099,12 @@ def audiobook_folder_match(
     offered: Dict[tuple, Dict[str, Any]] = {}
 
     def offer(directory: str, ext: str, files: List[Dict[str, Any]], score: float, file_based: bool) -> None:
+        names = " ".join(split_slskd_path(f["filename"])[1] for f in files[:3])
+        evidence = audiobook_evidence(author_name, f"{directory}\\{names}", ext, narrators, book_title, directory=directory)
+        if not evidence:
+            # A wrong book costs a manual clean-up; a skipped one is only searched again later
+            note("folders with nothing marking them as this author's audiobook", directory)
+            return
         candidate = {
             "directory": directory,
             "extension": ext,
@@ -895,8 +1121,13 @@ def audiobook_folder_match(
             offered[identity] = candidate
 
     for (directory, ext), files in groups.items():
+        if music_library(directory) and author_verdict(author_name, directory, book_title, narrators) != FULL:
+            # "Music\\Japanese\\tacica\\2022 - singularity" for Ryk Brown's Singularity: an album
+            # with the book's title, found because one song's name contains the surname
+            note("music library folders", directory)
+            continue
         if is_disc_folder(directory):
-            if author_in_name(author_name, directory):
+            if author_in_name(author_name, directory, book_title, narrators):
                 logger.info(f"Skipping {directory} from {username}: looks like one disc/part of a multi-part audiobook")
                 note("disc/part folders", directory)
             else:
@@ -920,8 +1151,16 @@ def audiobook_folder_match(
             # Folder names often omit the author ("Audiobooks\\Dune"), and titles repeat across
             # authors, so the author's surname must appear somewhere in the path (or, for a
             # single-file book, the filename). This also rules out other books with the same title.
-            path_text = directory + (" " + split_slskd_path(files[0]["filename"])[1] if len(files) == 1 else "")
-            if not author_in_name(author_name, path_text):
+            # A file name only stands in for the author when it names the book as well
+            # ("Ryk Brown - Resistance.m4b"); a song called "Brown" next to an album titled like
+            # the book says nothing about who wrote it.
+            author_here = author_in_name(author_name, directory, book_title, narrators)
+            if not author_here and len(files) == 1:
+                basename = split_slskd_path(files[0]["filename"])[1]
+                cleaned = clean_audiobook_name(basename) or basename
+                author_here = author_in_name(author_name, basename, book_title, narrators) and any(
+                    title_segment_match(title, name, author_name, series_title, narrators) for name in dict.fromkeys((basename, cleaned)) for title in titles)
+            if not author_here:
                 note("folders without the author's surname", directory)
                 continue
             score = accepted_score(best_score_for(folder_name_candidates(directory, files), checked=True), directory)
@@ -937,7 +1176,7 @@ def audiobook_folder_match(
         reasons = set()
         for book_files in by_book.values():
             basename = split_slskd_path(book_files[0]["filename"])[1]
-            if not author_in_name(author_name, directory + " " + basename):
+            if not author_in_name(author_name, directory + "\\" + basename, book_title, narrators):
                 reasons.add("author")
                 continue
             if names_another_release(book_title, basename, author_name, series_title, narrators):

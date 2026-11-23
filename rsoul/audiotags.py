@@ -35,7 +35,7 @@ import re
 import struct
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .match import _BOOK_WORDS, _COLLECTION_WORDS, _FORMAT_NOISE, _NUMBER_WORD, _meaningful_words, _people_words, names_another_release, title_segment_match, title_variants
+from .match import _BOOK_WORDS, _COLLECTION_WORDS, _FORMAT_NOISE, _NUMBER_WORD, _meaningful_words, _people_words, names_another_release, title_segment_match, title_variants, author_verdict, CONFLICT, FULL
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,18 @@ def read_tags(path: str) -> Dict[str, str]:
             _warned_missing = True
         return {}
 
+    def every(value: Any) -> str:
+        """All values of a multi-value frame, joined with " ; " (artists are often several)."""
+        values = value if isinstance(value, (list, tuple)) else [value]
+        found = []
+        for item in values:
+            text = getattr(item, "text", item)
+            for part in text if isinstance(text, (list, tuple)) else [text]:
+                part = str(part or "").strip()
+                if part and part not in found:
+                    found.append(part)
+        return " ; ".join(found)
+
     def first(value: Any) -> str:
         if isinstance(value, (list, tuple)):
             value = value[0] if value else ""
@@ -77,14 +89,17 @@ def read_tags(path: str) -> Dict[str, str]:
                 tags = ID3(path)
             except ID3NoHeaderError:
                 return {}
-            found = {"album": first(tags.get("TALB")), "title": first(tags.get("TIT2")), "artist": first(tags.get("TPE1")), "albumartist": first(tags.get("TPE2"))}
+            found = {"album": first(tags.get("TALB")), "title": first(tags.get("TIT2")), "artist": first(tags.get("TPE1")), "albumartist": first(tags.get("TPE2")),
+                     "credits": " ; ".join(v for v in (every(tags.get("TPE1")), every(tags.get("TPE2"))) if v)}
         elif ext in (".m4b", ".m4a", ".mp4", ".aac"):
             tags = MP4(path).tags or {}
-            found = {"album": first(tags.get("\xa9alb")), "title": first(tags.get("\xa9nam")), "artist": first(tags.get("\xa9ART")), "albumartist": first(tags.get("aART"))}
+            found = {"album": first(tags.get("\xa9alb")), "title": first(tags.get("\xa9nam")), "artist": first(tags.get("\xa9ART")), "albumartist": first(tags.get("aART")),
+                     "credits": " ; ".join(v for v in (every(tags.get("\xa9ART")), every(tags.get("aART"))) if v)}
         else:
             audio = mutagen.File(path, easy=True)
             tags = (audio.tags if audio is not None else None) or {}
             found = {key: first(tags.get(key)) for key in ("album", "title", "artist", "albumartist")}
+            found["credits"] = " ; ".join(v for v in (every(tags.get("artist")), every(tags.get("albumartist"))) if v)
     except Exception as e:
         logger.debug(f"Could not read the tags of {path}: {e}")
         return {}
@@ -335,9 +350,21 @@ def check_audiobook_tags(
     verdicts: List[Tuple[str, str]] = []
     chapter_titles_naming_another: List[str] = []
     titled = 0
+    artist_contradiction = ""
     for path in paths:
         tags = read_tags(path)
         name = os.path.basename(path)
+        # Artist credits name the author or a narrator, so one that names neither proves nothing.
+        # One naming another person with the author's surname ("Scott Brown" for Ryk Brown) does.
+        # Each file is judged on its own credits: one correctly credited chapter doesn't vouch for
+        # a wrongly credited track next to it. A co-credit of the author in the same file, or a
+        # narrator Chaptarr lists, is no contradiction.
+        credits = tags.get("credits") or " ; ".join(tags[k] for k in ("artist", "albumartist") if tags.get(k))
+        if credits and not artist_contradiction:
+            people = [c.strip() for c in credits.split(" ; ") if c.strip()]
+            credit_verdicts = [author_verdict(author_name, person, "", narrators) for person in people]
+            if CONFLICT in credit_verdicts and FULL not in credit_verdicts:
+                artist_contradiction = f'artist tag of {name} names "{people[credit_verdicts.index(CONFLICT)]}", not {author_name}'
         album = judge(tags["album"], is_album=True) if tags.get("album") else None
 
         if single_file:
@@ -367,6 +394,9 @@ def check_audiobook_tags(
             verdicts.append(album)
         else:
             verdicts.append((UNTAGGED, ""))
+
+    if artist_contradiction:
+        return MISMATCH, artist_contradiction
 
     # Chapter names: one chapter that happens to share a book's title proves nothing, but
     # most of the files naming another book do

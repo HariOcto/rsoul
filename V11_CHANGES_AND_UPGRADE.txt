@@ -729,3 +729,79 @@ Do not restore older journals or downgrade across accepted remote operations
 without reconciling them first: an old snapshot can recreate uncertainty
 about work the server has already accepted. Preserve the stopped backup
 as a recovery aid, not an automatic state reset while work is running.
+
+ADDENDUM (23 November 2026): WRONG-AUTHOR MATCHES
+
+The first live v11 run imported a dance track as Ryk Brown's "Resistance": the
+14 MB file "01 Resistance (JTS Mix).mp3" from a folder "Scott Brown\Hardcore
+Tracks". Three checks are tightened:
+
+- The author's surname must belong to the author. In each path segment, a
+  different given name right before the surname ("Scott Brown", "James
+  Brown") or after a comma ("Brown, Scott") makes that mention another person.
+  Initials count only when they are the author's. One-name authors are
+  unaffected. This applies to folder and file matches alike.
+- An artist or album-artist tag naming another person with the author's
+  surname is a confirmed mismatch, unless another credit names the author.
+  Artist tags naming neither (often the narrator) remain neutral.
+- [Search Settings] audiobook_min_duration_minutes (default 15, 0 = off): files
+  that play for less than this in total are set aside for review, not imported.
+
+The same run also queued tacica's album "singularity" (12 songs, about 45
+minutes) for Ryk Brown's "Singularity": the search "Brown - Singularity" found
+it because one song's name contains "Brown". Two more checks:
+
+- Folders in a music library (a path segment such as Music, Musique, Música,
+  OST or Soundtracks) are skipped unless the path also marks spoken word
+  (Audio Books, Audiobooks, Hörbücher, Spoken Word ...).
+- A file name only stands in for the author when it names the book as well
+  ("Ryk Brown - Singularity.m4b"); otherwise the author must be in the folder
+  path.
+
+The underlying rule, after looking at why both got through: a title match plus
+the author's surname somewhere in the path was treated as enough, but Soulseek
+matches words anywhere in a path, so "Brown - Resistance" returns every song
+called Resistance by anyone called Brown. A wrong book costs a manual clean-up;
+a skipped one is only searched again later. So:
+
+- Every candidate now needs positive evidence that it is this author's
+  audiobook: the author named in full ("Ryk Brown", "Brown, Ryk", "C. Nuttall"),
+  a spoken-word folder or file name (Audiobooks, Audio Books, Hörbücher,
+  Unabridged, read by, Libation, Audible ...), an audiobook container (m4b), or
+  a narrator Chaptarr lists. Every correct pick in the November logs has such
+  evidence; none of the wrong ones has.
+- Fallback queries keep at least two distinctive title words ("Brown - First"
+  and "Brown - my Enemy" are no longer sent); a one-word title is searched
+  with the full author name and "Surname - Title" only.
+- The same checks run again before import, on the peer's folder, so a download
+  queued before this change or resumed from saved state is held for review.
+
+After an outside review of that change:
+
+- Person names are read as a whole, within one field (a path segment, or one
+  side of " - "): a mention is the author in full (first name or its initial
+  with the surname), the surname alone, a listed narrator, or another person
+  (a given name or initial the author doesn't have: "Scott Brown", "Michael F.
+  Hamilton", "Anne Le Guin"). Another person rules a candidate out unless the
+  same path names the author in full; a bare surname never outweighs it.
+  Surname particles ("Le Guin") belong to the surname, and the book's own title
+  words are never read as a given name ("Resistance - Brown").
+- Search and import make the same evidence decision with the same inputs,
+  including the narrators Chaptarr lists (fetched before import only when
+  nothing else shows the evidence; an unreadable catalog defers the import).
+- Artist credits are judged per file, with every value of multi-value tags; a
+  listed narrator sharing the surname is not another author.
+- Unsubmitted work staged under older rules is validated again, on the files
+  it owns, before it is moved further or submitted (validation_policy in the
+  saved transaction). Submitted or uncertain imports are only reconciled.
+- A music folder no longer vetoes on its own: the author named in full plus an
+  m4b or a listed narrator still qualifies. Folder words match whole words.
+- Fallback queries may drop an article ("Tolkien - Hobbit"); the rule that two
+  meaningful words remain applies only when meaningful words are dropped.
+- Edit book_ledger.json only while R:soul is stopped: a running R:soul keeps it
+  in memory and would write the old entry back.
+
+A book already imported wrongly is not undone: delete its file in Chaptarr and
+its entry in book_ledger.json, so the book is wanted and searched again.
+
+Full suite after this change: 1,284 tests passed.

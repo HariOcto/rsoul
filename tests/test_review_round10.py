@@ -285,4 +285,4 @@ def test_disc_folders_of_other_artists_are_not_logged(caplog):
         assert audiobook_folder_match(t, files, "peer", ["mp3"], stats=stats, **THRESHOLDS) == []
     assert "c86" not in caplog.text
     assert "Cry Wolf\\CD1" in caplog.text  # the author's own disc folder is still explained
-    assert stats == {"disc/part folders": 1, "folders without the author's surname": 1}
+    assert stats == {"disc/part folders": 1, "music library folders": 1}  # the c86 disc sits in a music library

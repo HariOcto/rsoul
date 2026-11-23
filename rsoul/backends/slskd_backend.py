@@ -44,16 +44,25 @@ def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks:
     surname = name.split(",", 1)[0].strip() if "," in name else (name.split()[-1] if name.split() else "")
     title = book_title.split(":", 1)[0].strip()
     words = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", title, re.UNICODE)
-    stop = {"the", "a", "an", "of", "and", "or", "for", "to", "in", "on", "book", "volume", "series"}
+    stop = {
+        "the", "a", "an", "of", "and", "or", "for", "to", "in", "on", "at", "by", "with", "from", "as", "is", "be",
+        "my", "your", "his", "her", "its", "our", "their", "i", "you", "we", "it", "this", "that", "no", "not",
+        "book", "volume", "series", "part",
+    }
     distinctive = [word for word in words if word.casefold() not in stop]
+    # Soulseek matches words anywhere in a path, so a query of the surname and one common word
+    # ("Brown - First", "Brown - my Enemy") mostly finds music. The whole title with the surname
+    # is still tried (shares named "Kloos - Corvus"), but no shorter form of a one-word title, and
+    # nothing that leaves fewer than two distinctive words. Every result still has to show
+    # audiobook evidence (match.audiobook_evidence) before it is used.
     queries = [f"{surname} - {title}"]
     if distinctive:
-        queries.append(f"{surname} - {' '.join(distinctive)}")
-    # At most one distinctive word is omitted; never collapse to first name + 'the'.
-    if len(distinctive) >= 2:
+        queries.append(f"{surname} - {' '.join(distinctive)}")  # "Tolkien - Hobbit", "Brown - Vengeance"
+    # At most one distinctive word is omitted, and at least two always remain
+    if len(distinctive) >= 3:
         for index in range(len(distinctive)):
             kept = distinctive[:index] + distinctive[index + 1:]
-            if any(len(word) > 2 and not word.isdigit() for word in kept):
+            if sum(1 for word in kept if len(word) > 2 and not word.isdigit()) >= 2:
                 queries.append(f"{surname} - {' '.join(kept)}")
     return queries[:max(0, max_fallbacks)]
 

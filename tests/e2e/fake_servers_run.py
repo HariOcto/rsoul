@@ -213,6 +213,8 @@ os.environ.update({
     "RSOUL__SLSKD__READARR_DOWNLOAD_DIR": DL,
     "RSOUL__SEARCH_SETTINGS__MEDIA_MODE": "audiobook",
     "RSOUL__SEARCH_SETTINGS__AUDIOBOOK_MIN_SIZE_MB": "0",
+    # The fake chapters play for seconds and stand for a whole book
+    "RSOUL__SEARCH_SETTINGS__AUDIOBOOK_MIN_DURATION_MINUTES": "0",
     "RSOUL__SEARCH_SETTINGS__SEARCH_TYPE": "first_page",
     "RSOUL__SEARCH_SETTINGS__IGNORED_USERS": "",
     "RSOUL__DOWNLOAD_SETTINGS__MONITOR_WINDOW": "0",

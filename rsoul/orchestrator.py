@@ -7,9 +7,13 @@ It handles the search → download → monitor lifecycle.
 
 import time
 import logging
+import inspect
 from typing import List, Optional, Dict, Any, TYPE_CHECKING, Callable, Tuple
 
 from . import health
+from .outcomes import FailureKind, SearchIncomplete, check_fatal_state
+from .persistence import StatePersistenceError
+from .search_control import responsive_wait
 from .backends.base import (
     BackendUnavailable,
     DownloadBackend,
@@ -32,6 +36,7 @@ class DownloadOrchestrator:
 
     # How many search results are tried, best first, until one download starts
     MAX_START_ATTEMPTS = 3
+    supports_interleaved_search = True
 
     def __init__(self, backends: List[DownloadBackend], ctx: "Context"):
         """Initialize orchestrator.
@@ -41,6 +46,9 @@ class DownloadOrchestrator:
             ctx: Application context
         """
         self.backends = backends
+        # Older subclasses may override start_targets with the original protocol.
+        parameters = inspect.signature(self.start_targets).parameters
+        self.supports_interleaved_search = all(name in parameters for name in ("existing_tasks", "max_active"))
         self.ctx = ctx
         self.active_tasks: List[DownloadTask] = []
 
@@ -65,6 +73,17 @@ class DownloadOrchestrator:
         self.last_start_failure = "not_found"
         self._found_results = False
         self.unchecked_task_ids: set = set()
+        self.attempted_book_ids: set = set()
+        self.completed_during_search = []
+        self.remaining_existing_tasks = []
+        self._search_active = None
+        self._search_callback = None
+        self._last_search_poll = 0.0
+        self._polling_search = False
+        self._progress_logs = {}
+        self.last_start_kind = FailureKind.NO_MATCH.value
+        self.last_start_retry_at = None
+        self.ctx.orchestrator = self
 
     def get_backend(self, name: str) -> Optional[DownloadBackend]:
         """Get a backend instance by name.
@@ -92,6 +111,7 @@ class DownloadOrchestrator:
             Completed DownloadTask if successful, None if all backends failed
         """
         for backend in self.backends:
+            check_fatal_state(self.ctx)
             if not backend.is_available():
                 logger.debug(f"Backend {backend.name} not available, skipping")
                 continue
@@ -102,6 +122,8 @@ class DownloadOrchestrator:
                 task = self._try_backend(backend, target)
                 if task and task.status == DownloadStatus.COMPLETED:
                     return task
+            except StatePersistenceError:
+                raise
             except Exception as e:
                 logger.warning(f"Backend {backend.name} failed: {e}")
                 continue
@@ -121,28 +143,36 @@ class DownloadOrchestrator:
         Returns:
             Started DownloadTask if successful, None if all backends failed
         """
-        # Why nothing was started, for the caller: "not_searched" (no backend could be asked),
-        # "not_started" (found, but no download could be queued) or "not_found"
         searched = False
+        incomplete = False
         self._found_results = False
+        self.last_start_kind = FailureKind.NO_MATCH.value
+        self.last_start_retry_at = None
         for backend in self.backends:
+            check_fatal_state(self.ctx)
             if not backend.is_available():
-                logger.warning(f"Backend {backend.name} is not available, skipping")
+                incomplete = True
+                self.last_start_kind = FailureKind.SERVICE_UNAVAILABLE.value
+                logger.warning("Backend %s is unavailable; search outcome deferred", backend.name)
                 continue
-
-            logger.info(f"Trying backend: {backend.name}")
-
             try:
                 task = self._start_backend_download(backend, target)
                 searched = True
                 if task:
                     return task
-            except Exception as e:
-                logger.warning(f"Backend {backend.name} failed: {e}")
-                continue
-
-        self.last_start_failure = "not_searched" if not searched else "not_started" if self._found_results else "not_found"
-        logger.warning(f"All backends failed to start download for: {target.book_title} ({self.last_start_failure.replace('_', ' ')})")
+            except StatePersistenceError:
+                raise
+            except SearchIncomplete as error:
+                incomplete = True
+                self.last_start_kind = error.kind
+                self.last_start_retry_at = error.retry_at
+                logger.warning("Search deferred for %s: %s", target.book_title, error)
+            except Exception as error:
+                incomplete = True
+                self.last_start_kind = FailureKind.SERVICE_UNAVAILABLE.value
+                logger.warning("Backend %s could not complete search/start: %s", backend.name, error)
+        self.last_start_failure = "not_searched" if incomplete or not searched else "not_started" if self._found_results else "not_found"
+        logger.info("No download started for %s (%s; %s)", target.book_title, self.last_start_failure, self.last_start_kind)
         return None
 
     def _try_backend(self, backend: DownloadBackend, target: DownloadTarget) -> Optional[DownloadTask]:
@@ -177,6 +207,7 @@ class DownloadOrchestrator:
         """
         # 1. Search
         logger.info(f"Beginning search for: {target.author_name} - {target.book_title} (book {target.book_id}, {target.media_type})")
+        check_fatal_state(self.ctx)
         results = backend.search(target)
         if not results and getattr(backend, "found_but_unavailable", lambda book_id: False)(target.book_id):
             # Matches exist, but none could be used right now (peer not answering, local folder
@@ -193,6 +224,7 @@ class DownloadOrchestrator:
         # in use...), try the next ones instead of failing on the same result run after run
         task = None
         for attempt, result in enumerate(results[: self.MAX_START_ATTEMPTS], start=1):
+            check_fatal_state(self.ctx)
             task = backend.download(target, result)
             if task:
                 break
@@ -203,7 +235,8 @@ class DownloadOrchestrator:
         # Timers start when the download is queued, not at the first status poll (which only
         # happens after every other book in the batch has been searched)
         now = time.time()
-        task.extra.setdefault("monitor", {}).update({"started_at": now, "last_progress_at": now})
+        task.extra.setdefault("monitor", {}).setdefault("started_at", now)
+        task.extra["monitor"].setdefault("last_progress_at", now)
 
         # Add to state for resume functionality
         if self.ctx.state:
@@ -226,6 +259,12 @@ class DownloadOrchestrator:
         m.setdefault("last_progress_at", now)
         m.setdefault("last_bytes", 0)
         m.setdefault("last_percent", 0.0)
+
+        if task.extra.get("enqueue", {}).get("phase") in ("prepared", "unknown") or task.extra.get("failure_kind") == FailureKind.LEGACY_UNVERIFIED.value:
+            if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
+                task.extra["needs_review"] = True
+                task.error_message = "Ownership/completeness remains uncertain beyond max_download_time; manual review required"
+            return None
 
         if self.max_download_time > 0 and now - m["started_at"] >= self.max_download_time:
             return f"Exceeded max_download_time ({self.max_download_time:g}s)"
@@ -280,6 +319,8 @@ class DownloadOrchestrator:
         try:
             task.poll_failed = False
             return backend.get_status(task)
+        except StatePersistenceError:
+            raise
         except Exception as e:
             # Transient API errors: keep the task and try again next poll
             logger.error(f"Error checking status for {task.filename}: {e}")
@@ -290,7 +331,10 @@ class DownloadOrchestrator:
         """Cancel a download that is being given up on; a failing cancel must not stop the
         monitoring of every other download."""
         try:
+            check_fatal_state(self.ctx)
             backend.cancel(task)
+        except StatePersistenceError:
+            raise
         except Exception as e:
             logger.warning(f"Could not cancel {task.book_title} in {backend.name}: {e}")
 
@@ -305,26 +349,9 @@ class DownloadOrchestrator:
             Updated task with final status
         """
         while True:
-            task = self._poll(backend, task)
-            if task.status == DownloadStatus.COMPLETED:
-                logger.info(f"Download completed: {task.filename}")
+            if self._advance_task(task, None):
                 return task
-            if task.status == DownloadStatus.FAILED:
-                logger.warning(f"Download failed: {task.filename} - {task.error_message}")
-                return task
-            if task.status == DownloadStatus.CANCELLED:
-                logger.info(f"Download cancelled: {task.filename}")
-                return task
-
-            reason = self.check_timeouts(task)
-            if reason:
-                logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
-                self._cancel(backend, task)
-                task.status = DownloadStatus.FAILED
-                task.error_message = reason
-                return task
-
-            logger.debug(f"Download progress: {task.filename} - {task.progress_percent:.1f}%")
+            health.heartbeat()
             time.sleep(self.poll_interval)
 
     def process_targets(self, targets: List[DownloadTarget]) -> Dict[str, Any]:
@@ -355,57 +382,115 @@ class DownloadOrchestrator:
             "tasks": completed_tasks,
         }
 
-    def start_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> List[DownloadTask]:
-        """Search and enqueue every target (with rate limiting), without waiting for downloads.
+    def _checkpoint(self, task):
+        check_fatal_state(self.ctx)
+        state = getattr(self.ctx, "state", None)
+        if state is not None and not getattr(state, "read_only", False):
+            state.update_task(task)
 
-        Targets that no backend could start are reported through on_complete as a FAILED task.
+    def _advance_task(self, task, on_complete):
+        check_fatal_state(self.ctx)
+        backend = self.get_backend(task.backend_name)
+        if backend is None:
+            task.poll_failed = True
+            task.error_message = "Backend unavailable; retaining transfer ownership"
+            return False
+        refreshed = self._poll(backend, task)
+        if refreshed is not task:
+            task.__dict__.update(refreshed.__dict__)
+        terminal = task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED)
+        if not terminal:
+            reason = self.check_timeouts(task)
+            if reason:
+                self._cancel(backend, task)
+                task.status = DownloadStatus.FAILED
+                task.extra["failure_kind"] = FailureKind.TRANSFER_TIMEOUT.value
+                task.error_message = reason
+                terminal = True
+        if terminal and task.status == DownloadStatus.FAILED:
+            retry = getattr(backend, "retry_after_failure", None)
+            replacement = retry(task) if callable(retry) else None
+            if replacement is not None:
+                if replacement is not task:
+                    task.__dict__.update(replacement.__dict__)
+                terminal = task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED)
+        # Timer updates and complete transfer evidence survive a crash before callbacks.
+        self._checkpoint(task)
+        if terminal:
+            self._finish(task, on_complete)
+            return True
+        self._log_task_progress(task)
+        return False
 
-        Returns:
-            Started tasks, all downloading in parallel from here on.
+    def poll_during_search(self, force=False):
+        if self._search_active is None or self._polling_search:
+            return
+        now = time.time()
+        if not force and now - self._last_search_poll < self.poll_interval:
+            return
+        self._last_search_poll = now
+        self._polling_search = True
+        try:
+            for key, task in list(self._search_active.items()):
+                if self._advance_task(task, self._search_callback):
+                    self.completed_during_search.append(task)
+                    del self._search_active[key]
+                elif task.task_id != key:
+                    del self._search_active[key]
+                    self._search_active[task.task_id] = task
+        finally:
+            self._polling_search = False
+
+    def start_targets(self, targets: List[DownloadTarget], on_complete=None, existing_tasks=None, max_active=None) -> List[DownloadTask]:
+        """Search new targets while polling/importing owned work, honoring current capacity.
+
+        Only actually attempted target IDs are acknowledged to the durable wanted queue.
+        Return active new tasks; existing objects are updated in-place, including retries.
         """
-        active_tasks: List[DownloadTask] = []
+        existing_tasks = list(existing_tasks or [])
+        existing_objects = {id(task) for task in existing_tasks}
+        self.attempted_book_ids = set()
+        self.completed_during_search = []
+        self._search_active = {task.task_id: task for task in existing_tasks}
+        self._search_callback = on_complete
+        self._last_search_poll = 0.0
         failed_count = 0
-
         batch_delay = self.ctx.config.getfloat("General", "batch_delay", fallback=3.0)
         last_target_time = 0.0
-
-        for i, target in enumerate(targets):
-            # Elapsed-time-aware rate limiting (skip for first item)
-            if i > 0 and batch_delay > 0:
-                elapsed = time.time() - last_target_time
-                if elapsed < batch_delay:
-                    time.sleep(batch_delay - elapsed)
-            last_target_time = time.time()
-            health.heartbeat()
-
-            task = self.start_download(target)
-            if task:
-                active_tasks.append(task)
-                continue
-
-            failed_count += 1
-            # Fire callback with synthetic FAILED task so caller can handle
-            # (summary, unmonitor, failure_list.txt)
-            if on_complete:
-                failed_task = DownloadTask(
-                    task_id=f"not_found_{target.book_id}",
-                    backend_name="none",
-                    status=DownloadStatus.FAILED,
-                    book_title=target.book_title,
-                    author_name=target.author_name,
-                    book_id=target.book_id,
-                    series_title=target.series_title,
-                    filename="",
-                    error_message="No backend could find or start download",
-                    extra={"start_failure": self.last_start_failure},
-                )
-                try:
-                    on_complete(failed_task)
-                except Exception as e:
-                    logger.error(f"Error in on_complete callback for failed target: {e}")
-
-        logger.info(f"Batch Enqueue Complete. Active: {len(active_tasks)}, Failed to start: {failed_count}")
-        return active_tasks
+        try:
+            for target in targets:
+                check_fatal_state(self.ctx)
+                self.poll_during_search(force=True)
+                if max_active is not None and max_active > 0 and len(self._search_active) >= max_active:
+                    break
+                delay = batch_delay - (time.time() - last_target_time)
+                if last_target_time and delay > 0:
+                    responsive_wait(self.ctx, delay)
+                last_target_time = time.time()
+                health.heartbeat()
+                check_fatal_state(self.ctx)
+                self.attempted_book_ids.add(target.book_id)
+                task = self.start_download(target)
+                if task is not None:
+                    self._search_active[task.task_id] = task
+                    continue
+                failed_count += 1
+                failed = DownloadTask(
+                    task_id=f"not_found_{target.book_id}", backend_name="none", status=DownloadStatus.FAILED,
+                    book_title=target.book_title, author_name=target.author_name, book_id=target.book_id,
+                    series_title=target.series_title, filename="", error_message="No backend could finish searching or start a usable download",
+                    extra={"start_failure": self.last_start_failure, "failure_kind": self.last_start_kind,
+                           "retry_at": self.last_start_retry_at, "media_type": target.media_type})
+                self._finish(failed, on_complete)
+            self.poll_during_search(force=True)
+            remaining = list(self._search_active.values())
+            self.remaining_existing_tasks = [task for task in remaining if id(task) in existing_objects]
+            started = [task for task in remaining if id(task) not in existing_objects]
+            logger.info("Search batch complete: %s owned active, %s deferred/failed starts", len(remaining), failed_count)
+            return started
+        finally:
+            self._search_active = None
+            self._search_callback = None
 
     def batch_process_targets(self, targets: List[DownloadTarget], on_complete: Optional[Callable[[DownloadTask], None]] = None) -> Dict[str, Any]:
         """Process a list of download targets using batch workflow.
@@ -436,6 +521,7 @@ class DownloadOrchestrator:
         return completed
 
     def _finish(self, task: DownloadTask, on_complete: Optional[Callable[[DownloadTask], None]]) -> None:
+        check_fatal_state(self.ctx)
         if task.status == DownloadStatus.COMPLETED:
             logger.info(f"Task completed: {task.book_title} ({task.filename})")
         else:
@@ -443,6 +529,8 @@ class DownloadOrchestrator:
         if on_complete:
             try:
                 on_complete(task)
+            except StatePersistenceError:
+                raise
             except Exception as e:
                 logger.error(f"Error in on_complete callback: {e}")
 
@@ -470,38 +558,14 @@ class DownloadOrchestrator:
         completed_map: Dict[str, DownloadTask] = {}
 
         while active_map:
-            for task_id in list(active_map.keys()):
+            for task_id in list(active_map):
                 task = active_map[task_id]
-
-                backend = self.get_backend(task.backend_name)
-                if not backend:
-                    task.status = DownloadStatus.FAILED
-                    task.error_message = "Backend unavailable"
-                    completed_map[task_id] = task
+                if self._advance_task(task, on_complete):
+                    completed_map[task.task_id] = task
                     del active_map[task_id]
-                    self._finish(task, on_complete)
-                    continue
-
-                task = self._poll(backend, task)
-
-                if task.status in [DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED]:
-                    completed_map[task_id] = task
+                elif task.task_id != task_id:
                     del active_map[task_id]
-                    self._finish(task, on_complete)
-                    continue
-
-                reason = self.check_timeouts(task)
-                if reason:
-                    logger.error(f"Giving up on {task.book_title} ({task.filename}): {reason}")
-                    self._cancel(backend, task)
-                    task.status = DownloadStatus.FAILED
-                    task.error_message = reason
-                    completed_map[task_id] = task
-                    del active_map[task_id]
-                    self._finish(task, on_complete)
-                    continue
-
-                active_map[task_id] = task
+                    active_map[task.task_id] = task
 
             if not active_map:
                 break
@@ -515,12 +579,34 @@ class DownloadOrchestrator:
 
         return list(completed_map.values()), list(active_map.values())
 
-    def _log_batch_status(self, active: List[DownloadTask], completed: List[DownloadTask]) -> None:
-        """Log a summary of batch progress."""
-        total = len(active) + len(completed)
-        done = len(completed)
+    def _log_task_progress(self, task):
+        now = time.time()
+        progress = task.extra.get("progress", {})
+        monitor = task.extra.setdefault("monitor", {})
+        signature = (task.status.value, progress.get("files_complete"), task.extra.get("needs_review", False))
+        logged_at, logged_signature = self._progress_logs.get(task.task_id, (0, None))
+        if now - logged_at < 60 and logged_signature == signature:
+            return
+        self._progress_logs[task.task_id] = (now, signature)
+        elapsed = max(0, now - monitor.get("last_progress_at", now))
+        deadlines = []
+        if self.max_download_time > 0:
+            deadlines.append(monitor.get("started_at", now) + self.max_download_time)
+        if task.status == DownloadStatus.QUEUED and self.queue_timeout > 0 and monitor.get("queued_since") is not None:
+            deadlines.append(monitor["queued_since"] + self.queue_timeout)
+        elif task.status not in (DownloadStatus.QUEUED, DownloadStatus.QUEUED_LOCALLY) and self.stall_timeout > 0:
+            deadlines.append(monitor.get("last_progress_at", now) + self.stall_timeout)
+        remaining = "paused/unknown" if task.poll_failed else f"{max(0, min(deadlines) - now):.0f}s" if deadlines else "disabled"
+        logger.info("[Transfer] %s | %s | peer=%s | files=%s/%s bytes=%s/%s (%.1f%%) | last progress %.0fs ago | next timeout %s%s",
+                    task.book_title, task.status.value, task.extra.get("username", "?"), progress.get("files_complete", "?"),
+                    progress.get("files_total", len(task.extra.get("manifest", []))), task.bytes_transferred,
+                    progress.get("bytes_total", "?"), task.progress_percent, elapsed, remaining,
+                    " | " + task.error_message if task.error_message else "")
 
-        logger.info(f"[Batch Monitor] Progress: {done}/{total} tasks. Active: {len(active)}")
+    def _log_batch_status(self, active, completed):
+        logger.info("[Batch Monitor] Progress: %s/%s tasks. Active: %s", len(completed), len(active) + len(completed), len(active))
+        for task in active:
+            self._log_task_progress(task)
 
     def resume_tasks(self, persisted_tasks: List[Dict[str, Any]]) -> List[DownloadTask]:
         """Resume tasks from persisted state.
@@ -558,10 +644,12 @@ class DownloadOrchestrator:
                 logger.warning(f"Could not check {task_data.get('book_title', 'download')} ({e}); keeping it for the next run")
                 self.unchecked_task_ids.add(task_data.get("task_id"))
                 continue
+            except StatePersistenceError:
+                raise
             except Exception:
-                # Saved data in a shape nobody expected: give up on this one download, not the run
-                logger.exception(f"Error resuming {task_data.get('book_title', 'download')}; dropping it")
-                task = None
+                logger.exception(f"Error resuming {task_data.get('book_title', 'download')}; retaining it for review")
+                self.unchecked_task_ids.add(task_data.get("task_id"))
+                continue
             if task:
                 resumed.append(task)
                 logger.info(f"Resumed task: {task.filename} from {backend_name}")

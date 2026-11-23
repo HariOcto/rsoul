@@ -1,9 +1,102 @@
 import time
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Optional, Dict, List, Tuple
 from .types import SlskdFile, SlskdDirectory
+from .outcomes import http_status
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EnqueueOutcome:
+    """A POST acknowledgement and the exact records its durable intent owns.
+
+    `unknown` is deliberately not a failed download. The caller must keep the
+    intent and reconcile later; repeating the POST could start an untracked copy.
+    """
+    state: str
+    files: List[Dict[str, Any]] = field(default_factory=list)
+    reason: str = ""
+    kind: str = ""
+
+
+def matching_new_transfers(client, username, manifest, file_dir, pre_existing):
+    """Match one new transfer per exact requested path; never reuse an old ID.
+
+    A basename is accepted only inside the expected directory (slskd API versions
+    differ between full path and leaf directory). Ambiguity remains unknown.
+    """
+    listing = get_user_downloads(client, username)
+    leaf = file_dir.split("\\")[-1]
+    matches = []
+    ambiguous = False
+    for expected in manifest:
+        full = expected["filename"]
+        basename = full.split("\\")[-1]
+        candidates = {}
+        for directory in listing.get("directories", []):
+            observed_dir = directory.get("directory", "")
+            if observed_dir not in (file_dir, leaf):
+                continue
+            for record in directory.get("files", []):
+                rid = record.get("id")
+                if not rid or rid in pre_existing:
+                    continue
+                observed_name = record.get("filename", "")
+                if observed_name != full and not (observed_name == basename and observed_dir in (file_dir, leaf)):
+                    continue
+                # Size disagreement is not ownership proof; don't adopt an unrelated file.
+                size = record.get("size")
+                if size is not None and expected.get("size") and int(size) != int(expected["size"]):
+                    continue
+                candidates[rid] = record
+        if len(candidates) > 1:
+            ambiguous = True
+        if len(candidates) == 1:
+            record = next(iter(candidates.values()))
+            matches.append({"filename": full, "size": expected.get("size"), "id": record["id"], "username": username, "file_dir": file_dir, "status": record})
+    if len({row["id"] for row in matches}) != len(matches):
+        ambiguous = True
+    return matches, ambiguous
+
+
+def enqueue_owned(client, username, manifest, file_dir, pre_existing, wait=None):
+    """POST only after the caller durably recorded the complete enqueue intent.
+
+    Registration may be asynchronous or the response may be lost. Even zero
+    visible records after the observation window leaves the operation owned.
+    """
+    definite_rejection = False
+    reason = ""
+    kind = ""
+    try:
+        accepted = client.transfers.enqueue(username=username, files=[{"filename": f["filename"], "size": f["size"]} for f in manifest])
+        definite_rejection = accepted is False
+        if definite_rejection:
+            reason = "slskd explicitly refused enqueue"
+    except Exception as error:
+        status = http_status(error)
+        definite_rejection = status in (400, 401, 403, 404, 405, 409, 413, 415, 422, 429)
+        reason = f"enqueue response {status or 'unknown'}: {error}"
+        if definite_rejection:
+            kind = "rate_limited" if status == 429 else "service_unavailable"
+    observations = []
+    for attempt in range(4):
+        if attempt:
+            (wait or time.sleep)(2)
+        try:
+            observations, ambiguous = matching_new_transfers(client, username, manifest, file_dir, pre_existing)
+        except Exception as error:
+            reason = f"{reason}; cannot reconcile enqueue: {error}".strip("; ")
+            continue
+        if not ambiguous and len(observations) == len(manifest):
+            return EnqueueOutcome("registered", observations, reason)
+        if definite_rejection and not observations and not ambiguous:
+            return EnqueueOutcome("rejected", reason=reason, kind=kind)
+        if ambiguous:
+            reason = "multiple new transfer IDs match an enqueue intent; ownership is ambiguous"
+    return EnqueueOutcome("unknown", observations, reason or "enqueue accepted but not every requested transfer has registered")
 
 
 def is_not_found(error: Exception) -> bool:

@@ -2,6 +2,10 @@ class PyarrError(Exception):
     """Generic PyArr Exception."""
 
 
+class PyarrRateLimit(PyarrError):
+    """The API rejected a request with HTTP 429; response headers are retained."""
+
+
 class PyarrConnectionError(PyarrError):
     """Sonarr connection exception."""
 

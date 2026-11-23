@@ -1,4 +1,10 @@
-# ID3 frame names read by rsoul/audiotags.py (artist and album artist), not misspellings
 [default.extend-identifiers]
+# ID3 frame names read by rsoul/audiotags.py (artist and album artist), not misspellings
 TPE1 = "TPE1"
 TPE2 = "TPE2"
+
+[default.extend-words]
+# ISO 639-2 language code read by rsoul/recording_policy.py (French)
+fre = "fre"
+# Tag key some taggers use for the narrator, read by rsoul/audiotags.py
+readby = "readby"

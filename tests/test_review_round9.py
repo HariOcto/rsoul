@@ -1,7 +1,7 @@
 """Regression tests for the ninth round (fourth outside review): the tag check's decision.
 
-Three outcomes: confirmed match, confirmed wrong book, inconclusive. Only a confirmed wrong
-book stops an import and excludes the peer.
+Three content outcomes: confirmed match, confirmed wrong book, inconclusive. A confirmed
+wrong book is retained for review; local import validation does not penalize its peer.
 
 1. A fitting album doesn't outweigh a title tag that names another book
 2. An album that is the series is not another book, even when a book shares the name
@@ -253,8 +253,13 @@ def test_the_wanted_book_is_never_rejected_whatever_its_tags(book, monkeypatch):
     judged = 0
     for series_known, others_known in itertools.product([True, False], repeat=2):
         known = (series_label if series_known else "", [], siblings, others_series if others_known else [])
-        for album in usual_albums(title, author, series, position):
-            for book_title in usual_book_titles(title, author, series, position):
+        # A label naming another catalog work plus Book N is only a legitimate
+        # series fixture when the catalogue actually establishes that series.
+        # The no-series cases still exercise ordinary book/chapter tags here;
+        # unsupported sibling-as-series labels have their own negative test.
+        evidenced_series = series if known[0] or known[3] else ""
+        for album in usual_albums(title, author, evidenced_series, position):
+            for book_title in usual_book_titles(title, author, evidenced_series, position):
                 tags.clear()
                 tags["/x/book.m4b"] = {"album": album, "title": book_title}
                 judged += 1
@@ -270,6 +275,18 @@ def test_the_wanted_book_is_never_rejected_whatever_its_tags(book, monkeypatch):
                     rejected.append(("chapters", album, usual_chapter_titles(title, 1)[style], series_known, others_known))
     assert judged > 500
     assert rejected == []
+
+
+@pytest.mark.parametrize("title,author,sibling,label", [
+    ("Golden Son", "Pierce Brown", "Red Rising", "Red Rising Book 2"),
+    ("The Fellowship of the Ring", "J.R.R. Tolkien", "The Lord of the Rings", "The Lord of the Rings Book 1"),
+    ("Dune", "Frank Herbert", "Dune Messiah", "Dune Messiah Book 1"),
+])
+def test_numeric_sibling_title_requires_catalog_series_evidence(tmp_path, title, author, sibling, label):
+    path = audio_file(tmp_path / "book.m4b", album=title, title=label)
+    verdict, detail = check_audiobook_tags([path], title, author, siblings=[sibling])
+    assert verdict == MISMATCH
+    assert sibling in detail
 
 
 @pytest.mark.parametrize(

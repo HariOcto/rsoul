@@ -4,6 +4,8 @@ verify the actual destination of new files; handle recovery, cleanup and ledger 
 import configparser
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -42,7 +44,9 @@ def test_edition_is_ambiguous_when_two_audio_editions_have_same_monitor_state():
         {"id": 11, "readingFormatId": 2, "monitored": True},
     ]
     assert import_identity.select_edition({"id": 7, "mediaType": "audiobook"}, editions, "audiobook") is None
-    assert import_identity.select_edition({"id": 7, "mediaType": "audiobook"}, [{"id": 10, "isEbook": False}], "audiobook") is None
+    # An audiobook record whose only edition names no medium: Chaptarr's import only checks that
+    # the edition belongs to the book, so it is the one to use
+    assert import_identity.select_edition({"id": 7, "mediaType": "audiobook"}, [{"id": 10, "isEbook": False}], "audiobook")["id"] == 10
     assert import_identity.select_edition({"id": 7}, [{"id": 10}], "ebook")["id"] == 10  # plain Readarr
 
 
@@ -84,8 +88,9 @@ class WrongBook(Chaptarr):
 def test_targeted_import_misassignment_is_rejected(tmp_path, klass):
     chaptarr = klass(tmp_path / "dl")
     result, ctx = run_import(tmp_path, chaptarr)
-    assert result == {4020: False}
-    assert ctx.history.is_failed("peer", "The Trafalgar Gambit")
+    assert result[4020]["phase"] == "needs_review"
+    assert result[4020]["verification"]["status"] == "mismatch"
+    assert not ctx.history.is_failed("peer", "The Trafalgar Gambit")
     assert len(chaptarr.commands) == 1
 
 
@@ -96,14 +101,14 @@ class NothingVerified(Chaptarr):
         return reply
 
 
-def test_disappeared_files_without_bookfile_readback_remain_pending_then_fail(tmp_path):
+def test_disappeared_files_without_bookfile_readback_remain_for_review(tmp_path):
     client = NothingVerified(tmp_path / "dl")
     result, _ = run_import(tmp_path, client)
     pending = result[4020]
     assert pending["method"] == "targeted" and pending["command_id"] == 1
     assert pending["edition_id"] == 21610 and pending["before_ids"] == []
-    assert postprocess.check_pending_import(client, pending) is None
-    assert postprocess.check_pending_import(client, pending, now=pending["since"] + postprocess.PENDING_IMPORT_MAX_AGE + 1) is False
+    assert postprocess.check_pending_import(client, pending)["phase"] == "needs_review"
+    assert postprocess.check_pending_import(client, pending, now=pending["since"] + postprocess.PENDING_IMPORT_MAX_AGE + 1)["phase"] == "needs_review"
     assert [c[0] for c in client.commands] == ["ManualImport"]
 
 
@@ -115,8 +120,9 @@ def test_targeted_verification_ignores_existing_files():
             return [{"id": 5, "bookId": 10, "editionId": 20}]
 
     assert import_identity.verify_new_bookfiles(Bookfiles(), 10, 20, [5]) is None
-    assert import_identity.verify_new_bookfiles(Bookfiles(), 10, 20, []) is True
-    assert import_identity.verify_new_bookfiles(Bookfiles(), 10, 21, []) is False
+    # New IDs alone, even on the requested edition, are not input/output proof.
+    assert import_identity.verify_new_bookfiles(Bookfiles(), 10, 20, []) is None
+    assert import_identity.verify_new_bookfiles(Bookfiles(), 10, 21, []) is None
 
 
 def test_unsupported_bookfile_readback_keeps_files_staged(tmp_path):
@@ -133,16 +139,16 @@ def test_unsupported_bookfile_readback_keeps_files_staged(tmp_path):
     assert os.path.exists(result[4020]["files"][0])
 
 
-def test_failed_manual_import_without_command_path_moves_staged_files(tmp_path):
+def test_failed_manual_import_without_command_path_retains_staged_files(tmp_path):
     class Failed(Chaptarr):
         def get_command(self, id_):
             return {"id": id_, "status": "completed", "result": "unsuccessful", "body": {}, "message": "Failed to import"}
 
     client = Failed(tmp_path / "dl", takes_files=False)
     result, ctx = run_import(tmp_path, client)
-    assert result == {4020: False}
-    assert (tmp_path / "dl" / "failed_imports" / "The Trafalgar Gambit" / "Trafalgar Gambit (Ark Royal 3).mp3").exists()
-    assert not (tmp_path / "dl" / "rsoul_audiobooks" / "Christopher G Nuttall" / "The Trafalgar Gambit").exists()
+    assert result[4020]["phase"] == "needs_review"
+    assert Path(result[4020]["files"][0]).exists()
+    assert not ctx.history.is_failed("peer", "The Trafalgar Gambit")
 
 
 def test_pending_targeted_retry_never_calls_downloaded_books_scan(tmp_path):
@@ -163,9 +169,10 @@ def test_pending_targeted_retry_never_calls_downloaded_books_scan(tmp_path):
             raise requests.HTTPError("gone", response=response)
     client = Forgot(local, takes_files=False)
     updated = postprocess.check_pending_import(client, p)
-    assert updated["command_id"] == 1 and updated["submits"] == 2
+    assert updated["command_id"] == 51 and updated["submits"] == 1
     assert updated["edition_id"] == 21610 and updated["method"] == "targeted"
-    assert [n for n, _ in client.commands] == ["ManualImport"]
+    assert updated["phase"] == "needs_review"  # legacy identity is incomplete, no blind resubmission
+    assert client.commands == []
 
 
 def test_ledger_never_suppresses_other_media_or_reused_book_ids(tmp_path):
@@ -212,7 +219,7 @@ def test_disappeared_targeted_files_do_not_masquerade_as_success_after_command_4
 
     p = postprocess.pending_import_record("staged", "/chaptarr", str(tmp_path), [str(tmp_path / "gone.mp3")], 1,
                                           method="targeted", book_id=7, media_type="audiobook", edition_id=20, before_ids=[])
-    assert postprocess.check_pending_import(Lost(), p) is None
+    assert postprocess.check_pending_import(Lost(), p)["phase"] == "needs_review"
 
 
 def test_run_workflow_does_not_redownload_a_book_awaiting_targeted_verification(tmp_path, monkeypatch):
@@ -256,8 +263,15 @@ class BookFileServer:
         self.rows = rows
 
     def _get(self, path, ver, params=None):
-        assert path == "bookfile"
-        return self.rows
+        if path == "bookfile":
+            return self.rows
+        assert path == "history"
+        return {"records": [{"id": row["id"], "bookId": 4020, "date": datetime.now(timezone.utc).isoformat(),
+                             "eventType": "bookFileImported", "data": {"FileId": str(row["id"]), "ImportedPath": row["path"], "DroppedPath": "/staged/input.mp3"}}
+                            for row in self.rows]}
+
+
+INPUT_MANIFEST = [{"readarr_path": "/staged/input.mp3", "size": 1}]
 
 
 def chaptarr_row(file_id, book_id=4020):
@@ -269,17 +283,57 @@ def test_new_file_on_the_wanted_book_verifies_with_chaptarrs_fields(reported_boo
     row = chaptarr_row(9001, reported_book)
     if reported_book is None:
         del row["bookId"]
-    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(1), row]), 4020, 21610, ["1"]) is True
+    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(1), row]), 4020, 21610, ["1"], manifest=INPUT_MANIFEST) is True
 
 
 def test_contradicting_fields_still_fail_where_a_server_reports_them():
-    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(9001, 77)]), 4020, 21610, []) is False
+    assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(9001, 77)]), 4020, 21610, [], manifest=INPUT_MANIFEST) is False
     wrong_edition = dict(chaptarr_row(9001), editionId=999)
-    assert import_identity.verify_new_bookfiles(BookFileServer([wrong_edition]), 4020, 21610, []) is False
+    assert import_identity.verify_new_bookfiles(BookFileServer([wrong_edition]), 4020, 21610, [], manifest=INPUT_MANIFEST) is False
     right_edition = dict(chaptarr_row(9001), editionId=21610)
-    assert import_identity.verify_new_bookfiles(BookFileServer([right_edition]), 4020, 21610, []) is True
+    assert import_identity.verify_new_bookfiles(BookFileServer([right_edition]), 4020, 21610, [], manifest=INPUT_MANIFEST) is True
 
 
 def test_nothing_new_on_the_wanted_book_is_not_verified():
     assert import_identity.verify_new_bookfiles(BookFileServer([chaptarr_row(1)]), 4020, 21610, ["1"]) is None
     assert import_identity.verify_new_bookfiles(BookFileServer([]), 4020, 21610, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Audiobook records with only ebook or print editions (seen on Chaptarr, 22 November)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "editions, chosen",
+    [
+        ([{"id": 23439, "readingFormatId": 3, "monitored": True, "title": "The Algebraist (Culture)"}], 23439),
+        ([{"id": 23493, "readingFormatId": 1, "monitored": True}, {"id": 23494, "readingFormatId": 1, "monitored": False}], 23493),
+        ([{"id": 1, "readingFormatId": 1, "monitored": False}], 1),
+        ([{"id": 1, "readingFormatId": 3, "monitored": False}, {"id": 2, "readingFormatId": 2, "monitored": False}], 2),  # an audio edition still wins
+    ],
+)
+def test_audiobook_record_without_an_audio_edition_uses_its_own_edition(editions, chosen):
+    assert import_identity.select_edition({"id": 6744, "mediaType": "audiobook"}, editions, "audiobook")["id"] == chosen
+
+
+@pytest.mark.parametrize(
+    "book, editions",
+    [
+        ({"id": 1, "mediaType": "audiobook"}, [{"id": 1, "readingFormatId": 1, "monitored": True}, {"id": 2, "readingFormatId": 3, "monitored": True}]),  # two monitored: no choice
+        ({"id": 1, "mediaType": "audiobook"}, [{"id": 1, "readingFormatId": 1}, {"id": 2, "readingFormatId": 3}]),  # none monitored
+        ({"id": 1, "mediaType": "ebook"}, [{"id": 1, "readingFormatId": 2, "monitored": True}]),  # the record is the ebook
+        ({"id": 1, "mediaType": "audiobook"}, []),
+    ],
+)
+def test_no_guess_where_there_is_a_real_choice_or_the_wrong_record(book, editions):
+    assert import_identity.select_edition(book, editions, "audiobook") is None
+
+
+def test_pending_import_without_an_edition_goes_through_once_the_rule_allows_it(tmp_path):
+    # Algebraist-like: an audiobook record whose only edition is an ebook edition
+    chaptarr = Chaptarr(tmp_path / "dl", editions=[{"id": 23439, "readingFormatId": 3, "monitored": True}])
+    chaptarr.get_book = lambda book_id: {"id": book_id, "title": "The Trafalgar Gambit", "authorId": 37, "mediaType": "audiobook", "hasFiles": False}
+    result, _ = run_import(tmp_path, chaptarr)
+    assert [name for name, _ in chaptarr.commands] == ["ManualImport"]
+    assert chaptarr.commands[0][1]["files"][0]["editionId"] == 23439

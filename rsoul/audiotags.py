@@ -19,18 +19,20 @@ Which tag counts for what:
 - The album is the book, or its series. An album that names another book of the author is
   the wrong book, unless it reads as a series (many series are named after their first
   book): it consists of a series Chaptarr lists for the author, or cites the other title
-  with a position ("Red Rising Book 2"). Where Chaptarr lists no series for the author at
+  with a position supported by that catalogue ("Red Rising Book 2"). Where Chaptarr lists no series for the author at
   all, an album alone proves nothing.
 - The title tag of a single-file book is the most specific statement the file makes: if it
   names another book, a fitting album (often the series) doesn't outweigh it.
 - The title tags of a book in several files are chapter names. They are only looked at for
-  another book's title, and only count when most of the sampled files agree. "Book Two" in
+  another book's title, and only count when most of the titled files agree. "Book Two" in
   a chapter name is a part of the novel, not a position in the series.
 """
 
 import logging
+import math
 import os
 import re
+import struct
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .match import _BOOK_WORDS, _COLLECTION_WORDS, _FORMAT_NOISE, _NUMBER_WORD, _meaningful_words, _people_words, names_another_release, title_segment_match, title_variants
@@ -43,9 +45,6 @@ _BRACKETS = re.compile(r"[\[\](){}]")
 
 # Words that say nothing about which book it is
 _FILLER = {"unknown", "album", "untitled", "various", "artists", "track", "disc", "disk", "cd", "part", "chapter", "book", "vol", "volume"}
-# How many files of a multi-file book are looked at (first, middle, last)
-MAX_SAMPLED = 3
-
 _warned_missing = False
 
 
@@ -92,6 +91,124 @@ def read_tags(path: str) -> Dict[str, str]:
     return {key: value for key, value in found.items() if value}
 
 
+def _tag_values(value: Any) -> List[str]:
+    value = getattr(value, "text", value)
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _tag_values(item)]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _recording_metadata(audio: Any) -> Dict[str, Any]:
+    """Explicit recording tags only. Artist is not assumed to mean narrator."""
+    tags = getattr(audio, "tags", None) or {}
+    metadata: Dict[str, Any] = {}
+    for field, keys in {
+        "language": ("TLAN", "language", "LANGUAGE", "----:com.apple.iTunes:LANGUAGE", "----:com.apple.iTunes:language"),
+        "narrator": ("narrator", "NARRATOR", "narratedby", "readby", "TXXX:NARRATOR", "TXXX:narrator", "----:com.apple.iTunes:NARRATOR", "----:com.apple.iTunes:narrator"),
+    }.items():
+        values = [value for key in keys for value in _tag_values(tags.get(key))]
+        if values:
+            metadata[field] = list(dict.fromkeys(values))
+    return metadata
+
+
+def _mp4_structure_error(path: str) -> str:
+    """Check top-level atom boundaries and payload presence, without decoding audio."""
+    size = os.path.getsize(path)
+    position = 0
+    types = set()
+    payload = False
+    with open(path, "rb") as stream:
+        while position < size:
+            if size - position < 8:
+                return "truncated MP4 atom header"
+            stream.seek(position)
+            length, kind = struct.unpack(">I4s", stream.read(8))
+            header = 8
+            if length == 1:
+                raw = stream.read(8)
+                if len(raw) != 8:
+                    return "truncated extended MP4 atom header"
+                length = struct.unpack(">Q", raw)[0]
+                header = 16
+            elif length == 0:
+                length = size - position
+            if length < header or position + length > size:
+                return "truncated or invalid MP4 atom length"
+            types.add(kind)
+            if kind == b"mdat" and length > header:
+                payload = True
+            position += length
+    if b"moov" not in types or not payload:
+        return "MP4 has no audio metadata or media payload"
+    return ""
+
+
+def inspect_audio_files(paths: Sequence[str]) -> List[Dict[str, Any]]:
+    """Inspect every local file's actual audio container/header and duration.
+
+    This is lightweight structural validation, not a full decode or a guarantee
+    that every sample is intact. A filename or ID3 tag alone never makes a file
+    valid. Failures are separate from a valid recording that has no useful tags.
+    """
+    records = []
+    for raw_path in paths:
+        path = os.fspath(raw_path)
+        record: Dict[str, Any] = {"path": path, "valid": False, "reason": "", "duration_seconds": None,
+                                  "codec": None, "tags": {}, "metadata": {}, "validation": "container_header"}
+        try:
+            import mutagen
+
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                raise ValueError("missing, empty, or non-regular audio file")
+            audio = mutagen.File(path)
+            info = getattr(audio, "info", None)
+            if audio is None or info is None:
+                raise ValueError("no recognised audio container/stream")
+            duration = float(getattr(info, "length", 0) or 0)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("audio duration is missing or invalid")
+            for field in ("sample_rate", "channels"):
+                value = getattr(info, field, None)
+                if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
+                    raise ValueError(f"audio {field} is invalid")
+            if getattr(info, "sketchy", False):
+                raise ValueError("audio stream headers are incomplete or unreliable")
+            container = type(audio).__name__
+            extension = os.path.splitext(path)[1].lower()
+            if extension in {".m4b", ".m4a", ".mp4", ".m4p", ".mp4a", ".alac"} and container != "MP4":
+                raise ValueError(f"{extension} file contains {container}, not an MP4 audio container")
+            if extension == ".mp3" and container != "MP3":
+                raise ValueError(f".mp3 file contains {container}, not MPEG audio")
+            if container == "MP4":
+                error = _mp4_structure_error(path)
+                if error:
+                    raise ValueError(error)
+                if not getattr(info, "codec", None):
+                    raise ValueError("MP4 audio codec is unknown")
+            record.update(valid=True, duration_seconds=duration, codec=str(getattr(info, "codec", None) or container),
+                          tags=read_tags(path), metadata=_recording_metadata(audio))
+        except Exception as error:
+            record["reason"] = f"{type(error).__name__}: {error}"
+        records.append(record)
+    return records
+
+
+def validate_audio_files(paths: Sequence[str]) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """Return (valid, detail, inspection records), preserving invalid files for review."""
+    records = inspect_audio_files(paths)
+    if not records:
+        return False, "No audio files are available for validation", records
+    failures = [record for record in records if not record["valid"]]
+    if failures:
+        details = "; ".join(f"{os.path.basename(record['path'])}: {record['reason']}" for record in failures[:5])
+        return False, f"Unreadable or invalid audio ({len(failures)}/{len(records)} files): {details}", records
+    return True, "Every file has a recognised audio container and a positive duration", records
+
+
 def _phrase_in(phrase: List[str], words: List[str], taken: List[bool]) -> bool:
     """Find the phrase in the words, skipping words already taken by a longer title; mark it."""
     n = len(phrase)
@@ -126,10 +243,15 @@ def named_books(text: str, title: str, siblings: Sequence[str]) -> Tuple[bool, L
     return wanted, others
 
 
-def _series_reference(text: str, sibling: str) -> bool:
+def _series_reference(text: str, sibling: str, catalog_series: Sequence[str] = ()) -> bool:
     """True if the text uses another book's title the way a series is cited: the title plus a
     position or a series word ("Red Rising Book 2", "Red Rising #2", "Red Rising 2", "Red
     Rising Saga") and nothing else. Many series go by the name of their first book."""
+    # "Dune Messiah Book 1" is not a Dune-series label simply because it has
+    # a number. At least one actual catalog series must support that name.
+    sibling_words = set(_meaningful_words(sibling))
+    if not sibling_words or not any(sibling_words <= set(_meaningful_words(label)) for label in catalog_series if label):
+        return False
     rest = _meaningful_words(_BRACKETS.sub(" ", text))
     for variant in title_variants(sibling):
         phrase = _meaningful_words(variant)
@@ -164,23 +286,25 @@ def judge_text(
         book's title there only counts when Chaptarr gave series for this author at all;
         without them a series named after one of its books can't be told from that book.
     """
-    series_words = {w for label in [series_title, *author_series] for w in _meaningful_words(label) if not _NUMBER_WORD.fullmatch(w)}
-    neutral = _people_words(author_name, narrators) | series_words | _FORMAT_NOISE | _FILLER | _COLLECTION_WORDS
+    catalog_series = [part for label in [series_title, *author_series] for part in label.split(";") if part.strip()]
+    series_wordsets = [{w for w in _meaningful_words(label) if not _NUMBER_WORD.fullmatch(w)} for label in catalog_series]
+    series_words = set().union(*series_wordsets)
+    neutral = _people_words(author_name, narrators) | _FORMAT_NOISE | _FILLER | _COLLECTION_WORDS
     words = set(_meaningful_words(text))
-    series_level = bool(words) and all(word in neutral or _NUMBER_WORD.fullmatch(word) for word in words)
+    series_level = bool(words) and any(all(word in neutral | label_words or _NUMBER_WORD.fullmatch(word) for word in words) for label_words in series_wordsets)
 
     wanted, others = named_books(text, title, siblings)
     # Another book's title that is itself a series of the author ("The Lord of the Rings",
     # "Red Rising") is the series being named, not that book
-    others = [other for other in others if not set(_meaningful_words(other)) <= series_words]
+    others = [other for other in others if not any(set(_meaningful_words(other)) <= label_words for label_words in series_wordsets)]
     if others:
         # A tag that names the wanted book too: one of the two is the series, or it is a
         # bundle. It is only the other book when the wanted title is what the series is
         # called ("Red Rising 2 - Golden Son" for Red Rising); without series from Chaptarr
         # that can't be decided ("The Fellowship of the Ring (The Lord of the Rings #1)").
-        wanted_is_series_name = bool(series_words) and any(set(_meaningful_words(variant)) <= series_words for variant in title_variants(title))
+        wanted_is_series_name = any(set(_meaningful_words(variant)) <= label_words for variant in title_variants(title) for label_words in series_wordsets)
         names_only_other = not wanted or wanted_is_series_name
-        cited_as_series = not is_chapter and _series_reference(text, others[0])
+        cited_as_series = not is_chapter and _series_reference(text, others[0], catalog_series)
         if names_only_other and not series_level and not cited_as_series and (series_words or not is_album):
             return MISMATCH, f'"{text}" names another book by the author ("{others[0]}")'
     if names_another_release(title, text, author_name, "" if is_chapter else series_title, narrators):
@@ -195,7 +319,7 @@ def check_audiobook_tags(
 ) -> Tuple[str, str]:
     """Compare the tags of a downloaded audiobook with the wanted book.
 
-    paths: the book's audio files (first, middle and last are read).
+    paths: every audio file in the book; every file's tags are read.
 
     Returns (verdict, detail): AGREE (confirmed match), MISMATCH (confirmed wrong book; detail
     says which tag and why), UNCLEAR (tagged, but not conclusive) or UNTAGGED.
@@ -203,7 +327,6 @@ def check_audiobook_tags(
     paths = sorted(paths)
     if not paths:
         return UNTAGGED, ""
-    sample = paths if len(paths) <= MAX_SAMPLED else [paths[0], paths[len(paths) // 2], paths[-1]]
     single_file = len(paths) == 1
 
     def judge(text: str, is_chapter: bool = False, is_album: bool = False) -> Tuple[str, str]:
@@ -212,7 +335,7 @@ def check_audiobook_tags(
     verdicts: List[Tuple[str, str]] = []
     chapter_titles_naming_another: List[str] = []
     titled = 0
-    for path in sample:
+    for path in paths:
         tags = read_tags(path)
         name = os.path.basename(path)
         album = judge(tags["album"], is_album=True) if tags.get("album") else None
@@ -246,7 +369,7 @@ def check_audiobook_tags(
             verdicts.append((UNTAGGED, ""))
 
     # Chapter names: one chapter that happens to share a book's title proves nothing, but
-    # most of the sampled files naming another book do
+    # most of the files naming another book do
     if chapter_titles_naming_another and len(chapter_titles_naming_another) * 2 > titled:
         return MISMATCH, chapter_titles_naming_another[0]
 

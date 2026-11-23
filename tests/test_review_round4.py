@@ -105,7 +105,8 @@ def test_chapter_task_tracks_every_chapter():
     b = backend(client)
     task = b.download(target(), b.search(target())[0])
 
-    assert task.task_id == f"peer|{chapter(1)}"
+    assert task.task_id.startswith("slskd|")
+    assert task.extra["release_id"] == f"peer|{chapter(1)}"
     assert len(task.extra["files"]) == 12
     assert len(task.extra["expected_files"]) == 12
     assert len(client.transfers.records) == 12
@@ -142,7 +143,7 @@ class RefusingTransfers(Transfers):
         self.refused = refused
 
     def enqueue(self, username, files):
-        return True if username in self.refused else super().enqueue(username, files)
+        return False if username in self.refused else super().enqueue(username, files)
 
 
 def test_second_audiobook_candidate_is_used_when_the_first_cannot_be_queued():
@@ -156,7 +157,8 @@ def test_second_audiobook_candidate_is_used_when_the_first_cannot_be_queued():
     task = b.download(target(), results[0])
     assert task is not None
     assert task.extra["username"] == "second"
-    assert task.task_id == "second|@@s\\Brandon Sanderson\\The Final Empire"
+    assert task.task_id.startswith("slskd|")
+    assert task.extra["release_id"] == "second|@@s\\Brandon Sanderson\\The Final Empire"
     assert len(client.users.browsed) == 2
 
 
@@ -196,7 +198,7 @@ def test_transfer_appearing_after_the_first_cleanup_check_is_still_cancelled():
     assert transfers.cancelled == ["new-0"]
 
 
-def test_files_that_arrived_from_an_abandoned_enqueue_are_moved_aside(tmp_path):
+def test_files_from_unknown_enqueue_are_kept_under_durable_ownership(tmp_path):
     class ArrivingTransfers(Transfers):
         """Never lists the new transfer, but the file lands in the download folder anyway."""
 
@@ -209,9 +211,12 @@ def test_files_that_arrived_from_an_abandoned_enqueue_are_moved_aside(tmp_path):
     client.searches.responses = client.searches.responses[:1]
     b = backend(client, slskd={"download_dir": str(tmp_path)})
 
-    assert b.download(target(), b.search(target())[0]) is None
-    assert not (tmp_path / "The Final Empire").exists()  # the next attempt finds a clean folder
-    assert (tmp_path / "failed_downloads" / "The Final Empire" / "01.mp3").exists()
+    task = b.download(target(), b.search(target())[0])
+    assert task is not None
+    assert task.extra["enqueue"]["phase"] == "unknown"
+    assert b.ctx.state.get_tasks_for_orchestrator()[0]["task_id"] == task.task_id
+    assert (tmp_path / "The Final Empire" / "01.mp3").exists()
+    assert not (tmp_path / "failed_downloads").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -219,22 +224,17 @@ def test_files_that_arrived_from_an_abandoned_enqueue_are_moved_aside(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_unimported_peer_is_only_skipped_for_a_while(tmp_path):
+def test_import_uncertainty_never_creates_a_generic_peer_penalty(tmp_path):
     local = tmp_path / "dl"
     history = HistoryManager(str(tmp_path))
     ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=RejectingReadarr(), history=history)
-    postprocess.process_imports(ctx, [audiobook_item(local)])
-
-    entry = history.history[0]
-    assert history.is_failed("peer", "Mistborn: The Final Empire")  # no re-download on the next run...
-    days = (datetime.fromisoformat(entry["retry_after"]) - datetime.fromisoformat(entry["timestamp"])).days
-    assert days == 7  # ...but not for good: Chaptarr's own setup may have been the problem
-
-    entry["retry_after"] = (datetime.now() - timedelta(minutes=1)).isoformat()
+    result = postprocess.process_imports(ctx, [audiobook_item(local)])
+    assert result[7]["phase"] == "needs_review"
+    assert history.history == []
     assert not history.is_failed("peer", "Mistborn: The Final Empire")
 
 
-def test_retry_period_is_configurable_and_zero_means_for_good(tmp_path):
+def test_legacy_import_retry_setting_cannot_turn_uncertainty_into_a_ban(tmp_path):
     local = tmp_path / "dl"
     history = HistoryManager(str(tmp_path))
     config = make_config(slskd={"download_dir": str(local)})
@@ -242,8 +242,8 @@ def test_retry_period_is_configurable_and_zero_means_for_good(tmp_path):
     ctx = Context(config=config, slskd=None, readarr=RejectingReadarr(), history=history)
     postprocess.process_imports(ctx, [audiobook_item(local)])
 
-    assert "retry_after" not in history.history[0]
-    assert history.is_failed("peer", "Mistborn: The Final Empire")
+    assert history.history == []
+    assert not history.is_failed("peer", "Mistborn: The Final Empire")
 
 
 def test_expired_entry_is_replaced_not_duplicated(tmp_path):
@@ -304,7 +304,7 @@ def test_unreadable_state_file_is_set_aside_not_deleted(tmp_path):
     path.write_text('[{"task_id": "x"')  # cut off mid-write
 
     assert StateManager(str(tmp_path)).get_items() == []
-    assert not path.exists()
+    assert path.exists()  # block a new run until damaged ownership is reconciled
     copies = [p for p in tmp_path.iterdir() if ".damaged-" in p.name]
     assert len(copies) == 1 and copies[0].read_text() == '[{"task_id": "x"'
 

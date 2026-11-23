@@ -294,17 +294,17 @@ def folder_name_candidates(directory: str, files: List[Dict[str, Any]]) -> List[
 # second book of a series, so it is never taken for a part of "Title" on its own. The one
 # exception, "Title 10" next to "Title 01"..."Title 09", is handled in same_book_files.
 _PART_WORD = r"(?:part|pt|chapter|chap|ch|cd|disc|disk|track|teil|kapitel)"
-_NUMBER = r"(?<!\d)(?P<n>\d{1,3})(?:\s*(?:of|von|/)\s*\d{1,3})?[\s)\]]*$"
+_NUMBER = r"(?<!\d)(?P<n>\d{1,5})(?:\s*(?:of|von|/)\s*\d{1,5})?[\s)\]]*$"
 _TRAILING_EVIDENT = re.compile(
     rf"(?:[\s\-_.,(\[]*(?<![A-Za-z]){_PART_WORD}\.?\s*"  # "Part 2", "CD2", "(pt. 3"
-    rf"|(?:\s+[\-–]\s*|\s*[(\[]\s*)"  # " - 2", "(2"; not "_2" or ".2", which often stand for a space
+    rf"|(?:\s+[\-–]\s*|\s*[(\[]\s*)(?![1-9]\d{{3,}}[\s)\]]*$)"  # preserve numeric titles such as "1984"
     rf"|(?:\s+|[\-_.])(?=0\d))"  # " 02", "-02"
     rf"{_NUMBER}",
     re.IGNORECASE,
 )
 _TRAILING_ANY = re.compile(rf"[\s\-_.,(\[]*(?:(?<![A-Za-z]){_PART_WORD}\.?\s*)?{_NUMBER}", re.IGNORECASE)
 # A number in front of the name is a track number: "03 - Title", "03. Title", "CD2 Title"
-_LEADING_PART = re.compile(rf"^[\s(\[]*(?:{_PART_WORD}\.?\s*)?(?P<n>\d{{1,3}})(?!\d)[\s)\]\-_.]+", re.IGNORECASE)
+_LEADING_PART = re.compile(rf"^[\s(\[]*(?:{_PART_WORD}\.?\s*|(?![1-9]\d{{3,}}(?!\d)))(?P<n>\d{{1,5}})(?!\d)[\s)\]\-_.]+", re.IGNORECASE)
 
 
 def _stem(basename: str) -> str:
@@ -374,7 +374,8 @@ _CHAPTER_WORDS = {
 }
 # From this size on, a single file is taken for a whole book rather than a chapter
 BOOK_SIZED_BYTES = 100 * 1024 * 1024
-_OF_TOTAL = re.compile(r"(?<!\d)(\d{1,3})\s*(?:of|von|/)\s*(\d{1,3})(?!\d)", re.IGNORECASE)
+_OF_TOTAL = re.compile(r"(?<!\d)(\d{1,5})\s*(?:of|von|/)\s*(\d{1,5})(?!\d)", re.IGNORECASE)
+MAX_AUDIOBOOK_PARTS = 10000
 
 
 def books_in_folder(target: Dict[str, Any], files: List[Tuple[str, int]]) -> Tuple[str, List[str]]:
@@ -386,8 +387,8 @@ def books_in_folder(target: Dict[str, Any], files: List[Tuple[str, int]]) -> Tup
 
     Returns:
         ("folder", [])     the folder is the book: take every file (chapters).
-        ("own", names)     one or more book-sized files carry the title themselves and the
-                           others are named differently: only those files are the book.
+        ("own", names)     files carry the title themselves beside known sibling titles,
+                           or book-sized files have distinct neighbours: take only those.
         ("several", [])    no file carries the title, and the files are other books: each is
                            named like another book by the author (target["sibling_titles"],
                            where Chaptarr provides them), or they are book-sized and named
@@ -426,6 +427,11 @@ def books_in_folder(target: Dict[str, Any], files: List[Tuple[str, int]]) -> Tup
     if len(files) < 2:
         return "folder", []
     others = [name for name, _ in files if name not in own and own_name(name)]
+    if own and any(names_sibling(name) for name in others):
+        # Catalog evidence outranks size. A short/low-bitrate book does not turn a
+        # known sequel beside it into one of its chapters.
+        selected = same_book_files(own, [name for name, _ in files])
+        return "own", [name for name in selected if carries_title(name) or not names_sibling(name)]
     if own and others and all(sizes[name] >= BOOK_SIZED_BYTES for name in own):
         return "own", same_book_files(own, [name for name, _ in files])
     if not own and len({book_key(name) for name in others}) >= 2 and len(others) == len(files) and all(sizes[name] >= BOOK_SIZED_BYTES for name in others):
@@ -438,15 +444,20 @@ def missing_parts(basenames: List[str]) -> Optional[str]:
 
     Listing a folder shows everything the peer has, not everything the book has: a lone
     "Title - Part 2 of 4" or chapters 02 and 03 without 01 are complete listings of an
-    incomplete book. Only plain numberings are judged (every file numbered, below 100).
+    incomplete book. Only plain numberings are judged (every file numbered). A
+    bounded part count prevents malformed names from allocating an enormous range.
     """
     stems = [_stem(name) for name in basenames]
     totals = [(int(n), int(total)) for n, total in (found.groups() for found in (_OF_TOTAL.search(stem) for stem in stems) if found)]
     if totals:
         total = max(t for _, t in totals)
+        if total < 1 or total > MAX_AUDIOBOOK_PARTS:
+            return f"invalid or unsupported part total {total}"
+        if len({t for _, t in totals}) != 1 or any(n < 1 or n > total for n, _ in totals):
+            return "inconsistent part numbering or totals"
         missing = sorted(set(range(1, total + 1)) - {n for n, _ in totals})
-        if missing and total < 100:
-            return f"part {', '.join(map(str, missing))} of {total} missing"
+        if missing:
+            return f"part {', '.join(map(str, missing[:5]))}{'...' if len(missing) > 5 else ''} of {total} missing"
         return None
     if len(stems) == 1:
         # A number in front is the book's place in a series ("02 Golden Son"); only one set
@@ -455,9 +466,23 @@ def missing_parts(basenames: List[str]) -> Optional[str]:
         number = int(found.group("n")) if found else None
         return f"only part {number} is there" if number is not None and number > 1 else None
     numbers = [part_number(name) for name in basenames]
-    if any(n is None or n >= 100 for n in numbers):
+    if any(n is None for n in numbers):
         return None
+    # A three-digit DTT sequence can explicitly encode disc + track (101, 102,
+    # 201). Inspect each disc separately rather than abandoning every sequence
+    # that happens to contain a number >= 100. Plain 001..136 remains plain.
+    if all(100 < number < 1000 and number % 100 for number in numbers):
+        discs = {number // 100 for number in numbers}
+        if discs == set(range(1, max(discs) + 1)):
+            for disc in sorted(discs):
+                tracks = {number % 100 for number in numbers if number // 100 == disc}
+                missing = sorted(set(range(1, max(tracks) + 1)) - tracks)
+                if missing:
+                    return f"disc {disc} track {', '.join(map(str, missing[:5]))}{'...' if len(missing) > 5 else ''} missing"
+            return None
     first, last = min(numbers), max(numbers)
+    if last > MAX_AUDIOBOOK_PARTS:
+        return f"part number exceeds {MAX_AUDIOBOOK_PARTS}"
     if first > 1:
         return f"the numbering starts at {first}"
     missing = sorted(set(range(max(first, 1), last + 1)) - set(numbers))
@@ -539,6 +564,36 @@ _BOOK_RANGE = re.compile(r"(?:\bbooks?|\bbks?|\bvols?|\bvolumes?|#)\.?\s*\d+\s*(
 _BRACKET_CONTENT = re.compile(r"\[([^\]]*)\]|\(([^)]*)\)|\{([^}]*)\}")
 # A segment that starts like this names the narrator, not another book
 _NARRATOR_LEAD = {"read", "narrated", "performed", "narrator", "gelesen"}
+
+# These describe a fragment only when used as release labels, not when they are
+# part of the wanted work's own title (a short story can itself be named Prologue).
+_FRAGMENT_MARKER = re.compile(r"\b(?:sample|preview|excerpt|prologue|prolog|epilogue|epilog|trailer|teaser)\b", re.IGNORECASE)
+
+
+def fragment_release(title: str, raw_name: str) -> bool:
+    """Recognise explicit fragment labels before normalization removes brackets.
+
+    Inspect bracket labels and separated filename/folder segments. A normal
+    chapter file inside a fully selected book is not passed here as a release.
+    """
+    wanted_words = set(_meaningful_words(title))
+    markers = {m.group(0).lower() for m in _FRAGMENT_MARKER.finditer(raw_name)} - wanted_words
+    if not markers:
+        return False
+    name = _stem(raw_name)
+    labels = [next((g for g in groups if g), "") for groups in _BRACKET_CONTENT.findall(name)]
+    labels += re.split(r"\s+[-–]\s+|\\|,|;|:", name)
+    for label in labels:
+        words = _meaningful_words(label)
+        # "Dune - Prologue", "[Free Sample]", "Prologue for 9 - Dune".
+        # Also catch an explicit marker appended to a known wanted title.
+        if any(marker in words for marker in markers):
+            if (wanted_words and wanted_words <= set(words)) or all(
+                word in markers or word in {"free", "only", "audio", "audiobook", "chapter", "part", "track"} or word.isdigit()
+                for word in words
+            ):
+                return True
+    return False
 
 _NUMBER_WORD = re.compile(r"\d+(?:[snrt][tdh])?")
 _YEAR_WORD = re.compile(r"(?:1[89]|20)\d\d")
@@ -632,6 +687,8 @@ def names_another_release(title: str, raw_name: str, author_name: str = "", seri
       "(Box Set)". A bracket naming the series with this book's number ("(Red Rising Saga
       #1)") or holding anything else ("(Unabridged)", "(2014)", "[Tim Gerard Reynolds]") is fine.
     """
+    if fragment_release(title, raw_name):
+        return True
     positions = series_positions(series_title)
     if positions and any(int(n) not in positions for n in _BOOK_NUMBER.findall(raw_name)):
         return True
@@ -735,8 +792,8 @@ def audiobook_folder_match(
     Audiobooks usually arrive as a folder of chapter files ("01.mp3", "02.mp3"...)
     whose names say nothing about the book, so the folder name is matched instead.
     Files are grouped by (folder, extension). Disc/part subfolders are skipped, and the
-    author's surname must appear in the folder path. The best folder per extension that
-    scores at least minimum_match_ratio is returned, best match first.
+    author's surname must appear in the folder path. Distinct matching releases
+    are retained until full directory validation, best match first.
 
     Returns:
         List of dicts: directory, extension, files, score, total_size, file_based.
@@ -816,7 +873,10 @@ def audiobook_folder_match(
         logger.info(f"Audiobook match on title and author with a low fuzzy score, kept as a last choice: {name} from {username}")
         return minimum_match_ratio
 
-    best_per_ext: Dict[str, Dict[str, Any]] = {}
+    # Preserve distinct releases until their complete directory listing has been
+    # checked. A bigger search hit can be incomplete; dropping the smaller release
+    # here used to make the backend's alternate-candidate mechanism ineffective.
+    offered: Dict[tuple, Dict[str, Any]] = {}
 
     def offer(directory: str, ext: str, files: List[Dict[str, Any]], score: float, file_based: bool) -> None:
         candidate = {
@@ -829,9 +889,10 @@ def audiobook_folder_match(
             # this name are the book; the rest of the folder is something else.
             "file_based": file_based,
         }
-        current = best_per_ext.get(ext)
+        identity = (directory, ext, tuple(sorted(book_key(split_slskd_path(f["filename"])[1]) for f in files)) if file_based else ())
+        current = offered.get(identity)
         if current is None or (candidate["score"], candidate["total_size"]) > (current["score"], current["total_size"]):
-            best_per_ext[ext] = candidate
+            offered[identity] = candidate
 
     for (directory, ext), files in groups.items():
         if is_disc_folder(directory):
@@ -898,7 +959,7 @@ def audiobook_folder_match(
                 note("folders without the author's surname", directory)
 
     # Best match first; the configured format order only breaks ties
-    matches = sorted(best_per_ext.values(), key=lambda c: (-c["score"], allowed.index(c["extension"])))
+    matches = sorted(offered.values(), key=lambda c: (-c["score"], allowed.index(c["extension"]), -c["total_size"]))
     for match in matches:
         logger.info(f"Audiobook folder match: {match['directory']} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
     return matches

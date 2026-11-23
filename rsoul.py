@@ -21,10 +21,14 @@ from rsoul.ledger import BookLedger
 from rsoul.search import get_books, SearchError
 from rsoul.media import get_media_mode
 from rsoul.net import apply_timeout
-from rsoul.locking import AlreadyRunning, InstanceLock
+from rsoul.locking import AlreadyRunning, InstanceLock, LockUnavailable
 from rsoul import health
+from rsoul import postprocess
 from rsoul.history import HistoryManager
-from rsoul.state import StateManager
+from rsoul.state import StateManager, StatePersistenceError
+from rsoul import notify
+from rsoul.version import __version__, BUILD_ID
+from rsoul.diagnostics import report_versions
 from rsoul.backends import create_backends_from_config
 from rsoul.orchestrator import DownloadOrchestrator
 
@@ -43,6 +47,7 @@ LAST_RUN: dict = {}
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description="""Readarr Soul: Connect Readarr with Soulseek""")
+    parser.add_argument("--version", action="version", version=f"R:soul {__version__} ({BUILD_ID})")
 
     default_data_directory = os.getcwd()
     if is_docker():
@@ -74,13 +79,14 @@ def main():
     instance_lock = InstanceLock(config_dir)
     try:
         instance_lock.acquire()
-    except AlreadyRunning as e:
+    except (AlreadyRunning, LockUnavailable) as e:
+        LAST_RUN["skip_status"] = True
         console.print(str(e), style="bold red")
         return EXIT_ERROR
 
     exit_code = EXIT_OK
     health.configure(config_dir)
-    health.write_status("running", run_started_at=time.time())
+    health.write_status("running", run_started_at=time.time(), persistence_error=None, version=__version__)
     try:
         # Print banner
         print_startup_banner()
@@ -123,6 +129,7 @@ def main():
 
         # Validate Config
         validate_config(config)
+        notify.configure(config)
 
         # Extract Config Values
         slskd_enabled = config.getboolean("Backends", "slskd_enabled", fallback=True)
@@ -160,10 +167,14 @@ def main():
         # Initialize State Manager for resume functionality
         dry_run = is_dry_run(config, args.dry_run)
         state_manager = StateManager(config_dir, read_only=dry_run)
+        if not dry_run:
+            state_manager.ensure_writable()
 
         # Initialize Context
         ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir, history=history_manager, state=state_manager)
         ctx.ledger = BookLedger(config_dir, read_only=dry_run)
+        if not dry_run:
+            report_versions(ctx)
 
         # Initialize backends and orchestrator
         backends = create_backends_from_config(ctx)
@@ -177,6 +188,10 @@ def main():
         if dry_run:
             return _dry_run(ctx, search_sources, search_type, page_size)
 
+        # A sidecar can be the last committed evidence after an interrupted central
+        # state update. Adopt it even when the wanted list is empty or unavailable.
+        postprocess.recover_pending_imports(ctx)
+
         # Check if we have saved state to resume (downloads, or imports awaiting confirmation)
         has_saved_state = state_manager.has_pending_state()
         saved_downloads = [i for i in state_manager.get_items() if not i.get("extra", {}).get("import_pending")]
@@ -189,31 +204,38 @@ def main():
         wanted_books = []
         download_targets = []
         if not saved_downloads or monitor_window > 0:
-            try:
-                for source in search_sources:
+            for source in search_sources:
+                try:
                     logger.debug(f"Getting records from {source}")
-                    wanted_books.extend(get_books(ctx, source, search_type, page_size))
-            except (ValueError, SearchError) as ex:
-                # Neither a bad search setting nor an unreachable Readarr/Chaptarr may strand
-                # downloads that are already running
-                logger.error(f"Searching for new books failed: {ex}")
-                if not has_saved_state:
-                    return EXIT_ERROR if isinstance(ex, ValueError) else EXIT_PARTIAL
-                logger.error("Continuing with the saved downloads only")
-                wanted_books = []
+                    wanted_books.extend(get_books(ctx, source, search_type, page_size, durable_queue=True))
+                except (ValueError, SearchError) as ex:
+                    # Keep successful sources and durable recovery work available
+                    # when a different wanted endpoint fails.
+                    logger.error("Searching %s for new books failed: %s", source, ex)
+                    exit_code = EXIT_ERROR if isinstance(ex, ValueError) and not has_saved_state and not wanted_books else EXIT_PARTIAL
+            if getattr(ctx, "wanted_scan_errors", None):
                 exit_code = EXIT_PARTIAL
 
             # Construct Download Targets. Books still downloading from an earlier run (hand-off)
             # are skipped here already, so their authors aren't fetched for nothing.
             in_flight = {item.get("book_id") for item in state_manager.get_tasks_for_orchestrator()}
+            if ctx.wanted_queue:
+                ctx.wanted_queue.acknowledge(in_flight)
             wanted_books = [b for b in wanted_books if b.get("id") not in in_flight]
             if len(wanted_books) > 0:
                 console.print(f"\nFound {len(wanted_books)} wanted books to process", style="bold green")
 
+                authors = {}
+                seen_ids = set()
                 for book in wanted_books:
+                    if book.get("id") in seen_ids:
+                        continue
+                    seen_ids.add(book.get("id"))
                     try:
                         authorID = book["authorId"]
-                        author = ctx.readarr.get_author(authorID)
+                        if authorID not in authors:
+                            authors[authorID] = ctx.readarr.get_author(authorID)
+                        author = authors[authorID]
                         download_targets.append({"book": book, "author": author})
                     except Exception:
                         logger.exception(f"Error processing book {book.get('title', 'unknown')}")
@@ -224,6 +246,11 @@ def main():
         if len(download_targets) > 0 or has_saved_state:
             try:
                 LAST_RUN.update(run_workflow(ctx, download_targets) or {})
+            except StatePersistenceError as exc:
+                LAST_RUN["persistence_error"] = str(exc)
+                notify.send("persistence_error", "State could not be saved", str(exc))
+                logger.exception("Durable checkpoint failed; stopping further mutations")
+                return EXIT_ERROR
             except Exception:
                 logger.exception("Fatal error encountered during workflow execution")
                 return EXIT_ERROR
@@ -234,6 +261,11 @@ def main():
     except KeyboardInterrupt:
         console.print("\nOperation cancelled by user", style="bold yellow")
         return 130
+    except StatePersistenceError as e:
+        LAST_RUN["persistence_error"] = str(e)
+        notify.send("persistence_error", "State could not be saved", str(e))
+        logger.error("Durable checkpoint failed; stopping further mutations: %s", e)
+        return EXIT_ERROR
     except ValueError as e:
         logger.error(f"{e}")
         return EXIT_ERROR
@@ -242,6 +274,9 @@ def main():
         return EXIT_ERROR
     finally:
         instance_lock.release()
+        # One shared grace period, outside the transaction lock. A stalled webhook worker
+        # is a daemon and cannot hold up shutdown or the next scheduled run.
+        notify.shutdown()
 
     return exit_code
 
@@ -287,9 +322,13 @@ def _dry_run(ctx, search_sources, search_type, page_size) -> int:
 def _main_with_status() -> int:
     LAST_RUN.clear()
     code = main()
-    # Docker's health check only looks at how recent this file is (liveness). The details
-    # below say how the last run went, for anyone reading health.json.
+    if LAST_RUN.get("skip_status"):
+        return code
+    # Docker checks freshness and durable-state failures. The details below also
+    # distinguish pending work, review, and incomplete searches.
     details = {
+        "version": __version__,
+        "persistence_error": LAST_RUN.get("persistence_error"),
         "last_exit": code,
         "last_run_ended_at": time.time(),
         "last_run": {
@@ -299,6 +338,8 @@ def _main_with_status() -> int:
             "still_downloading": LAST_RUN.get("still_running", 0),
             "pending_imports": LAST_RUN.get("pending_imports", 0),
             "unchecked_downloads": LAST_RUN.get("unchecked_downloads", 0),
+            "needs_review": LAST_RUN.get("needs_review", 0),
+            "pending_cleanup": LAST_RUN.get("pending_cleanup", 0),
         },
     }
     if "dry_run" in LAST_RUN:

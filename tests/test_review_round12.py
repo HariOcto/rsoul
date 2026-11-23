@@ -12,6 +12,9 @@ six other books while the wanted records stayed wanted.
 import logging
 import os
 import sys
+import copy
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +45,7 @@ class Chaptarr:
         self.commands = []
         self.previews = []
         self.bookfiles = []
+        self.events = []
 
     def get_book(self, book_id):
         return {"id": book_id, "title": "The Trafalgar Gambit", "authorId": 37, "hasFiles": self.has_files}
@@ -49,15 +53,25 @@ class Chaptarr:
     def get_edition(self, book_id):
         return self.editions
 
+    def get_author(self, author_id):
+        return {"id": 37, "authorName": NUTTALL}
+
     def _get(self, path, ver_uri="", params=None):
         if path == "bookfile":
             return list(self.bookfiles)
+        if path == "history":
+            return {"records": list(self.events), "totalRecords": len(self.events)}
         assert path == "manualimport"
         self.previews.append(params)
         if self.preview_error:
             raise self.preview_error
         if self.preview is not None:
-            return self.preview
+            preview = copy.deepcopy(self.preview)
+            if isinstance(preview, list):
+                for row in preview:
+                    if isinstance(row, dict) and isinstance(row.get("path"), str) and row["path"].startswith(STAGED + "/"):
+                        row["path"] = params["folder"] + row["path"][len(STAGED):]
+            return preview
         folder = params["folder"]
         local = folder.replace("/chaptarr-side", self.local_root)
         return [{"path": f"{folder}/{name}", "quality": QUALITY, "indexerFlags": 0} for name in sorted(os.listdir(local))]
@@ -65,11 +79,19 @@ class Chaptarr:
     def post_command(self, name, **kwargs):
         self.commands.append((name, kwargs))
         if self.takes_files:
-            if name == "ManualImport":
-                self.bookfiles.append({"id": len(self.bookfiles) + 100, "bookId": kwargs["files"][0]["bookId"], "editionId": kwargs["files"][0]["editionId"]})
-            for root, _, files in os.walk(os.path.join(self.local_root, postprocess.AUDIOBOOK_STAGING_DIR)):
-                for f in files:
-                    os.remove(os.path.join(root, f))
+            entries = kwargs["files"] if name == "ManualImport" else [
+                {"path": kwargs["path"] + "/" + f, "bookId": 4020, "editionId": 21610}
+                for f in os.listdir(kwargs["path"].replace("/chaptarr-side", self.local_root))]
+            for entry in entries:
+                source = entry["path"].replace("/chaptarr-side", self.local_root)
+                file_id = len(self.bookfiles) + 100
+                output = f"/server-library/{file_id}.mp3"
+                if self.has_files:
+                    self.bookfiles.append({"id": file_id, "bookId": entry["bookId"], "editionId": entry["editionId"],
+                                           "path": output, "size": os.path.getsize(source)})
+                    self.events.append({"id": file_id, "bookId": entry["bookId"], "date": datetime.now(timezone.utc).isoformat(),
+                                        "eventType": "bookFileImported", "data": {"FileId": str(file_id), "DroppedPath": entry["path"], "ImportedPath": output}})
+                os.remove(source)
         return {"id": len(self.commands), "body": {"path": kwargs.get("path", "")}}
 
     def get_command(self, id_):
@@ -80,9 +102,10 @@ def run_import(tmp_path, chaptarr, method="targeted", files=("Trafalgar Gambit (
     local = tmp_path / "dl"
     (local / "Christopher G Nuttall").mkdir(parents=True, exist_ok=True)
     for name in files:
-        (local / "Christopher G Nuttall" / name).write_bytes(b"audio")
+        (local / "Christopher G Nuttall" / name).write_bytes((Path(__file__).parent / "fixtures" / "silence.mp3").read_bytes())
     config = make_config(slskd={"download_dir": str(local), "readarr_download_dir": "/chaptarr-side"})
     config["Readarr"]["import_method"] = method
+    config["Readarr"]["import_poll_timeout"] = "0"
     config["Postprocessing"] = {"audiobook_tag_check": "off"}
     ctx = Context(config=config, slskd=None, readarr=chaptarr, history=HistoryManager(str(tmp_path)))
     item = {"author_name": NUTTALL, "title": "The Trafalgar Gambit", "bookId": 4020, "dir": "Christopher G Nuttall", "filename": files[0], "expected_files": list(files), "backend_name": "slskd", "media_type": "audiobook", "source_id": "peer"}
@@ -102,14 +125,16 @@ def test_targeted_import_names_author_book_and_edition(tmp_path):
     result, _ = run_import(tmp_path, chaptarr)
 
     assert result == {4020: True}
-    assert chaptarr.previews == [{"folder": STAGED, "filterExistingFiles": "false"}]
+    staged = chaptarr.previews[0]["folder"]
+    assert staged.startswith(STAGED + " (") and staged.endswith(")")
+    assert chaptarr.previews == [{"folder": staged, "filterExistingFiles": "false"}]
     assert len(chaptarr.commands) == 1
     name, body = chaptarr.commands[0]
     assert name == "ManualImport"
     assert body["importMode"] == "move" and body["replaceExistingFiles"] is False
     assert body["files"] == [
         {
-            "path": f"{STAGED}/Trafalgar Gambit (Ark Royal 3).mp3",
+            "path": f"{staged}/Trafalgar Gambit (Ark Royal 3).mp3",
             "authorId": 37,
             "bookId": 4020,  # the record that was wanted, not whatever the tags suggest
             "editionId": 21610,
@@ -140,12 +165,13 @@ def test_monitored_edition_is_preferred(tmp_path):
     assert chaptarr.commands[0][1]["files"][0]["editionId"] == 2
 
 
-def test_scan_stays_the_default(tmp_path):
+def test_explicit_scan_is_supported_with_complete_correlation(tmp_path):
     chaptarr = Chaptarr(tmp_path / "dl")
     result, _ = run_import(tmp_path, chaptarr, method="scan")
     assert result == {4020: True}
     assert chaptarr.previews == []
-    assert chaptarr.commands == [("DownloadedBooksScan", {"path": STAGED})]
+    assert len(chaptarr.commands) == 1 and chaptarr.commands[0][0] == "DownloadedBooksScan"
+    assert chaptarr.commands[0][1]["path"].startswith(STAGED + " (")
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +194,17 @@ def test_import_that_cannot_be_targeted_stays_pending(tmp_path, kwargs):
     result, _ = run_import(tmp_path, chaptarr)
     assert isinstance(result[4020], dict) and result[4020]["method"] == "targeted"
     assert chaptarr.commands == []
-    assert (tmp_path / "dl" / "rsoul_audiobooks" / "Christopher G Nuttall" / "The Trafalgar Gambit").is_dir()
+    assert Path(result[4020]["local_dir"]).is_dir()
 
 
-def test_failed_targeted_import_is_a_failed_import(tmp_path):
-    # Chaptarr accepts the command but takes no file: failed, not silently scanned as well
+def test_failed_targeted_import_is_retained_without_peer_penalty(tmp_path):
+    # Chaptarr accepts the command but takes no file: unverified, never silently scanned.
     chaptarr = Chaptarr(tmp_path / "dl", takes_files=False)
     result, ctx = run_import(tmp_path, chaptarr)
-    assert result == {4020: False}
+    assert result[4020]["phase"] == "needs_review"
     assert [name for name, _ in chaptarr.commands] == ["ManualImport"]
-    assert (tmp_path / "dl" / "failed_imports" / "The Trafalgar Gambit" / "Trafalgar Gambit (Ark Royal 3).mp3").exists()
-    assert ctx.history.is_failed("peer", "The Trafalgar Gambit")
+    assert Path(result[4020]["files"][0]).exists()
+    assert not ctx.history.is_failed("peer", "The Trafalgar Gambit")
 
 
 def test_folder_with_several_books_is_not_scanned_in_targeted_mode(tmp_path):
@@ -206,9 +232,9 @@ def test_import_that_lands_on_another_record_is_reported(tmp_path, caplog):
     chaptarr = Chaptarr(tmp_path / "dl", has_files=False)  # the wanted record stays empty
     with caplog.at_level(logging.WARNING):
         result, _ = run_import(tmp_path, chaptarr, method="scan")
-    assert result == {4020: False}  # wrong destination must not be marked as imported in the ledger
-    assert "not for the record that was wanted (book 4020 still has no files)" in caplog.text
-    assert "import_method = targeted" in caplog.text
+    assert result[4020]["phase"] == "needs_review"  # cannot be recorded as imported
+    assert result[4020]["verification"]["status"] == "unverified"
+    assert "Legacy folder scan" in caplog.text
 
 
 def test_no_report_when_the_wanted_record_has_the_files(tmp_path, caplog):

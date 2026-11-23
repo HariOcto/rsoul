@@ -5,6 +5,8 @@ from requests import Response
 from requests.auth import HTTPBasicAuth
 
 from .exceptions import (
+    PyarrError,
+    PyarrRateLimit,
     PyarrAccessRestricted,
     PyarrBadGateway,
     PyarrBadRequest,
@@ -229,28 +231,44 @@ def _process_response(
     Returns:
         JSON: Array
     """
+    def fail(error):
+        # Preserve status and Retry-After for service-level recovery. Error bodies
+        # are data, never evidence that a non-2xx mutation succeeded.
+        error.response = res
+        error.status_code = res.status_code
+        error.headers = dict(res.headers)
+        raise error
+
     if res.status_code == 400:
-        raise PyarrBadRequest(f"Bad Request, possibly a bug. {str(res.content)}")
+        fail(PyarrBadRequest(f"Bad Request, possibly a bug. {str(res.content)}"))
 
     if res.status_code == 401:
-        raise PyarrUnauthorizedError(
+        fail(PyarrUnauthorizedError(
             "Unauthorized. Please ensure valid API Key is used.", {}
-        )
+        ))
     if res.status_code == 403:
-        raise PyarrAccessRestricted(
+        fail(PyarrAccessRestricted(
             "Access restricted. Please ensure API Key has correct permissions", {}
-        )
+        ))
     if res.status_code == 404:
-        raise PyarrResourceNotFound("Resource not found")
+        fail(PyarrResourceNotFound("Resource not found"))
     if res.status_code == 405:
-        raise PyarrMethodNotAllowed(f"The endpoint {res.url} is not allowed")
+        fail(PyarrMethodNotAllowed(f"The endpoint {res.url} is not allowed"))
+    if res.status_code == 429:
+        fail(PyarrRateLimit("API rate limit reached; retry after the server's requested delay"))
     if res.status_code == 500:
-        raise PyarrServerError(
-            f"Internal Server Error: {res.json()['message']}",
-            res.json(),
-        )
+        try:
+            data = res.json()
+        except ValueError:
+            data = {}
+        message = data.get("message", "unknown server error") if isinstance(data, dict) else "unknown server error"
+        error = PyarrServerError(f"Internal Server Error: {message}", data)
+        error.response_data = data
+        fail(error)
     if res.status_code == 502:
-        raise PyarrBadGateway("Bad Gateway. Check your server is accessible.")
+        fail(PyarrBadGateway("Bad Gateway. Check your server is accessible."))
+    if res.status_code >= 400:
+        fail(PyarrError(f"API request failed with HTTP {res.status_code}"))
 
     content_type = res.headers.get("Content-Type", "")
     if "application/json" in content_type:

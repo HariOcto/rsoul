@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .match import title_key
+from .persistence import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +51,7 @@ class BookLedger:
     def _save(self) -> None:
         if self.read_only:
             return
-        temp = self.filepath.with_name(self.filepath.name + ".tmp")
-        try:
-            with open(temp, "w", encoding="utf-8") as f:
-                json.dump(self.books, f, indent=2)
-            os.replace(temp, self.filepath)
-        except OSError as e:
-            logger.warning(f"Could not save {self.filepath}: {e}")
+        atomic_write_json(self.filepath, self.books)
 
     @staticmethod
     def _when(value: Any) -> Optional[datetime]:

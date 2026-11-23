@@ -1,110 +1,100 @@
+"""Scoped source failures. Local import/configuration failures never poison a peer."""
 import json
-import os
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict
+import os
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
+from .persistence import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
 
-class HistoryManager:
-    """
-    Manages a persistent list of failed downloads to prevent re-queueing.
-    """
+def _key(value):
+    return " ".join(str(value or "").casefold().split())
 
+
+class HistoryManager:
+    """Persist source evidence with a work/media/backend and optional release scope.
+
+    Unscoped legacy API calls remain readable by unscoped callers. Scoped production
+    calls ignore legacy username/title-only bans: their cause/medium is unknowable.
+    """
     def __init__(self, config_dir: str):
         self.file_path = os.path.join(config_dir, "failed_downloads.json")
-        self.history: List[Dict[str, str]] = []
+        self.history: List[Dict[str, Any]] = []
+        self._lock = threading.RLock()
         self.load()
 
     def load(self):
-        """Load history from JSON file."""
-        if os.path.exists(self.file_path):
+        with self._lock:
             try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    self.history = json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load history from {self.file_path}: {e}")
+                with open(self.file_path, encoding="utf-8") as stream:
+                    rows = json.load(stream)
+                self.history = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+            except FileNotFoundError:
                 self.history = []
-        else:
-            self.history = []
+            except (OSError, ValueError) as error:
+                logger.error("Cannot read source failure history %s: %s", self.file_path, error)
+                self.history = []
 
     def save(self):
-        """Save history to JSON file using atomic write (temp file + rename)."""
-        tmp_path = self.file_path + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self.history, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, self.file_path)
-        except Exception as e:
-            logger.error(f"Failed to save history to {self.file_path}: {e}")
-            # Clean up temp file if it exists
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-
-    def add_failure(self, source_id: str, book_title: str, reason: str = "", retry_after_days: float = 0):
-        """
-        Record a failed download/import.
-
-        Args:
-            source_id: Backend-specific identifier (slskd username, AA path, etc.)
-            book_title: The canonical book title from Readarr.
-            reason: Optional reason for failure.
-            retry_after_days: If > 0, the entry only holds for this many days. Used when the
-                files themselves may be fine (Readarr/Chaptarr didn't import them, which can
-                also be a path, permission or import-setting problem on its side).
-        """
-        if not source_id or not book_title:
-            return
-
-        # Check if already exists to avoid duplicates
-        if self.is_failed(source_id, book_title):
-            return
-
-        # Entries that have run out make room for the new one
-        self.history = [e for e in self.history if not self._expired(e)]
-
-        entry = {"source_id": source_id, "book_title": book_title, "timestamp": datetime.now().isoformat(), "reason": reason}
-        if retry_after_days and retry_after_days > 0:
-            entry["retry_after"] = (datetime.now() + timedelta(days=retry_after_days)).isoformat()
-        self.history.append(entry)
-        logger.info(f"Added to blocklist: '{source_id}' for Book '{book_title}'")
-        self.save()
+        with self._lock:
+            atomic_write_json(self.file_path, self.history)
 
     @staticmethod
-    def _expired(entry: Dict[str, str]) -> bool:
-        """True for a temporary entry whose time is up. Entries without retry_after never expire."""
-        retry_after = entry.get("retry_after") if isinstance(entry, dict) else None
-        if not retry_after:
+    def _expired(entry):
+        deadline = entry.get("retry_after") if isinstance(entry, dict) else None
+        if not deadline:
             return False
         try:
-            return datetime.now() >= datetime.fromisoformat(retry_after)
+            parsed = datetime.fromisoformat(deadline)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) >= parsed
         except (TypeError, ValueError):
-            return False
+            return True
 
-    def is_failed(self, source_id: str, book_title: str) -> bool:
-        """
-        Check if a source_id/book combo is in the blocklist.
-        Case-insensitive comparison.
-        Backwards-compatible: reads both 'source_id' and legacy 'username' fields.
-        """
+    def is_failed(self, source_id: str, book_title: str, *, backend="", author="", media_type="", release_id="", failure_kind="") -> bool:
         if not source_id or not book_title:
             return False
-
-        target_source = source_id.strip().lower()
-        target_book = book_title.strip().lower()
-
-        for entry in self.history:
-            if self._expired(entry):
-                continue
-            # Support both new 'source_id' and legacy 'username' field
-            h_source = entry.get("source_id", entry.get("username", "")).strip().lower()
-            h_book = entry.get("book_title", "").strip().lower()
-
-            if h_source == target_source and h_book == target_book:
+        scoped = bool(backend and author and media_type)
+        with self._lock:
+            for entry in self.history:
+                if self._expired(entry):
+                    continue
+                if _key(entry.get("source_id", entry.get("username"))) != _key(source_id) or _key(entry.get("book_title")) != _key(book_title):
+                    continue
+                if scoped:
+                    if entry.get("schema_version") != 2:
+                        continue
+                    if any(_key(entry.get(name)) != _key(value) for name, value in (("backend", backend), ("author", author), ("media_type", media_type))):
+                        continue
+                    if entry.get("release_id") and entry["release_id"] != release_id:
+                        continue
+                    if failure_kind and entry.get("failure_kind") != failure_kind:
+                        continue
                 return True
-
         return False
+
+    def add_failure(self, source_id: str, book_title: str, reason: str = "", retry_after_days: float = 0, *, backend="", author="", media_type="", release_id="", failure_kind=""):
+        if not source_id or not book_title:
+            return
+        if failure_kind in {"import_failed", "import_unknown", "permission", "path", "service_unavailable", "rate_limited", "enqueue_unknown", "state_persistence", "local_file_invalid", "legacy_unverified"}:
+            logger.info("Not blocklisting a source for %s: %s", failure_kind, book_title)
+            return
+        with self._lock:
+            if self.is_failed(source_id, book_title, backend=backend, author=author, media_type=media_type, release_id=release_id, failure_kind=failure_kind):
+                return
+            now = datetime.now(timezone.utc)
+            entry = {"source_id": source_id, "book_title": book_title, "timestamp": now.isoformat(), "reason": reason}
+            if backend and author and media_type:
+                entry.update(schema_version=2, backend=backend, author=author, media_type=media_type, release_id=release_id, failure_kind=failure_kind or "source_failed")
+            else:
+                entry["schema_version"] = 1
+            if retry_after_days > 0:
+                entry["retry_after"] = (now + timedelta(days=retry_after_days)).isoformat()
+            rows = [row for row in self.history if not self._expired(row)] + [entry]
+            atomic_write_json(self.file_path, rows)
+            self.history = rows
+            logger.info("Recorded %s failure for %s / %s (%s)", failure_kind or "legacy", author, book_title, source_id)

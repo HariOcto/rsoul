@@ -1,6 +1,7 @@
 import os
 import logging
 from rich.console import Console
+from .version import __version__, BUILD_ID
 
 
 # Safe terminal width detection with proper error handling
@@ -28,7 +29,7 @@ def get_terminal_width():
 
 # Initialize rich console with safe width detection
 terminal_width = get_terminal_width()
-console = Console(width=terminal_width, force_terminal=True)
+console = Console(width=terminal_width)
 
 logger = logging.getLogger("rsoul.display")
 
@@ -43,6 +44,7 @@ def print_startup_banner():
 ================================================================
     """
     print(banner)
+    print(f"R:soul {__version__} — {BUILD_ID}")
 
 
 def print_search_summary(query, results_count, search_type="main", status="completed"):
@@ -92,12 +94,11 @@ def print_import_summary(commands):
 
     logger.info("--- Import Operations ---")
     for command in commands:
-        author_name = "Unknown"
-        if "body" in command and "path" in command["body"]:
-            path = command["body"]["path"]
-            author_name = os.path.basename(path)
+        author_name = command.get("_rsoul_folder") or "Unknown"
+        if command.get("body", {}).get("path"):
+            author_name = os.path.basename(command["body"]["path"])
 
-        logger.info(f"Author: {author_name} | Command ID: {command['id']} | Status: Queued")
+        logger.info(f"Import folder: {author_name} | Command ID: {command['id']} | Status: Queued")
     logger.info("-------------------------")
 
 

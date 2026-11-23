@@ -21,19 +21,38 @@ logger = logging.getLogger(__name__)
 _CACHE_KEY = "author_titles"
 
 
+class CatalogUnavailable(RuntimeError):
+    """An author's bibliography could not be verified, rather than being empty."""
+
+
 def _author_books(ctx: "Context", author_id: Any) -> Dict[str, List[str]]:
-    """Titles and series of all books Readarr/Chaptarr lists for the author; empty lists if
-    they can't be fetched."""
-    cache: Dict[Any, Dict[str, List[str]]] = ctx.stats.setdefault(_CACHE_KEY, {}) if isinstance(ctx.stats, dict) else {}
+    """Fetch/cache successful catalog responses; failures remain retryable."""
+    stats = getattr(ctx, "stats", None)
+    if not isinstance(stats, dict):
+        stats = {}
+        try:
+            ctx.stats = stats
+        except (AttributeError, TypeError):
+            pass
+    cache = stats.setdefault(_CACHE_KEY, {})
+    if not isinstance(cache, dict):
+        cache = {}
+        stats[_CACHE_KEY] = cache
     if author_id in cache:
         return cache[author_id]
     found: Dict[str, List[Any]] = {"titles": [], "series": [], "records": []}
     try:
         books = ctx.readarr._get("book", ctx.readarr.ver_uri, params={"authorId": author_id})
-        for book in books if isinstance(books, list) else []:
+        if not isinstance(books, list):
+            raise CatalogUnavailable("Author bibliography API returned an unsupported response")
+        for book in books:
+            if not isinstance(book, dict):
+                raise CatalogUnavailable("Author bibliography API returned a malformed book")
             # Only this author's: a server that ignores the filter would hand back everything
-            if not isinstance(book, dict) or book.get("authorId", author_id) != author_id:
+            if str(book.get("authorId", author_id)) != str(author_id):
                 continue
+            if not isinstance(book.get("title"), str) or not book["title"].strip():
+                raise CatalogUnavailable("Author bibliography API returned a book without a title")
             for key, value in (("titles", book.get("title")), ("series", book.get("seriesTitle"))):
                 if isinstance(value, str) and value.strip() and value not in found[key]:
                     found[key].append(value)
@@ -46,10 +65,26 @@ def _author_books(ctx: "Context", author_id: Any) -> Dict[str, List[str]]:
                     "has_files": bool(book.get("hasFiles")) or bool(statistics.get("bookFileCount")),
                 }
             )
+    except CatalogUnavailable:
+        raise
     except Exception as e:
-        logger.debug(f"Could not fetch the other books of author {author_id}: {e}")
+        raise CatalogUnavailable(f"Could not fetch the bibliography of author {author_id}: {e}") from e
     cache[author_id] = found
     return found
+
+
+def require_author_catalog(ctx: "Context", book: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Return verified author metadata or explicitly report that it is unavailable.
+
+    An actual empty API list is a successful response. A failed or malformed
+    lookup never becomes an empty cached bibliography that disables safety checks.
+    """
+    author_id = book.get("authorId") if isinstance(book, dict) else None
+    if not author_id or not isinstance(author_id, (int, str)) or isinstance(author_id, bool):
+        raise CatalogUnavailable("The wanted book has no usable author ID for its bibliography")
+    if not getattr(ctx, "readarr", None):
+        raise CatalogUnavailable("Readarr/Chaptarr is unavailable for author bibliography validation")
+    return _author_books(ctx, author_id)
 
 
 def author_series(ctx: "Context", book: Dict[str, Any]) -> List[str]:
@@ -61,7 +96,11 @@ def author_series(ctx: "Context", book: Dict[str, Any]) -> List[str]:
     author_id = book.get("authorId")
     if not author_id or not getattr(ctx, "readarr", None):
         return []
-    return list(_author_books(ctx, author_id)["series"])
+    try:
+        return list(require_author_catalog(ctx, book)["series"])
+    except CatalogUnavailable as exc:
+        logger.debug("Author series unavailable: %s", exc)
+        return []
 
 
 def record_with_files(ctx: "Context", book: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,7 +115,12 @@ def record_with_files(ctx: "Context", book: Dict[str, Any]) -> Dict[str, Any]:
     if not author_id or not title or not getattr(ctx, "readarr", None):
         return {}
     media_type = str(book.get("mediaType") or "").strip().lower()
-    for record in _author_books(ctx, author_id)["records"]:
+    try:
+        records = require_author_catalog(ctx, book)["records"]
+    except CatalogUnavailable as exc:
+        logger.debug("Duplicate catalog lookup unavailable: %s", exc)
+        return {}
+    for record in records:
         if record["id"] == book.get("id") or not record["has_files"]:
             continue
         if media_type and record["media_type"] and record["media_type"] != media_type:
@@ -98,7 +142,12 @@ def sibling_titles(ctx: "Context", book: Dict[str, Any], author_name: str = "") 
         return []
     own = title_variants(title)
     siblings = []
-    for other in _author_books(ctx, author_id)["titles"]:
+    try:
+        titles = require_author_catalog(ctx, book)["titles"]
+    except CatalogUnavailable as exc:
+        logger.debug("Sibling titles unavailable: %s", exc)
+        return []
+    for other in titles:
         same_book = any(title_segment_match(variant, other, author_name) for variant in own) or any(title_segment_match(variant, title, author_name) for variant in title_variants(other))
         if not same_book:
             siblings.append(other)

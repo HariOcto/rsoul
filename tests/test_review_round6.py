@@ -12,6 +12,7 @@ import os
 import sys
 
 import pytest
+from rsoul.outcomes import SearchIncomplete
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -231,7 +232,7 @@ def test_searches_that_all_fail_are_not_an_empty_result():
             self.searches.search_text = lambda **kwargs: (_ for _ in ()).throw(ConnectionError("slskd gone"))
 
     b = backend(Broken())
-    with pytest.raises(RuntimeError, match="searches could be run"):
+    with pytest.raises(SearchIncomplete, match="Search coverage incomplete"):
         b.search(DownloadTarget(book_id=7, book_title="Red Rising", author_name=BROWN, series_title="", allowed_filetypes=["mp3"], media_type="audiobook"))
 
 

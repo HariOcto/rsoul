@@ -21,11 +21,23 @@ class SearchError(Exception):
     """
 
 
-def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int, advance_page: bool = True) -> List[Book]:
+def get_books(ctx: "Context", search_source: str, search_type: str, page_size: int, advance_page: bool = True, *, durable_queue: bool = False) -> List[Book]:
     """Get books from Readarr based on search source and type.
 
     advance_page=False (dry run) leaves the page counter of incrementing_page untouched, so the
     next real run gets the same books."""
+    if durable_queue and advance_page:
+        from .wanted_queue import WantedQueue
+        from .persistence import StatePersistenceError
+        if not getattr(ctx, "wanted_queue", None):
+            ctx.wanted_queue = WantedQueue(ctx.config_dir)
+        try:
+            return ctx.wanted_queue.fetch(ctx, search_source, search_type, page_size)
+        except (StatePersistenceError, ValueError):
+            raise
+        except Exception as exc:
+            raise SearchError(f"Could not update the {search_source} wanted queue: {exc}") from exc
+
     # One page counter per list: with search_source = all, a shared counter would be advanced
     # twice per run, so each list would only ever see every other page
     page_file = ".current_page.txt" if search_source == "missing" else f".current_page_{search_source}.txt"

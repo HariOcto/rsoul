@@ -2,6 +2,11 @@ import logging
 import os
 import re
 import time
+import copy
+import hashlib
+import json
+import stat
+import uuid
 from typing import List, Optional, Any, Dict, Tuple, TYPE_CHECKING
 from pathlib import Path
 
@@ -18,10 +23,14 @@ from . import register_backend
 if TYPE_CHECKING:
     from ..config import Context
 
-from ..download import slskd_do_enqueue, slskd_download_status, downloads_all_done
-from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number, books_in_folder, missing_parts
+from ..download import slskd_download_status, downloads_all_done, enqueue_owned, matching_new_transfers, _transfer_ids, get_user_downloads, is_not_found
+from ..outcomes import FailureKind, SearchIncomplete, http_status, check_fatal_state
+from ..persistence import StatePersistenceError
+from ..search_control import SearchControl, responsive_wait
+from ..recording_policy import evaluate_recording
+from ..match import book_match, verify_filetype, audiobook_folder_match, split_slskd_path, same_book_files, part_number, books_in_folder, missing_parts, fragment_release
 from ..media import AUDIO_EXTENSIONS
-from ..library import sibling_titles
+from ..library import sibling_titles, require_author_catalog, CatalogUnavailable
 from ..display import print_search_summary
 from ..postprocess import move_files_aside
 from .. import health
@@ -30,28 +39,27 @@ logger = logging.getLogger(__name__)
 
 
 def _generate_fallback_queries(author_name: str, book_title: str, max_fallbacks: int) -> List[str]:
-    """Generate progressively degraded search queries for blocked word workaround.
+    """Keep the surname and distinctive title words while relaxing punctuation/noise."""
+    name = _strip_initials(author_name)
+    surname = name.split(",", 1)[0].strip() if "," in name else (name.split()[-1] if name.split() else "")
+    title = book_title.split(":", 1)[0].strip()
+    words = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", title, re.UNICODE)
+    stop = {"the", "a", "an", "of", "and", "or", "for", "to", "in", "on", "book", "volume", "series"}
+    distinctive = [word for word in words if word.casefold() not in stop]
+    queries = [f"{surname} - {title}"]
+    if distinctive:
+        queries.append(f"{surname} - {' '.join(distinctive)}")
+    # At most one distinctive word is omitted; never collapse to first name + 'the'.
+    if len(distinctive) >= 2:
+        for index in range(len(distinctive)):
+            kept = distinctive[:index] + distinctive[index + 1:]
+            if any(len(word) > 2 and not word.isdigit() for word in kept):
+                queries.append(f"{surname} - {' '.join(kept)}")
+    return queries[:max(0, max_fallbacks)]
 
-    Strategy:
-    1. First name + full title
-    2. First name + title with word 0 dropped
-    3. First name + title with word 1 dropped
-    ...continues left-to-right until max_fallbacks reached
-    """
-    queries = []
-    first_name = author_name.split()[0] if author_name.split() else ""
-    title_words = book_title.split()
 
-    # Step 1: First name + full title
-    queries.append(f"{first_name} - {book_title}")
-
-    # Steps 2+: Drop words left-to-right
-    for i in range(min(len(title_words), max_fallbacks - 1)):
-        remaining = " ".join(title_words[:i] + title_words[i + 1:])
-        if remaining:
-            queries.append(f"{first_name} - {remaining}")
-
-    return queries[:max_fallbacks]
+def _query_key(query):
+    return " ".join(re.findall(r"[^\W_]+", query.casefold(), re.UNICODE))
 
 
 def _strip_initials(author_name: str) -> str:
@@ -82,6 +90,7 @@ def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[
         Tuple of (search results list, search ID for cleanup)
     """
     print_search_summary(query, 0, search_type, "searching")
+    check_fatal_state(ctx)
 
     search_timeout_ms = ctx.config.getint("Search Settings", "search_timeout", fallback=5000)
     search = ctx.slskd.searches.search_text(
@@ -92,23 +101,31 @@ def _execute_search(ctx: "Context", query: str, search_type: str) -> Tuple[List[
         minimumPeerUploadSpeed=ctx.config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
     )
 
-    health.heartbeat()  # searching many books can take longer than the health check allows
-    time.sleep(10)
-
-    # slskd ends a search itself after search_timeout; the cap only guards against a search
-    # that never leaves "InProgress", which would otherwise hang the whole run
-    deadline = time.time() + search_timeout_ms / 1000 + SEARCH_WAIT_MARGIN
-    while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":
-        if time.time() >= deadline:
-            logger.warning(f"Search '{query}' is still in progress after {search_timeout_ms / 1000 + SEARCH_WAIT_MARGIN:.0f}s; using the results so far")
-            break
+    try:
         health.heartbeat()
-        time.sleep(1)
-
-    results = ctx.slskd.searches.search_responses(search["id"])
-    print_search_summary(query, len(results), search_type, "completed")
-
-    return results, search["id"]
+        responsive_wait(ctx, 10)
+        deadline = time.time() + search_timeout_ms / 1000 + SEARCH_WAIT_MARGIN
+        while ctx.slskd.searches.state(search["id"], False)["state"] == "InProgress":
+            if time.time() >= deadline:
+                raise SearchIncomplete(f"Search '{query}' did not finish before its bounded wait expired")
+            responsive_wait(ctx, 1)
+        results = ctx.slskd.searches.search_responses(search["id"])
+        print_search_summary(query, len(results), search_type, "completed")
+        return results, search["id"]
+    except StatePersistenceError:
+        raise
+    except Exception:
+        # This search ID belongs to this request; only it may be removed. A broken
+        # polling request must not leave every subsequent search fighting its slot.
+        if ctx.config.getboolean("Slskd", "delete_searches", fallback=True):
+            try:
+                check_fatal_state(ctx)
+                ctx.slskd.searches.delete(search["id"])
+            except StatePersistenceError:
+                raise
+            except Exception:
+                pass
+        raise
 
 
 @register_backend("slskd")
@@ -123,6 +140,9 @@ class SlskdBackend(DownloadBackend):
         self._alternates: Dict[int, Any] = {}
         # book ID -> what the last search considered and rejected (read by the dry run)
         self.search_notes: Dict[int, Dict[str, Any]] = {}
+        self._pending_alternates: Dict[str, Any] = {}
+        self._search_control = None
+        self._replacing_task_id = None
 
     @property
     def name(self) -> str:
@@ -154,88 +174,85 @@ class SlskdBackend(DownloadBackend):
             return False
 
     def search(self, target: DownloadTarget) -> List[SearchResult]:
-        """Search for a book on Soulseek via slskd."""
-        author_name = target.author_name
-        book_title = target.book_title
-
-        delete_searches = self.config.getboolean("Slskd", "delete_searches", fallback=True)
-
-        # Build queries
-        queries = []
-        queries.append(f"{author_name} - {book_title}")
-
-        # Initials ("Christopher G. Nuttall") make a search stricter than most file and folder
-        # names, which usually leave them out: also try the name without them
-        author_no_initials = _strip_initials(author_name)
-        if author_no_initials and author_no_initials != author_name:
-            queries.append(f"{author_no_initials} - {book_title}")
-
-        if ":" in book_title:
-            main_title = book_title.split(":")[0].strip()
-            queries.append(f"{author_name} - {main_title}")
-
-        max_fallbacks = self.config.getint("Search Settings", "max_search_fallbacks", fallback=5)
-        queries.extend(_generate_fallback_queries(author_name, book_title, max_fallbacks))
-
-        all_results: List[SearchResult] = []
-        seen_queries = set()
-        searched_queries = failed_queries = 0
-        last_error: Optional[Exception] = None
+        """Search with a bounded normalized query budget and explicit incomplete outcomes."""
+        check_fatal_state(self.ctx)
+        if self._search_control is None:
+            self._search_control = SearchControl(self.ctx)
+        control = self._search_control
+        author, title = target.author_name, target.book_title
+        queries = [f"{author} - {title}"]
+        without_initials = _strip_initials(author)
+        if without_initials and without_initials != author:
+            queries.append(f"{without_initials} - {title}")
+        if ":" in title:
+            queries.append(f"{without_initials or author} - {title.split(':', 1)[0].strip()}")
+        queries.extend(_generate_fallback_queries(author, title, self.config.getint("Search Settings", "max_search_fallbacks", fallback=5)))
+        budget = max(1, self.config.getint("Search Settings", "search_query_budget", fallback=6))
+        seen, unique = set(), []
+        for query in queries:
+            key = _query_key(query)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(query)
+        queries = unique[:budget]
         self.search_notes.pop(target.book_id, None)
-
-        # Prepare target dict for book_match
+        self._alternates.pop(target.book_id, None)
         target_dict = {
-            "book": target.readarr_book or {"title": target.book_title, "id": target.book_id, "seriesTitle": target.series_title},
-            "author": target.readarr_author or {"authorName": target.author_name},
+            "book": target.readarr_book or {"title": title, "id": target.book_id, "seriesTitle": target.series_title},
+            "author": target.readarr_author or {"authorName": author},
         }
         if target.is_audiobook:
-            # The author's other titles tell a shelf of books from a folder of chapters
-            target_dict["sibling_titles"] = sibling_titles(self.ctx, target_dict["book"], target.author_name)
-
-        for i, query in enumerate(queries):
-            if query in seen_queries:
-                continue
-            seen_queries.add(query)
-
-            search_label = "main" if i == 0 else f"fallback-{i}"
-            try:
+            if target_dict["book"].get("authorId"):
                 try:
-                    search_results, search_id = _execute_search(self.ctx, query, search_label)
-                except Exception as e:
-                    if "429" not in str(e):
-                        raise
-                    # slskd limits how fast searches may be started: wait and ask once more
-                    logger.info(f"slskd is rate-limiting searches; waiting {RATE_LIMIT_WAIT}s before repeating '{query}'")
-                    time.sleep(RATE_LIMIT_WAIT)
-                    search_results, search_id = _execute_search(self.ctx, query, search_label)
-            except Exception as e:
-                logger.error(f"Search failed for query '{query}': {e}")
-                failed_queries += 1
-                last_error = e
-                continue
-            searched_queries += 1
-
-            if delete_searches:
+                    require_author_catalog(self.ctx, target_dict["book"])
+                except CatalogUnavailable as error:
+                    raise SearchIncomplete(f"Author bibliography unavailable for safe audiobook selection: {error}", FailureKind.SERVICE_UNAVAILABLE) from error
+            target_dict["sibling_titles"] = sibling_titles(self.ctx, target_dict["book"], author)
+        failures = []
+        for index, query in enumerate(queries):
+            label = "main" if index == 0 else f"fallback-{index}"
+            search_results = None
+            for attempt in range(2):
                 try:
+                    control.before_search()
+                    search_results, search_id = _execute_search(self.ctx, query, label)
+                    control.success()
+                    break
+                except StatePersistenceError:
+                    raise
+                except SearchIncomplete:
+                    raise
+                except Exception as error:
+                    if http_status(error) == 429:
+                        retry_at = control.rate_limited(error)
+                        if attempt == 0:
+                            logger.info("slskd rate-limited search; waiting until its persisted retry deadline")
+                            continue
+                        raise SearchIncomplete(str(error), FailureKind.RATE_LIMITED, retry_at) from error
+                    failures.append(str(error))
+                    logger.warning("Search query could not finish (%s): %s", query, error)
+                    break
+            if search_results is None:
+                continue
+            if self.config.getboolean("Slskd", "delete_searches", fallback=True):
+                try:
+                    check_fatal_state(self.ctx)
                     self.client.searches.delete(search_id)
+                except StatePersistenceError:
+                    raise
                 except Exception:
                     pass
-
             if search_results:
-                if target.is_audiobook:
-                    all_results.extend(self._match_audiobook_results(target, target_dict, search_results))
-                else:
-                    all_results.extend(self._match_ebook_results(target, target_dict, search_results))
+                results = self._match_audiobook_results(target, target_dict, search_results) if target.is_audiobook else self._match_ebook_results(target, target_dict, search_results)
+                if results:
+                    return results
+        if failures:
+            raise SearchIncomplete(f"Search coverage incomplete ({len(failures)} failed query/queries): {failures[-1]}")
+        return []
 
-                # If we found any matches for this query, stop searching further queries
-                if all_results:
-                    break
-
-        if failed_queries and not searched_queries:
-            # Not one search went through (slskd unreachable, a bad setting...). That is not the
-            # same as "nobody shares this book", and must not be reported as such.
-            raise RuntimeError(f"none of the {failed_queries} searches could be run: {last_error}")
-        return all_results
+    def _history_failed(self, username, target, release_id=""):
+        history = getattr(self.ctx, "history", None)
+        return bool(history and history.is_failed(username, target.book_title, backend=self.name, author=target.author_name, media_type=target.media_type, release_id=release_id))
 
     def _match_thresholds(self) -> Dict[str, Any]:
         """Matching thresholds shared by ebook and audiobook matching."""
@@ -261,7 +278,7 @@ class SlskdBackend(DownloadBackend):
         for result in search_results:
             username = result["username"]
             # Skip if in history (failed previously)
-            if self.ctx.history and self.ctx.history.is_failed(username, book_title):
+            if self._history_failed(username, target):
                 continue
 
             if username not in file_cache:
@@ -280,6 +297,8 @@ class SlskdBackend(DownloadBackend):
                 match = book_match(target_dict, files, username, ext, **thresholds)
 
                 if match:
+                    if self._history_failed(username, target, f"{username}|{match['filename']}"):
+                        continue
                     file_dir = match["filename"].rsplit("\\", 1)[0] if "\\" in match["filename"] else ""
                     filename = match["filename"].split("\\")[-1]
 
@@ -318,7 +337,7 @@ class SlskdBackend(DownloadBackend):
         # slskd > 0.22.2 returns a list of directories ({"name", "fileCount", "files"}); older
         # versions return a single directory object
         if isinstance(listing, list):
-            listing = next((d for d in listing if d.get("name") == directory), listing[0] if listing else None)
+            listing = next((d for d in listing if d.get("name") == directory), None)
         if not isinstance(listing, dict):
             return None
 
@@ -326,7 +345,7 @@ class SlskdBackend(DownloadBackend):
         for f in listing.get("files", []):
             name = f.get("filename", "")
             full = name if "\\" in name else f"{directory}\\{name}"
-            files.append({"filename": full, "size": f.get("size", 0)})
+            files.append(dict(f, filename=full, size=f.get("size", 0)))
         return files
 
     def _match_audiobook_results(self, target: DownloadTarget, target_dict: Dict[str, Any], search_results: List[Dict[str, Any]]) -> List[SearchResult]:
@@ -342,7 +361,7 @@ class SlskdBackend(DownloadBackend):
         rejected: List[Dict[str, str]] = []
         for result in search_results:
             username = result["username"]
-            if self.ctx.history and self.ctx.history.is_failed(username, book_title):
+            if self._history_failed(username, target):
                 stats["skipped (failed before)"] = stats.get("skipped (failed before)", 0) + 1
                 continue
             for match in audiobook_folder_match(target_dict, result.get("files", []), username, target.allowed_filetypes, stats=stats, rejected=rejected, **thresholds):
@@ -360,21 +379,23 @@ class SlskdBackend(DownloadBackend):
         # download() asks for the next only if that one can't be started. Each browse is a slow
         # round trip to the peer, so none is made before it is needed.
         notes = self.search_notes.setdefault(target.book_id, {"candidates": [], "stats": {}, "rejected": [], "skipped": [], "not_tried": 0})
-        listed = {(c["username"], c["directory"], c["extension"]) for c in notes["candidates"]}
+        listed = {(c["username"], c["directory"], c["extension"], tuple(c.get("matched_files", []))) for c in notes["candidates"]}
         for u, m in candidates:
-            if (u, m["directory"], m["extension"]) not in listed:
+            matched_files = sorted(f["filename"] for f in m["files"])
+            if (u, m["directory"], m["extension"], tuple(matched_files)) not in listed:
                 notes["candidates"].append(
-                    {"username": u, "directory": m["directory"], "extension": m["extension"], "score": m["score"], "file_based": bool(m.get("file_based")), "files_found": len(m["files"])}
+                    {"username": u, "directory": m["directory"], "extension": m["extension"], "score": m["score"], "file_based": bool(m.get("file_based")), "files_found": len(m["files"]), "matched_files": matched_files}
                 )
+                listed.add((u, m["directory"], m["extension"], tuple(matched_files)))
         # Fallback queries mostly bring back the same folders: count them once
         for reason, count in stats.items():
             notes["stats"][reason] = max(notes["stats"].get(reason, 0), count)
         notes["rejected"].extend(entry for entry in rejected if entry not in notes["rejected"])
         # Folders already looked into for an earlier query of this search are not listed again
-        tried = {(skip["username"], skip["directory"], skip["extension"]) for skip in notes["skipped"]}
-        candidates = [(u, m) for u, m in candidates if (u, m["directory"], m["extension"]) not in tried]
+        tried = {(skip["username"], skip["directory"], skip["extension"], tuple(skip.get("matched_files", []))) for skip in notes["skipped"]}
+        candidates = [(u, m) for u, m in candidates if (u, m["directory"], m["extension"], tuple(sorted(f["filename"] for f in m["files"]))) not in tried]
         # Matching folders beyond the browse limit are never looked at: not proof of anything
-        notes["not_tried"] = max(len(candidates) - browse_limit, 0)
+        notes["not_tried"] = sum(not item.get("checked", False) for item in notes["candidates"])
 
         usable = self._usable_audiobook_results(target, target_dict, candidates[:browse_limit], min_size_bytes)
         first = next(usable, None)
@@ -394,125 +415,137 @@ class SlskdBackend(DownloadBackend):
         notes = self.search_notes.get(book_id) or {}
         return bool(notes.get("not_tried")) or any(skip["temporary"] for skip in notes.get("skipped", []))
 
-    def _usable_audiobook_results(self, target: DownloadTarget, target_dict: Dict[str, Any], candidates: List[Tuple[str, Dict[str, Any]]], min_size_bytes: int):
-        """Yield a SearchResult for each candidate that is, as far as its file list shows, the
-        complete book and can be downloaded now. Why the others were passed over is noted in
-        search_notes (temporary: the reason may be gone on the next run)."""
+    def _usable_audiobook_results(self, target, target_dict, candidates, min_size_bytes):
+        """Establish a same-work set across formats before choosing one complete format."""
         notes = self.search_notes.setdefault(target.book_id, {"candidates": [], "stats": {}, "rejected": [], "skipped": [], "not_tried": 0})
-
+        browse_cache = {}
         for username, match in candidates:
-            directory = match["directory"]
-            ext = match["extension"]
+            directory, ext = match["directory"], match["extension"]
             file_based = bool(match.get("file_based"))
+            matched_files = sorted(f["filename"] for f in match["files"])
+            for item in notes["candidates"]:
+                if (item["username"], item["directory"], item["extension"], item.get("matched_files", [])) == (username, directory, ext, matched_files):
+                    item["checked"] = True
+            notes["not_tried"] = sum(not item.get("checked", False) for item in notes["candidates"])
 
-            def skip(reason: str, temporary: bool = False, label: str = "") -> None:
-                logger.info(f"Skipping {label or directory or '(share root)'} from {username}: {reason}")
-                entry = {"username": username, "directory": directory, "extension": ext, "reason": reason, "temporary": temporary}
+            def skip(reason, temporary=False, label=""):
+                logger.info("Skipping %s from %s: %s", label or directory or "(share root)", username, reason)
+                entry = {"username": username, "directory": directory, "extension": ext, "matched_files": matched_files, "reason": reason, "temporary": temporary}
                 if entry not in notes["skipped"]:
                     notes["skipped"].append(entry)
 
-            browsed = self._browse_directory(username, directory) if directory else None
+            cache_key = (username, directory)
+            if cache_key not in browse_cache:
+                browse_cache[cache_key] = self._browse_directory(username, directory) if directory else None
+            browsed = browse_cache[cache_key]
             if browsed is None:
-                # Search results list only the files that matched the query, so without the full
-                # listing we can't know the book is complete. Try the next candidate instead.
                 skip("could not list the full folder (peer offline or busy)", temporary=True)
                 continue
-
-            files = [
-                {"filename": f["filename"], "size": f.get("size", 0)}
-                for f in browsed
-                if split_slskd_path(f["filename"])[1].lower().endswith(f".{ext}")
-                # Only this folder's own files, not ones from subfolders
-                and split_slskd_path(f["filename"])[0] == directory
-            ]
-            names = [split_slskd_path(f["filename"])[1] for f in files]
+            audio = [dict(f) for f in browsed if split_slskd_path(f["filename"])[0] == directory and split_slskd_path(f["filename"])[1].rsplit(".", 1)[-1].lower() in AUDIO_EXTENSIONS]
+            names = [split_slskd_path(f["filename"])[1] for f in audio]
             if file_based:
-                # The files' own names matched, not the folder's: the folder may be a whole library
-                # ("Audiobooks", an author folder). Take the files that share the matched name,
-                # i.e. the one file of a single-file book or every chapter of
-                # "Author - Title - 01.mp3", "... - 02.mp3", and nothing else.
-                matched = [split_slskd_path(f["filename"])[1] for f in match["files"]]
-                own = set(same_book_files(matched, names))
-                files = [f for f in files if split_slskd_path(f["filename"])[1] in own]
-            elif files and self._chapters_in_other_formats(directory, ext, files, browsed):
-                # "01.mp3" next to "02.m4a": this format alone is not the whole book
-                skip("its chapters are spread over several audio formats")
-                continue
-            elif files:
-                # A folder named after the book can still be a shelf of several books
-                verdict, own_files = books_in_folder(target_dict, [(name, f["size"]) for name, f in zip(names, files)])
+                seeds = [split_slskd_path(f["filename"])[1] for f in match["files"]]
+                own = set(same_book_files(seeds, names))
+                audio = [f for f in audio if split_slskd_path(f["filename"])[1] in own]
+            elif audio:
+                verdict, own_names = books_in_folder(target_dict, [(split_slskd_path(f["filename"])[1], f.get("size", 0)) for f in audio])
                 if verdict == "several":
                     skip("its files look like several other books, none of them this one")
                     continue
                 if verdict == "own":
-                    files = [f for f in files if split_slskd_path(f["filename"])[1] in set(own_files)]
+                    audio = [f for f in audio if split_slskd_path(f["filename"])[1] in set(own_names)]
                     file_based = True
+            files = [f for f in audio if f["filename"].lower().endswith(f".{ext}")]
             if not files:
                 skip(f"no {ext} files of this book in the folder listing")
                 continue
-
-            files.sort(key=lambda f: f["filename"].lower())
-            total_size = sum(f["size"] for f in files)
+            if self._chapters_in_other_formats(directory, ext, files, audio):
+                skip("this format omits numbered chapters present in another format of this book")
+                continue
+            files.sort(key=lambda f: f["filename"].casefold())
+            if all(fragment_release(target.book_title, split_slskd_path(f["filename"])[1]) for f in files):
+                skip("explicit sample/prologue-only recording")
+                continue
+            total_size = sum(f.get("size", 0) for f in files)
             label = f"{files[0]['filename']} (+{len(files) - 1} more)" if file_based else directory
-
             missing = missing_parts([split_slskd_path(f["filename"])[1] for f in files])
             if missing:
                 skip(f"incomplete ({missing})", label=label)
                 continue
-
+            if any(not isinstance(f.get("size"), int) or f["size"] <= 0 for f in files):
+                skip("a chapter has no trustworthy positive byte size", temporary=True, label=label)
+                continue
             if total_size < min_size_bytes:
                 skip(f"{total_size / 1048576:.1f} MB is below audiobook_min_size_mb", label=label)
                 continue
-
-            too_short = self._too_small_for_duration(target, total_size)
+            too_short = self._too_small_for_duration(
+                target, total_size, self.config.getfloat("Search Settings", "audiobook_min_bitrate_kbps", fallback=MIN_AUDIOBOOK_KBPS))
             if too_short:
                 skip(too_short, label=label)
                 continue
-
-            if self._local_clashes(directory, files):
-                # download() would refuse these files; the next candidate may be fine
-                skip("its local download folder is in use", temporary=True, label=label)
+            policy = evaluate_recording(self.config, [directory] + [split_slskd_path(f["filename"])[1] for f in files], final=False)
+            if not policy.allowed:
+                skip("recording policy: " + "; ".join(policy.reasons), label=label)
                 continue
-
-            logger.info(f"Audiobook candidate: {label} ({len(files)} {ext} files, {total_size / 1048576:.0f} MB) from {username}")
-            yield self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], file_based=file_based)
+            result = self._audiobook_result(target, username, directory, ext, files, total_size, match["score"], file_based=file_based)
+            if self._history_failed(username, target, result.source_id):
+                skip("this release failed before", label=label)
+                continue
+            if self._local_clashes(directory, files):
+                skip("its local download folder is in use or its ownership cannot be checked", temporary=True, label=label)
+                continue
+            logger.info("Audiobook candidate: %s (%s %s files, %.0f MB) from %s", label, len(files), ext, total_size / 1048576, username)
+            yield result
 
     @staticmethod
-    def _too_small_for_duration(target: DownloadTarget, total_size: int) -> str:
+    def _too_small_for_duration(target: DownloadTarget, total_size: int, min_kbps: float = MIN_AUDIOBOOK_KBPS) -> str:
         """Say so if the files are far too small for the length Chaptarr gives for the book.
 
-        Even heavily compressed speech needs about 16 kbit/s, so anything below
-        MIN_AUDIOBOOK_KBPS for the book's whole duration is a fragment or an abridgement, not
-        the book. Returns "" when it is plausible or Chaptarr gives no duration.
+        Even heavily compressed speech needs about 12-16 kbit/s, so anything below min_kbps
+        ([Search Settings] audiobook_min_bitrate_kbps, default 8) for the book's whole duration is
+        a fragment or an abridgement, not the book. Returns "" when it is plausible, when Chaptarr
+        gives no duration, or when the check is off (0).
         """
         try:
             minutes = float((target.readarr_book or {}).get("durationMinutes") or 0)
         except (TypeError, ValueError):
             return ""
-        if minutes < 30:
+        if minutes < 30 or not min_kbps or min_kbps <= 0:
             return ""
         kbps = total_size * 8 / 1000 / (minutes * 60)
-        if kbps >= MIN_AUDIOBOOK_KBPS:
+        if kbps >= min_kbps:
             return ""
-        return f"{total_size / 1048576:.0f} MB is too small for a book of {minutes / 60:.1f} hours ({kbps:.0f} kbit/s)"
+        return f"{total_size / 1048576:.0f} MB is too small for a book of {minutes / 60:.1f} hours ({kbps:.0f} kbit/s, minimum {min_kbps:g})"
 
     @staticmethod
-    def _chapters_in_other_formats(directory: str, ext: str, files: List[Dict[str, Any]], browsed: List[Dict[str, Any]]) -> bool:
-        """True if the folder's numbered chapters are split between this format and another.
+    def _chapters_in_other_formats(directory, ext, files, browsed):
+        """Compare compatible numbering units within the already selected same-work set.
 
-        A second complete copy in another format (an .m4b next to the mp3 chapters, or the
-        same chapters as mp3 and m4a) is fine. It is a split when each format has chapter
-        numbers the other lacks.
+        Two m4b parts alongside twelve mp3 chapters are separate complete encodings;
+        chapter 01.mp3 alongside 01+02.m4a is evidence that the mp3 set is incomplete.
         """
-        own = {part_number(split_slskd_path(f["filename"])[1]) for f in files} - {None}
-        other = set()
-        for f in browsed:
-            folder, basename = split_slskd_path(f["filename"])
-            other_ext = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
-            if folder == directory and other_ext != ext and other_ext in AUDIO_EXTENSIONS:
-                other.add(part_number(basename))
-        other.discard(None)
-        return bool(own - other) and bool(other - own)
+        def family(name):
+            stem = name.rsplit(".", 1)[0].casefold()
+            if re.search(r"\b(?:part|pt)[ ._-]*[0-9]", stem):
+                return "part"
+            if re.search(r"\b(?:disc|disk|cd)[ ._-]*[0-9]", stem):
+                return "disc"
+            return "chapter"
+        own = {}
+        for file in files:
+            name = split_slskd_path(file["filename"])[1]
+            number = part_number(name)
+            if number is not None:
+                own.setdefault(family(name), set()).add(number)
+        for file in browsed:
+            folder, name = split_slskd_path(file["filename"])
+            if folder != directory or name.lower().endswith(f".{ext}"):
+                continue
+            number = part_number(name)
+            unit = family(name)
+            if number is not None and unit in own and number not in own[unit]:
+                return True
+        return False
 
     def _audiobook_result(
         self, target: DownloadTarget, username: str, directory: str, ext: str, files: List[Dict[str, Any]], total_size: int, score: float, file_based: bool = False
@@ -534,175 +567,335 @@ class SlskdBackend(DownloadBackend):
         )
 
     def download(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
-        """Initiate download of a Soulseek file or audiobook.
-
-        search() returns one audiobook result at a time. If that one can't be started (the peer
-        went offline, its queue refused the files...), the next usable candidates of the same
-        search are tried here, so one bad peer doesn't fail the book.
-        """
+        """Retain lazy alternatives until a definite owned attempt finishes or fails."""
         alternates = self._alternates.pop(target.book_id, None)
         task = self._download_one(target, result)
-        if task is None and alternates is not None and result.extra.get("media_type") == "audiobook":
-            for alternate in alternates:
-                logger.info(f"Trying the next audiobook candidate for {target.book_title}: {alternate.username}")
-                task = self._download_one(target, alternate)
-                if task is not None:
-                    break
+        attempts = 1
+        while task is None and alternates is not None and attempts < 3:
+            candidate = next(alternates, None)
+            if candidate is None:
+                break
+            attempts += 1
+            task = self._download_one(target, candidate)
+        if task is not None and alternates is not None:
+            self._pending_alternates[task.task_id] = (target, alternates, attempts)
         return task
+
+    def _checkpoint(self, task):
+        check_fatal_state(self.ctx)
+        state = getattr(self.ctx, "state", None)
+        if state is None or getattr(state, "read_only", False):
+            raise StatePersistenceError("A writable durable StateManager is required before enqueueing downloads")
+        state.update_task(task)
 
     def _download_one(self, target: DownloadTarget, result: SearchResult) -> Optional[DownloadTask]:
-        """Queue one search result in slskd."""
+        check_fatal_state(self.ctx)
         username = result.extra["username"]
-        files = result.extra["files"]
-        file_dir = result.extra["file_dir"]
-
-        # Ensure full paths for files before enqueuing
-        for i in range(len(files)):
-            if "\\" not in files[i]["filename"]:
-                files[i]["filename"] = file_dir + "\\" + files[i]["filename"]
-
-        # slskd saves into <download_dir>/<remote folder name>/ and renames a new file whose name
-        # is already taken, so R:soul would then pick up the wrong (old or other) file.
-        clashes = self._local_clashes(file_dir, files)
-        if clashes:
-            local = str(Path(self.download_dir or "") / file_dir.split(chr(92))[-1])
-            logger.warning(
-                f"Not downloading {target.book_title} from {username}: the local folder {local} is in use "
-                f"({len(clashes)} file(s), e.g. {clashes[0]}). If those files are left over from an earlier "
-                f"download, move or delete them; otherwise it is retried on a later run."
-            )
-            return None
-
-        # An audiobook needs every chapter; anything less is cancelled again by the enqueue helper
-        is_audiobook = result.extra.get("media_type") == "audiobook"
-        downloads = slskd_do_enqueue(self.client, username, files, file_dir, require_all=is_audiobook)
-
-        if not downloads:
-            logger.warning(f"Failed to enqueue download for {target.book_title} from {username}")
-            # Anything that did arrive from this attempt (a quick peer can finish a file before
-            # its transfer is cancelled) must not block the next attempt at this folder. The
-            # clash check above made sure none of these names were there before.
-            leaf = file_dir.split("\\")[-1] if file_dir else ""
-            if self.download_dir and leaf:
-                moved_to = move_files_aside(self.download_dir, leaf, [f["filename"].split("\\")[-1] for f in files], bucket="failed_downloads")
-                if moved_to:
-                    logger.info(f"Moved files of the abandoned download to {moved_to}")
-            return None
-
-        # Log what was enqueued
-        short_filename = result.filename.split("\\")[-1] if "\\" in result.filename else result.filename
-        logger.info(f"Enqueued: {short_filename} from {username}")
-
-        # local_dir should be the flattened directory name (bottom-most folder)
+        file_dir = result.extra.get("file_dir", "")
+        files = copy.deepcopy(result.extra["files"])
+        for file in files:
+            if "\\" not in file["filename"] and file_dir:
+                file["filename"] = file_dir + "\\" + file["filename"]
         local_dir = file_dir.split("\\")[-1] if file_dir else ""
-
-        # Use (username, filename) as task_id; audiobooks are one task per folder
-        # (file-based audiobooks share their folder with other books, so the first file names the task)
-        if is_audiobook and not result.extra.get("file_based"):
-            task_id = f"{username}|{file_dir}"
-        elif is_audiobook:
-            task_id = f"{username}|{files[0]['filename']}"
-        else:
-            task_id = f"{username}|{result.filename}"
-
-        extra = {"username": username, "file_dir": file_dir, "files": downloads, "slskd_id": downloads[0]["id"] if downloads else None}
-        if is_audiobook:
-            extra["media_type"] = "audiobook"
-            extra["expected_files"] = [f["filename"].split("\\")[-1] for f in files]
-            logger.info(f"Enqueued audiobook: {len(downloads)} file(s) from {username}, into the local folder {local_dir}")
-
-        return DownloadTask(
-            task_id=task_id,
-            backend_name=self.name,
-            status=DownloadStatus.QUEUED,
-            book_title=target.book_title,
-            author_name=target.author_name,
-            book_id=target.book_id,
-            filename=result.filename,
-            series_title=target.series_title,
-            local_dir=local_dir,
-            extra=extra,
+        manifest = [{"filename": f["filename"], "name": f["filename"].split("\\")[-1], "size": f.get("size")} for f in files]
+        if (not manifest or len({f["name"] for f in manifest}) != len(manifest)
+                or any(not self._safe_leaf(f["name"]) or not isinstance(f["size"], int) or isinstance(f["size"], bool) or f["size"] <= 0 for f in manifest)
+                or (local_dir and not self._safe_leaf(local_dir))):
+            logger.warning("Cannot enqueue %s: unsafe names, duplicate basenames, or unknown byte sizes", target.book_title)
+            return None
+        if self._local_clashes(file_dir, files):
+            logger.info("Deferring %s: local destination is occupied or could not be checked", target.book_title)
+            return None
+        pre_existing = _transfer_ids(self.client, username)
+        if pre_existing is None:
+            return None
+        now = time.time()
+        task = DownloadTask(
+            task_id=f"slskd|{uuid.uuid4()}", backend_name=self.name, status=DownloadStatus.PENDING,
+            book_title=target.book_title, author_name=target.author_name, book_id=target.book_id,
+            filename=result.filename, series_title=target.series_title, local_dir=local_dir,
+            extra={
+                "username": username, "file_dir": file_dir, "media_type": target.media_type,
+                "release_id": result.source_id, "source_id": result.source_id,
+                "manifest_version": 1, "manifest": manifest, "manifest_digest": self._manifest_digest(manifest),
+                "expected_files": [f["name"] for f in manifest],
+                "files": [dict(f, username=username, file_dir=file_dir) for f in manifest],
+                "readarr_book": copy.deepcopy(target.readarr_book), "readarr_author": copy.deepcopy(target.readarr_author),
+                "intended_identity": {"book_id": target.book_id, "author_id": target.readarr_author.get("id") or target.readarr_book.get("authorId"),
+                    "foreign_book_id": target.readarr_book.get("foreignBookId"), "foreign_author_id": target.readarr_author.get("foreignAuthorId"),
+                    "title": target.book_title, "author": target.author_name, "media_type": target.media_type},
+                "monitor": {"started_at": now, "last_progress_at": now},
+                "enqueue": {"phase": "prepared", "created_at": now, "pre_existing_ids": sorted(pre_existing)},
+            },
         )
-
-    def get_status(self, task: DownloadTask) -> DownloadTask:
-        """Poll slskd for transfer status."""
-        downloads = task.extra.get("files", [])
-        if not downloads:
+        # This is the write-ahead intent. A failed checkpoint prohibits the POST.
+        self._checkpoint(task)
+        check_fatal_state(self.ctx)
+        outcome = enqueue_owned(self.client, username, manifest, file_dir, pre_existing,
+                                wait=lambda seconds: responsive_wait(self.ctx, seconds))
+        task.extra["enqueue"].update(phase=outcome.state, detail=outcome.reason)
+        self._bind_records(task, outcome.files)
+        if outcome.state == "rejected":
             task.status = DownloadStatus.FAILED
-            task.error_message = "No files in task"
-            return task
-
-        ok = slskd_download_status(self.client, downloads)
-        if not ok:
-            logger.debug(f"Failed to get status for some files in task {task.task_id}")
-            # slskd forgets transfers (restart, "clear completed"); a file that is already in the
-            # download folder at full size has finished. slskd writes unfinished files to its
-            # separate incomplete directory, so a file here is complete.
-            for f in downloads:
-                if f.get("status") is None and self._finished_on_disk(task, f):
-                    f["status"] = {"state": "Completed, Succeeded", "bytesTransferred": f.get("size", 0)}
-                    f.pop("missing", None)
-                elif f.get("status") is None and f.get("missing"):
-                    # Cleared from slskd's list without the finished file ever reaching the download
-                    # folder: it failed (or was cancelled), and it will never complete now
-                    f["status"] = {"state": "Completed, Errored", "bytesTransferred": 0, "exception": "Transfer disappeared from slskd without finishing"}
-
-        # Still-unknown files mean this poll can't be trusted; the orchestrator pauses timeouts
-        task.poll_failed = any(f.get("status") is None for f in downloads)
-
-        all_succeeded, has_errors = downloads_all_done(downloads)
-
-        if all_succeeded:
-            task.status = DownloadStatus.COMPLETED
-            task.progress_percent = 100.0
-            return task
-
-        # Fail fast: if any file has a terminal error, don't wait for others
-        if has_errors:
-            states = set(
-                f.get("status", {}).get("state", "")
-                for f in downloads
-                if f.get("status")
-            )
-            task.status = DownloadStatus.FAILED
-            task.error_message = f"File(s) failed: {', '.join(sorted(states))}"
-            return task
-
-        # Map remaining slskd states to DownloadStatus
-        states = [f.get("status", {}).get("state", "") for f in downloads if f.get("status")]
-
-        # Aggregate progress across all files (completed files count in full). offline_bytes are
-        # chapters that finished in an earlier run and are no longer tracked in slskd.
-        offline = task.extra.get("offline_bytes", 0)
-        total_size = sum(f.get("size", 0) for f in downloads) + offline
-        bytes_transferred = sum(f.get("status", {}).get("bytesTransferred", 0) for f in downloads if f.get("status")) + offline
-        task.bytes_transferred = bytes_transferred
-        if total_size > 0:
-            task.progress_percent = (bytes_transferred / total_size) * 100
-
-        # slskd reports transfer states such as "InProgress", "Initializing", "Queued, Remotely",
-        # "Queued, Locally" and "Requested"
-        if any(s in ("InProgress", "Initializing", "Downloading") for s in states):
-            task.status = DownloadStatus.DOWNLOADING
-        elif any(s == "Queued, Remotely" for s in states):
+            task.extra["failure_kind"] = outcome.kind or FailureKind.PEER_REJECTED.value
+            task.error_message = outcome.reason
+            self._checkpoint(task)
+            # An explicit non-acceptance and an empty observation has no remote ownership.
+            self._record_source_failure(task)
+            self.ctx.state.remove_task(task.task_id)
+            return None
+        if outcome.state == "registered":
             task.status = DownloadStatus.QUEUED
-        elif any(s == "Queued, Locally" for s in states):
-            task.status = DownloadStatus.QUEUED_LOCALLY
         else:
-            # Requested / pending states
-            task.status = DownloadStatus.PENDING
-
+            task.poll_failed = True
+            task.error_message = "Enqueue outcome unknown; retaining intent for reconciliation: " + outcome.reason
+            task.extra["failure_kind"] = FailureKind.ENQUEUE_UNKNOWN.value
+        self._checkpoint(task)
+        logger.info("Enqueue %s for %s: tracking %s/%s files (%s)", outcome.state, task.book_title,
+                    sum(bool(f.get("id")) for f in task.extra["files"]), len(manifest), task.task_id)
         return task
 
-    def _finished_on_disk(self, task: DownloadTask, file: Dict[str, Any]) -> bool:
-        """True if the file is already in the local download folder at its expected size."""
-        if not self.download_dir or not file.get("size"):
-            return False  # without a known size, an old file of the same name could be mistaken for it
-        path = Path(self.download_dir) / (task.local_dir or "") / file["filename"].split("\\")[-1]
+    @staticmethod
+    def _safe_leaf(name):
+        return bool(name) and name not in (".", "..") and not any(c in name for c in ("/", "\\", "\x00"))
+
+    @staticmethod
+    def _manifest_digest(manifest):
+        return hashlib.sha256(json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def _ensure_manifest(self, task):
+        """Upgrade recoverable legacy state without guessing missing file sizes."""
+        extra = task.extra
+        manifest = extra.get("manifest")
+        if manifest is not None:
+            if extra.get("manifest_digest") and extra["manifest_digest"] != self._manifest_digest(manifest):
+                raise BackendUnavailable("download manifest changed; manual review required")
+            return manifest
+        unnamed = [file for file in extra.get("files", []) if not file.get("filename")]
+        if unnamed:
+            expected = extra.get("expected_files") or [task.filename.split("\\")[-1]]
+            if len(extra["files"]) != 1 or len(expected) != 1 or not self._safe_leaf(expected[0]):
+                raise BackendUnavailable("Saved transfer IDs lack unambiguous filenames; manual review required")
+            directory = extra.get("file_dir", "")
+            unnamed[0]["filename"] = directory + "\\" + expected[0] if directory else expected[0]
+        previous = {str(f.get("filename", "")).split("\\")[-1]: f for f in extra.get("files", [])}
+        names = list(extra.get("expected_files") or previous.keys() or [task.filename.split("\\")[-1]])
+        directory = extra.get("file_dir", "")
+        manifest = []
+        for name in names:
+            name = str(name).split("\\")[-1]
+            saved = previous.get(name, {})
+            full = saved.get("filename") or (directory + "\\" + name if directory else name)
+            if "\\" not in full and directory:
+                full = directory + "\\" + full
+            size = saved.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                size = None
+            manifest.append({"filename": full, "name": name, "size": size})
+        extra.update(manifest_version=1, manifest=manifest, legacy_manifest=True,
+                     expected_files=names, manifest_digest=self._manifest_digest(manifest))
+        return manifest
+
+    def _bind_records(self, task, records):
+        """Keep every manifest entry, even after slskd clears a finished transfer."""
+        previous = {f["filename"].split("\\")[-1]: f for f in task.extra.get("files", [])}
+        observed = {f["filename"].split("\\")[-1]: f for f in records}
+        rows = []
+        for expected in self._ensure_manifest(task):
+            row = dict(previous.get(expected["name"], {}))
+            found = observed.get(expected["name"])
+            if found:
+                if row.get("id") and row["id"] != found.get("id"):
+                    raise BackendUnavailable("a different transfer ID tried to replace an owned manifest entry")
+                row.update(found)
+            row.update(filename=expected["filename"], size=expected["size"], username=task.extra.get("username") or row.get("username"), file_dir=task.extra.get("file_dir") or row.get("file_dir", ""))
+            rows.append(row)
+        task.extra["files"] = rows
+        task.extra["slskd_id"] = next((f.get("id") for f in rows if f.get("id")), None)
+
+    def _reconcile_enqueue(self, task):
+        intent = task.extra.get("enqueue", {})
+        if intent.get("phase") not in ("prepared", "unknown"):
+            return
+        manifest = self._ensure_manifest(task)
+        records, ambiguous = matching_new_transfers(self.client, task.extra["username"], manifest,
+            task.extra.get("file_dir", ""), set(intent.get("pre_existing_ids", [])))
+        if ambiguous:
+            task.extra["needs_review"] = True
+            task.error_message = "Ambiguous new transfer IDs; enqueue intent retained for manual review"
+            task.poll_failed = True
+            return
+        self._bind_records(task, records)
+        if all(f.get("id") for f in task.extra["files"]):
+            intent["phase"] = "registered"
+            task.extra.pop("failure_kind", None)
+            task.error_message = None
+        else:
+            intent["phase"] = "unknown"
+            task.extra["failure_kind"] = FailureKind.ENQUEUE_UNKNOWN.value
+            task.error_message = "Waiting to reconcile every file of an enqueue with an uncertain response"
+        self._checkpoint(task)
+
+    def get_status(self, task: DownloadTask) -> DownloadTask:
+        if task.extra.get("retry_retired"):
+            raise BackendUnavailable("This attempt was durably retired before an alternate; do not inspect its former local paths")
+        manifest = self._ensure_manifest(task)
+        task.poll_failed = False
+        self._reconcile_enqueue(task)
+        self._bind_records(task, [])
+        downloads = task.extra["files"]
+        if not downloads:
+            raise BackendUnavailable("Empty transfer manifest; review required")
+        known = [f for f in downloads if f.get("id") is not None and f.get("id") != ""]
+        if known:
+            slskd_download_status(self.client, known)
+        invalid = []
+        for f in downloads:
+            verified = self._finished_on_disk(task, f)
+            status = f.get("status")
+            if verified:
+                # The immutable requested size and a regular completed-directory file prove
+                # completion even when another client has cleared slskd's transfer history.
+                f["status"] = {"state": "Completed, Succeeded", "bytesTransferred": f["size"]}
+                f.pop("missing", None)
+            elif status and status.get("state") == "Completed, Succeeded":
+                invalid.append(f)
+            elif f.get("missing") and task.extra.get("enqueue", {}).get("phase") not in ("prepared", "unknown"):
+                f["status"] = {"state": "Completed, Errored", "bytesTransferred": 0,
+                    "exception": "Transfer vanished without a verified complete local file"}
+        if any(not f.get("size") for f in manifest):
+            task.status = DownloadStatus.PENDING
+            task.poll_failed = True
+            task.extra.update(failure_kind=FailureKind.LEGACY_UNVERIFIED.value, needs_review=True)
+            task.error_message = "Legacy state lacks expected byte sizes; completeness cannot be proved"
+            return task
+        total = sum(f["size"] for f in manifest)
+        task.bytes_transferred = sum(min(f["size"], max(0, int((f.get("status") or {}).get("bytesTransferred") or 0))) for f in downloads)
+        task.progress_percent = 100.0 * task.bytes_transferred / total if total else 0.0
+        task.extra["progress"] = {"files_total": len(manifest), "files_complete": sum(self._finished_on_disk(task, f) for f in downloads), "bytes_total": total}
+        if invalid:
+            # slskd may publish success just before its final filesystem rename.
+            started = task.extra.setdefault("local_verification_started_at", time.time())
+            grace = self.config.getfloat("Download Settings", "completed_file_settle_time", fallback=30)
+            if time.time() - started < grace:
+                if all((f.get("status") or {}).get("state") == "Completed, Succeeded" for f in downloads):
+                    task.status = DownloadStatus.PENDING
+                    task.poll_failed = True
+                    task.error_message = "Transfer finished; waiting for regular local files at the manifest sizes"
+                    return task
+            else:
+                task.status = DownloadStatus.FAILED
+                task.extra["failure_kind"] = FailureKind.LOCAL_FILE_INVALID.value
+                task.error_message = "Completed transfer has missing, non-regular, or wrong-size local file(s): " + ", ".join(f["filename"].split("\\")[-1] for f in invalid[:3])
+                return task
+        else:
+            task.extra.pop("local_verification_started_at", None)
+        all_succeeded, has_errors = downloads_all_done(downloads)
+        if all_succeeded and all(self._finished_on_disk(task, f) for f in downloads):
+            task.status = DownloadStatus.COMPLETED
+            task.progress_percent = 100.0
+            task.bytes_transferred = total
+            task.error_message = None
+            return task
+        if has_errors and task.extra.get("enqueue", {}).get("phase") in ("prepared", "unknown"):
+            task.status = DownloadStatus.PENDING
+            task.poll_failed = True
+            task.error_message = "Some files were rejected; remaining enqueue ownership is still unknown"
+            return task
+        if has_errors:
+            states = sorted({(f.get("status") or {}).get("state", "") for f in downloads})
+            task.status = DownloadStatus.FAILED
+            rejected = any("Rejected" in state for state in states)
+            task.extra["failure_kind"] = FailureKind.PEER_REJECTED.value if rejected else FailureKind.TRANSFER_FAILED.value
+            task.error_message = "File(s) failed: " + ", ".join(states)
+            return task
+        task.poll_failed = any(f.get("status") is None for f in downloads)
+        if task.extra.get("enqueue", {}).get("phase") in ("prepared", "unknown"):
+            task.poll_failed = True
+        states = [(f.get("status") or {}).get("state", "") for f in downloads]
+        if any(s in ("InProgress", "Initializing", "Downloading") for s in states):
+            task.status = DownloadStatus.DOWNLOADING
+        elif "Queued, Remotely" in states:
+            task.status = DownloadStatus.QUEUED
+        elif "Queued, Locally" in states:
+            task.status = DownloadStatus.QUEUED_LOCALLY
+        else:
+            task.status = DownloadStatus.PENDING
+        return task
+
+    def _finished_on_disk(self, task, file):
+        size = file.get("size")
+        if not self.download_dir or not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            return False
+        name = file.get("name") or str(file.get("filename", "")).split("\\")[-1]
+        if not self._safe_leaf(name) or (task.local_dir and not self._safe_leaf(task.local_dir)):
+            return False
+        root = Path(self.download_dir)
+        directory = root / (task.local_dir or "")
+        path = directory / name
         try:
-            return path.is_file() and path.stat().st_size == file["size"]
+            if directory.is_symlink():
+                return False
+            info = path.lstat()
+            return stat.S_ISREG(info.st_mode) and info.st_size == size
         except OSError:
             return False
+
+    def _record_source_failure(self, task):
+        history = getattr(self.ctx, "history", None)
+        if history:
+            history.add_failure(task.extra.get("username"), task.book_title, task.error_message or "",
+                retry_after_days=1, backend=self.name, author=task.author_name,
+                media_type=task.extra.get("media_type", "ebook"), release_id=task.extra.get("release_id", ""),
+                failure_kind=task.extra.get("failure_kind", FailureKind.TRANSFER_FAILED.value))
+
+    def retry_after_failure(self, task):
+        """Retry a definite peer rejection, after confirming only owned IDs were removed."""
+        check_fatal_state(self.ctx)
+        pending = self._pending_alternates.pop(task.task_id, None)
+        if not pending or task.extra.get("failure_kind") != FailureKind.PEER_REJECTED.value:
+            return None
+        target, alternates, attempts = pending
+        if attempts >= 3:
+            return None
+        self._record_source_failure(task)
+        if not self.cleanup_confirmed(task):
+            task.status = DownloadStatus.PENDING
+            task.poll_failed = True
+            task.extra["retry_cleanup_pending"] = True
+            task.error_message = "Peer rejected transfer, but owned cleanup could not be confirmed; retry deferred"
+            self._pending_alternates[task.task_id] = pending
+            self._checkpoint(task)
+            return task
+        if not self.discard(task):
+            task.extra["needs_review"] = True
+            task.error_message = "Owned transfers removed, but failed files could not be fully isolated; retry deferred"
+            self._pending_alternates[task.task_id] = pending
+            self._checkpoint(task)
+            return None
+        # A crash after a replacement intent is saved must never let the old
+        # attempt claim or discard the replacement's same-name local files.
+        task.extra["retry_retired"] = {"since": time.time(), "reason": "Owned transfers removed and named leftovers isolated before alternate retry"}
+        self._checkpoint(task)
+        # Keep the old journal until the replacement is durable, but permit that
+        # one confirmed-cleaned reservation to be reused by lazy alternatives.
+        previous_replacement = self._replacing_task_id
+        self._replacing_task_id = task.task_id
+        try:
+            while attempts < 3:
+                result = next(alternates, None)
+                if result is None:
+                    break
+                attempts += 1
+                replacement = self._download_one(target, result)
+                if replacement is not None:
+                    self._pending_alternates[replacement.task_id] = (target, alternates, attempts)
+                    self.ctx.state.remove_task(task.task_id)
+                    logger.info("Trying alternate %s of 3 for %s after a peer rejection", attempts, task.book_title)
+                    return replacement
+        finally:
+            self._replacing_task_id = previous_replacement
+        return None
 
     def _local_clashes(self, file_dir: str, files: List[Dict[str, Any]]) -> List[str]:
         """Reasons not to download into this download's local folder: files of the same name
@@ -713,7 +906,28 @@ class SlskdBackend(DownloadBackend):
 
         if self.download_dir and os.path.isdir(self.download_dir):
             folder = Path(self.download_dir) / leaf
-            clashes.update(f"{n} (already in the download folder)" for n in names if (folder / n).exists())
+            if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+                clashes.add("local destination is not a regular directory")
+            clashes.update(f"{n} (already in the download folder)" for n in names if os.path.lexists(folder / n))
+
+        # An uncertain POST may have no visible transfer yet. Its durable intent
+        # still reserves these output names; a second book must not claim them.
+        state = getattr(self.ctx, "state", None)
+        if state is not None:
+            try:
+                for item in state.get_tasks_for_orchestrator():
+                    if item.get("task_id") == self._replacing_task_id:
+                        continue
+                    extra = item.get("extra") or {}
+                    reserved_dir = item.get("local_dir") or str(extra.get("file_dir", "")).split("\\")[-1]
+                    if reserved_dir != leaf:
+                        continue
+                    reserved = {str(f.get("name") or f.get("filename", "")).split("\\")[-1]
+                                for f in extra.get("manifest", []) or extra.get("files", [])}
+                    clashes.update(f"{name} (reserved by recovery task {item.get('task_id')})" for name in names & reserved)
+            except Exception as error:
+                logger.warning("Could not inspect destination reservations: %s", error)
+                clashes.add("saved transfer ownership could not be checked")
 
         # Unfinished downloads (from any peer or tool) headed for the same local folder. Any such
         # download counts, not only same-named files: Soularr deletes the whole local folder of an
@@ -738,6 +952,7 @@ class SlskdBackend(DownloadBackend):
                         clashes.add(f"{basename} (still downloading from {peer})")
         except Exception as e:
             logger.warning(f"Could not check slskd's transfer list for clashing downloads: {e}")
+            clashes.add("transfer ownership could not be checked")
 
         return sorted(clashes)
 
@@ -748,24 +963,55 @@ class SlskdBackend(DownloadBackend):
         try:
             for item in state.get_tasks_for_orchestrator() if state else []:
                 extra = item.get("extra") or {}
-                for f in extra.get("files", []):
+                for f in extra.get("files", []) or extra.get("manifest", []):
                     own.add((f.get("username") or extra.get("username"), str(f.get("filename", "")).split("\\")[-1]))
         except Exception as e:
             logger.debug(f"Could not read R:soul's own downloads from the state: {e}")
         return own
 
-    def discard(self, task: DownloadTask) -> None:
-        """Move files a failed download left in the local folder (e.g. finished chapters)
-        into <download_dir>/failed_downloads/, so a retry starts from a clean folder."""
-        if not self.download_dir or not task.local_dir:
-            return
-        names = task.extra.get("expected_files") or [f["filename"].split("\\")[-1] for f in task.extra.get("files", [])]
-        moved_to = move_files_aside(self.download_dir, task.local_dir, names, bucket="failed_downloads")
-        if moved_to:
-            logger.info(f"Moved leftovers of the failed download of {task.book_title} to {moved_to}")
+    def discard(self, task: DownloadTask) -> bool:
+        """Journal and isolate only this task's files; report confirmed source absence."""
+        check_fatal_state(self.ctx)
+        if task.extra.get("retry_retired"):
+            return True
+        if not self.download_dir or not Path(self.download_dir).is_dir():
+            return False
+        names = list(dict.fromkeys(task.extra.get("expected_files") or
+                     [f["filename"].split("\\")[-1] for f in task.extra.get("files", [])]))
+        if not names or any(not self._safe_leaf(name) for name in names) or (task.local_dir and not self._safe_leaf(task.local_dir)):
+            return False
+        source = Path(self.download_dir) / (task.local_dir or "")
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            return False
+        record = task.extra.setdefault("discard", {})
+        destination = record.get("destination")
+        if not destination:
+            destination = str(Path(self.download_dir) / "failed_downloads" / f"{task.local_dir or 'root'}-{uuid.uuid4().hex}")
+        record.update(phase="prepared", source=str(source), names=names, destination=destination)
+        self._checkpoint(task)
+        try:
+            moved_to = move_files_aside(self.download_dir, task.local_dir or "", names, bucket="failed_downloads",
+                                        destination=destination, before_move=lambda: check_fatal_state(self.ctx))
+            remaining = [name for name in names if os.path.lexists(source / name)]
+            record.update(phase="complete" if not remaining else "incomplete", remaining=remaining)
+            if moved_to:
+                logger.info("Moved leftovers of %s to %s", task.book_title, moved_to)
+        except StatePersistenceError:
+            raise
+        except Exception as error:
+            record.update(phase="incomplete", error=str(error), moved=getattr(error, "moved", []),
+                          remaining=[name for name in names if os.path.lexists(source / name)])
+            logger.warning("Could not isolate all failed files of %s: %s", task.book_title, error)
+            self._checkpoint(task)
+            return False
+        self._checkpoint(task)
+        return not bool(remaining)
 
     def cancel(self, task: DownloadTask) -> bool:
         """Cancel the download in slskd."""
+        check_fatal_state(self.ctx)
+        if task.extra.get("retry_retired"):
+            return True
         username = task.extra.get("username")
         files = task.extra.get("files", [])
         if not username or not files:
@@ -773,200 +1019,107 @@ class SlskdBackend(DownloadBackend):
 
         success = True
         for file in files:
+            if not file.get("id"):
+                success = False
+                continue
             try:
+                check_fatal_state(self.ctx)
                 self.client.transfers.cancel_download(username=username, id=file["id"])
+            except StatePersistenceError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to cancel download {file.get('id')} for {username}: {e}")
                 success = False
         return success
 
-    def cleanup(self, task: DownloadTask) -> None:
-        """Remove this task's own records from slskd's transfer list.
+    def cleanup(self, task: DownloadTask) -> bool:
+        return self.cleanup_confirmed(task)
 
-        slskd is often shared with other tools (e.g. Soularr for music), so R:soul
-        no longer clears every finished transfer; it removes only the ones it queued.
-        """
+    def cleanup_confirmed(self, task: DownloadTask) -> bool:
+        """Remove only this intent's IDs, and verify that each record is gone."""
+        check_fatal_state(self.ctx)
+        if task.extra.get("retry_retired"):
+            return True
+        if task.extra.get("enqueue", {}).get("phase") in ("prepared", "unknown"):
+            return False
         username = task.extra.get("username")
-        removed = 0
-        for f in task.extra.get("files", []):
-            if not f.get("id"):
-                continue
+        owned = {f["id"] for f in task.extra.get("files", []) if f.get("id")}
+        if not username:
+            return False
+        for transfer_id in sorted(owned):
             try:
-                # remove=True drops the record; for an unfinished transfer slskd cancels it first
-                if self.client.transfers.cancel_download(username=f.get("username") or username, id=f["id"], remove=True):
-                    removed += 1
-            except Exception as e:
-                logger.debug(f"Could not remove transfer {f['id']} from slskd: {e}")
-        if removed:
-            logger.debug(f"Removed {removed} transfer record(s) of {task.book_title} from slskd")
+                check_fatal_state(self.ctx)
+                self.client.transfers.cancel_download(username=username, id=transfer_id, remove=True)
+            except StatePersistenceError:
+                raise
+            except Exception as error:
+                if not is_not_found(error):
+                    logger.warning("Could not remove owned transfer %s: %s", transfer_id, error)
+        try:
+            listing = get_user_downloads(self.client, username)
+            remaining = {f.get("id") for d in listing.get("directories", []) for f in d.get("files", [])}
+            return not bool(owned & remaining)
+        except Exception as error:
+            logger.warning("Could not confirm owned transfer cleanup for %s: %s", task.book_title, error)
+            return False
 
     def reconcile_task(self, task_data: Dict[str, Any]) -> Optional[DownloadTask]:
-        """Reconcile a persisted task with live slskd state."""
-        if task_data.get("extra", {}).get("media_type") == "audiobook":
-            return self._reconcile_audiobook_task(task_data)
-
-        username = task_data.get("extra", {}).get("username")
-        filename = task_data.get("filename")
-        local_dir = task_data.get("local_dir", "")
-
-        if not username or not filename:
-            return None
-
-        # The transfer ID saved when the download was queued identifies it exactly; slskd keeps
-        # old records of earlier attempts with the same filename, so names alone are ambiguous.
-        saved_ids = {f.get("id") for f in task_data.get("extra", {}).get("files", []) if f.get("id")}
-
+        """Restore the complete manifest; never turn an arbitrary existing path into success."""
+        extra = copy.deepcopy(task_data.get("extra") or {})
+        if extra.get("retry_retired"):
+            raise BackendUnavailable("This attempt was durably retired; remove only its recovery record without touching files")
+        username = extra.get("username")
+        if not username:
+            raise BackendUnavailable("Saved task has no peer identity; manual review required")
+        task = DownloadTask(
+            task_id=task_data["task_id"], backend_name=self.name, status=DownloadStatus.PENDING,
+            book_title=task_data.get("book_title", ""), author_name=task_data.get("author_name", ""),
+            book_id=task_data.get("book_id"), filename=task_data.get("filename", ""),
+            series_title=task_data.get("series_title", ""), local_dir=task_data.get("local_dir", ""), extra=extra)
+        manifest = self._ensure_manifest(task)
+        if not manifest or any(not self._safe_leaf(f["name"]) for f in manifest):
+            raise BackendUnavailable("Saved manifest has invalid filenames; manual review required")
         try:
-            all_downloads = self.client.transfers.get_all_downloads()
-        except Exception as e:
-            raise BackendUnavailable(f"slskd not reachable: {e}") from e
-
-        try:
-            # Find the matching transfer in slskd's list
-
+            listing = get_user_downloads(self.client, username)
+        except Exception as error:
+            raise BackendUnavailable(f"slskd not reachable: {error}") from error
+        directory = extra.get("file_dir", "")
+        leaf = directory.split("\\")[-1]
+        saved = {f["filename"].split("\\")[-1]: f for f in extra.get("files", [])}
+        observations = []
+        for entry in manifest:
+            previous = saved.get(entry["name"], {})
             candidates = []
-            for user_transfer in all_downloads:
-                if user_transfer["username"] == username:
-                    for directory in user_transfer["directories"]:
-                        for file in directory["files"]:
-                            slskd_filename = file["filename"]
-                            if slskd_filename == filename or slskd_filename.split("\\")[-1] == filename:
-                                candidates.append((directory, file))
-
-            if saved_ids:
-                candidates = [c for c in candidates if c[1]["id"] in saved_ids]
-            else:
-                # Old state file without IDs: prefer a record that is still active
-                candidates.sort(key=lambda c: str(c[1].get("state", "")).startswith("Completed"))
-
+            for folder in listing.get("directories", []):
+                if folder.get("directory") not in (directory, leaf):
+                    continue
+                for record in folder.get("files", []):
+                    if record.get("filename") not in (entry["filename"], entry["name"]):
+                        continue
+                    if previous.get("id") and record.get("id") != previous["id"]:
+                        continue
+                    # No ID in a new intent: the pre-enqueue snapshot is authoritative.
+                    if extra.get("enqueue") and not previous.get("id"):
+                        continue
+                    candidates.append(record)
+            if len(candidates) > 1:
+                raise BackendUnavailable(f"Several transfer records match legacy file {entry['name']}; manual review required")
             if candidates:
-                directory, file = candidates[0]
-                # Found it! Re-create task with updated data
-                new_files = [{"filename": file["filename"], "id": file["id"], "size": file["size"], "username": username, "file_dir": directory["directory"]}]
-
-                task_data["extra"]["files"] = new_files
-                task_data["extra"]["slskd_id"] = file["id"]
-                task_data["extra"]["file_dir"] = directory["directory"]
-
-                task = DownloadTask(
-                    task_id=task_data["task_id"],
-                    backend_name=self.name,
-                    status=DownloadStatus.PENDING,
-                    book_title=task_data["book_title"],
-                    author_name=task_data["author_name"],
-                    book_id=task_data["book_id"],
-                    filename=task_data["filename"],
-                    series_title=task_data.get("series_title", ""),
-                    local_dir=task_data.get("local_dir", ""),
-                    extra=task_data["extra"],
-                )
-                return self.get_status(task)
-
-            # If not found in slskd, check if it's already on disk in the download dir
-            if self.download_dir and local_dir:
-                local_path = Path(self.download_dir) / local_dir / filename
-                if local_path.exists():
-                    return DownloadTask(
-                        task_id=task_data["task_id"],
-                        backend_name=self.name,
-                        status=DownloadStatus.COMPLETED,
-                        book_title=task_data["book_title"],
-                        author_name=task_data["author_name"],
-                        book_id=task_data["book_id"],
-                        filename=filename,
-                        series_title=task_data.get("series_title", ""),
-                        local_dir=local_dir,
-                        output_path=local_path,
-                        progress_percent=100.0,
-                        extra=task_data["extra"],
-                    )
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Error reconciling slskd task: {e}")
-            return None
+                record = candidates[0]
+                # A saved transfer ID permits recovering its expected size in old state.
+                if entry.get("size") is None and previous.get("id") == record.get("id"):
+                    size = record.get("size")
+                    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+                        entry["size"] = size
+                observations.append(dict(record, filename=entry["filename"], username=username, file_dir=directory, status=record))
+        if extra.get("legacy_manifest"):
+            extra["manifest_digest"] = self._manifest_digest(manifest)
+        self._bind_records(task, observations)
+        task = self.get_status(task)
+        # Save enriched legacy sizes/IDs and unchanged full manifests for the next restart.
+        if getattr(self.ctx, "state", None) is not None:
+            self._checkpoint(task)
+        return task
 
     def _reconcile_audiobook_task(self, task_data: Dict[str, Any]) -> Optional[DownloadTask]:
-        """Reconcile a persisted audiobook folder task.
-
-        Files still in the slskd transfer list are tracked again; files already on
-        disk count as done (slskd drops completed transfers from its list).
-        """
-        extra = task_data.get("extra", {})
-        username = extra.get("username")
-        file_dir = extra.get("file_dir", "")
-        expected = extra.get("expected_files") or []
-        local_dir = task_data.get("local_dir", "")
-        if not username or not expected:
-            return None
-
-        leaf = file_dir.split("\\")[-1] if file_dir else ""
-        # Chapters are matched by the transfer IDs saved when they were queued: slskd keeps old
-        # records of earlier attempts with the same names (e.g. "Completed, Errored").
-        saved_ids = {f["id"] for f in extra.get("files", []) if f.get("id")}
-        tracked: Dict[str, Dict[str, Any]] = {}
-        try:
-            all_downloads = self.client.transfers.get_all_downloads()
-        except Exception as e:
-            raise BackendUnavailable(f"slskd not reachable: {e}") from e
-        try:
-            for user_transfer in all_downloads:
-                if user_transfer["username"] != username:
-                    continue
-                for directory in user_transfer["directories"]:
-                    if directory["directory"] not in (file_dir, leaf):
-                        continue
-                    for file in directory["files"]:
-                        basename = file["filename"].split("\\")[-1]
-                        if basename not in expected:
-                            continue
-                        if saved_ids and file["id"] not in saved_ids:
-                            continue  # an older (or unrelated) record with the same name
-                        previous = tracked.get(basename)
-                        # Without saved IDs (old state file), prefer a record that is still active
-                        if previous is None or str(previous.get("state", "")).startswith("Completed"):
-                            tracked[basename] = {
-                                "filename": file["filename"],
-                                "id": file["id"],
-                                "size": file["size"],
-                                "username": username,
-                                "file_dir": file_dir,
-                                "state": file.get("state", ""),
-                            }
-        except Exception as e:
-            logger.error(f"Error reconciling slskd audiobook task: {e}")
-            return None
-        for f in tracked.values():
-            f.pop("state", None)
-
-        on_disk = set()
-        if self.download_dir and local_dir:
-            on_disk = {name for name in expected if name not in tracked and (Path(self.download_dir) / local_dir / name).exists()}
-
-        missing = [name for name in expected if name not in tracked and name not in on_disk]
-        if missing:
-            logger.warning(f"Cannot resume audiobook {task_data.get('book_title')}: {len(missing)} of {len(expected)} files are neither queued nor on disk")
-            return None
-
-        extra["files"] = list(tracked.values())
-        # Chapters finished in an earlier run still count towards progress
-        extra["offline_bytes"] = sum((Path(self.download_dir) / local_dir / name).stat().st_size for name in on_disk)
-        task = DownloadTask(
-            task_id=task_data["task_id"],
-            backend_name=self.name,
-            status=DownloadStatus.PENDING,
-            book_title=task_data["book_title"],
-            author_name=task_data["author_name"],
-            book_id=task_data["book_id"],
-            filename=task_data["filename"],
-            series_title=task_data.get("series_title", ""),
-            local_dir=local_dir,
-            extra=extra,
-        )
-        if not tracked:
-            # Everything already downloaded
-            task.status = DownloadStatus.COMPLETED
-            task.progress_percent = 100.0
-            return task
-        return self.get_status(task)
+        return self.reconcile_task(task_data)

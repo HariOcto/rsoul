@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timedelta
 
 import pytest
+from rsoul.outcomes import SearchIncomplete
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -113,7 +114,7 @@ class Orch:
 def test_successful_import_is_written_to_the_ledger(tmp_path, monkeypatch):
     ctx = ctx_for(tmp_path)
     ctx.orchestrator = Orch()
-    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items: {4020: True})
+    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items, **kwargs: {4020: True})
     results = workflow._RunResults(ctx, [])
     task = DownloadTask("t", "slskd", DownloadStatus.COMPLETED, "The Trafalgar Gambit", NUTTALL, 4020, "a.mp3", extra={"media_type": "audiobook"})
     results.on_complete(task)
@@ -126,7 +127,7 @@ def test_successful_import_is_written_to_the_ledger(tmp_path, monkeypatch):
 def test_failed_import_is_not_in_the_ledger(tmp_path, monkeypatch):
     ctx = ctx_for(tmp_path)
     ctx.orchestrator = Orch()
-    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items: {7: False})
+    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items, **kwargs: {7: False})
     results = workflow._RunResults(ctx, [])
     results.on_complete(DownloadTask("t", "slskd", DownloadStatus.COMPLETED, "Robot Dreams", "Isaac Asimov", 7, "a.mp3", extra={"media_type": "audiobook"}))
     results.wait_for_imports()
@@ -297,7 +298,11 @@ def test_rate_limited_search_is_repeated_once(monkeypatch):
     def flaky(ctx, query, label):
         calls.append(query)
         if len(calls) == 1:
-            raise RuntimeError("429 Client Error: Too Many Requests for url: http://slskd/api/v0/searches")
+            import requests
+            response = requests.Response()
+            response.status_code = 429
+            response.headers["Retry-After"] = "0"
+            raise requests.HTTPError("429 Client Error: Too Many Requests", response=response)
         return [], "s1"
 
     monkeypatch.setattr(slskd_backend, "_execute_search", flaky)
@@ -318,7 +323,7 @@ def test_other_search_errors_are_not_repeated(monkeypatch):
     monkeypatch.setattr(slskd_backend, "_execute_search", broken)
     ctx = Context(config=make_config(search={"max_search_fallbacks": "0"}), slskd=Client(), readarr=None)
     target = DownloadTarget(book_id=7, book_title="Endeavour", author_name=NUTTALL, series_title="", allowed_filetypes=["mp3"], media_type="audiobook")
-    with pytest.raises(RuntimeError, match="searches could be run"):
+    with pytest.raises(SearchIncomplete, match="Search coverage incomplete"):
         SlskdBackend(ctx).search(target)
     assert len(calls) == len(set(calls))
 

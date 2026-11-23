@@ -4,7 +4,7 @@ An OS-level lock (flock) on <config dir>/.rsoul.lock, in Docker too. Unlike the 
 "lock file exists" check, it can't go stale: the operating system releases it when the
 process ends, even after a crash. Two containers sharing a data folder can't run at once,
 on filesystems that support OS file locks (local disks and ZFS datasets do; some network
-filesystems don't, and R:soul then runs without the lock and logs a warning).
+filesystems don't, and R:soul then stops before making changes).
 """
 
 import logging
@@ -25,6 +25,10 @@ class AlreadyRunning(Exception):
     """Another R:soul process holds the lock for this data folder."""
 
 
+class LockUnavailable(RuntimeError):
+    """Single-writer ownership could not be established safely."""
+
+
 class InstanceLock:
     def __init__(self, config_dir: str):
         self.path = os.path.join(config_dir, LOCK_FILENAME)
@@ -32,13 +36,11 @@ class InstanceLock:
 
     def acquire(self) -> None:
         if fcntl is None:
-            logger.debug("File locking isn't available on this platform; running without an instance lock")
-            return
+            raise LockUnavailable("OS file locking is unavailable; use a supported Linux data volume")
         try:
             self._file = open(self.path, "a+")
         except OSError as e:
-            logger.warning(f"Could not open lock file {self.path} ({e}); running without an instance lock")
-            return
+            raise LockUnavailable(f"Could not open instance lock {self.path}: {e}") from e
         try:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -46,10 +48,9 @@ class InstanceLock:
             self._file = None
             raise AlreadyRunning(f"Another R:soul is already running with the data folder {os.path.dirname(self.path)}")
         except OSError as e:
-            # Some network filesystems don't support locks; don't refuse to run because of that
-            logger.warning(f"Could not lock {self.path} ({e}); running without an instance lock")
             self._file.close()
             self._file = None
+            raise LockUnavailable(f"Could not lock {self.path}: {e}; no changes were started") from e
 
     def release(self) -> None:
         """Never raises: a problem unlocking must not hide how the run ended."""

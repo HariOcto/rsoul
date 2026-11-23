@@ -261,7 +261,7 @@ def test_entries_written_by_this_and_older_versions_are_accepted(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["grab_list_state.json"]
 
 
-def test_surprise_while_resuming_drops_one_download_not_the_run():
+def test_surprise_while_resuming_protects_one_download_and_continues_others():
     class Backend:
         name = "slskd"
 
@@ -286,38 +286,40 @@ def test_surprise_while_resuming_drops_one_download_not_the_run():
         del SlskdBackend._reconcile_stub
 
     assert [t.task_id for t in resumed] == ["good"]
-    assert orch.unchecked_task_ids == set()  # dropped, not kept for another crash next run
+    assert orch.unchecked_task_ids == {"bad"}  # retained ownership; the healthy task still resumes
 
 
 # ---------------------------------------------------------------------------
-# 5. Which failures exclude a peer for good
+# 5. Import failures retain local evidence without blaming a peer
 # ---------------------------------------------------------------------------
 
 
-def test_audiobook_that_cannot_be_staged_only_pauses_the_peer(tmp_path):
+def test_audiobook_that_cannot_be_staged_is_retained_without_peer_penalty(tmp_path):
     local = tmp_path / "dl"
     (local / "Mistborn").mkdir(parents=True)  # the chapter isn't where it should be
     history = HistoryManager(str(tmp_path))
     ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=None, history=history)
     item = {"author_name": AUTHOR, "title": "T", "bookId": 7, "dir": "Mistborn", "filename": "01.mp3", "expected_files": ["01.mp3"], "backend_name": "slskd", "media_type": "audiobook", "source_id": "peer"}
 
-    assert postprocess.process_imports(ctx, [item]) == {7: False}
-    assert history.is_failed("peer", "T")
-    assert "retry_after" in history.history[0]
+    result = postprocess.process_imports(ctx, [item])
+    assert result[7]["phase"] == "needs_review"
+    assert history.history == []
+    assert not history.is_failed("peer", "T")
 
 
-def test_ebook_that_is_not_where_expected_only_pauses_the_peer(tmp_path):
+def test_ebook_that_is_not_where_expected_is_retained_without_peer_penalty(tmp_path):
     local = tmp_path / "dl"
     local.mkdir()
     history = HistoryManager(str(tmp_path))
     ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=None, history=history)
     item = {"author_name": AUTHOR, "title": "T", "bookId": 7, "dir": "x", "filename": "a.epub", "backend_name": "slskd", "source_id": "peer"}
 
-    postprocess.process_imports(ctx, [item])
-    assert "retry_after" in history.history[0]
+    result = postprocess.process_imports(ctx, [item])
+    assert result[7]["phase"] == "needs_review"
+    assert history.history == []
 
 
-def test_ebook_with_the_wrong_content_excludes_the_peer_for_good(tmp_path, monkeypatch):
+def test_ebook_metadata_rejection_preserves_the_source_for_review(tmp_path, monkeypatch):
     local = tmp_path / "dl"
     (local / "x").mkdir(parents=True)
     (local / "x" / "a.epub").write_bytes(b"not the book")
@@ -326,6 +328,8 @@ def test_ebook_with_the_wrong_content_excludes_the_peer_for_good(tmp_path, monke
     ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=None, history=history)
     item = {"author_name": AUTHOR, "title": "T", "bookId": 7, "dir": "x", "filename": "a.epub", "backend_name": "slskd", "source_id": "peer"}
 
-    postprocess.process_imports(ctx, [item])
-    assert history.history[0]["reason"] == "Metadata validation failed"
-    assert "retry_after" not in history.history[0]
+    result = postprocess.process_imports(ctx, [item])
+    assert result[7]["phase"] == "needs_review"
+    assert "metadata" in result[7]["reason"].lower()
+    assert history.history == []
+    assert (local / "x" / "a.epub").exists()

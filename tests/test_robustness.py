@@ -125,57 +125,125 @@ def test_queued_without_progress_still_times_out():
 
 @pytest.fixture
 def staged(tmp_path):
+    from pathlib import Path
     local = tmp_path / "dl"
     (local / "Book").mkdir(parents=True)
-    (local / "Book" / "01.m4b").write_bytes(b"x")
+    (local / "Book" / "01.m4b").write_bytes((Path(REPO) / "tests/fixtures/silence.m4b").read_bytes())
     config = configparser.ConfigParser()
     config["Slskd"] = {"download_dir": str(local), "readarr_download_dir": "/chaptarr/dl"}
-    config["Readarr"] = {"import_poll_timeout": "0"}
+    config["Readarr"] = {"import_poll_timeout": "0", "import_method": "targeted"}
+    config["Postprocessing"] = {"audiobook_tag_check": "off"}
     item = {"author_name": "A", "title": "T", "bookId": 7, "dir": "Book", "filename": "01.m4b", "expected_files": ["01.m4b"], "backend_name": "slskd", "media_type": "audiobook"}
     return local, config, item
 
 
 class StillRunning:
+    ver_uri = "/api/v1"
+
+    def __init__(self, local):
+        self.local = local
+
+    def get_book(self, book_id):
+        return {"id": book_id, "title": "T", "authorId": 3, "mediaType": "audiobook"}
+
+    def get_author(self, author_id):
+        return {"id": author_id, "authorName": "A"}
+
+    def get_edition(self, book_id):
+        return [{"id": 20, "bookId": book_id, "readingFormatId": 2, "monitored": True}]
+
+    def _get(self, resource, ver_uri=None, params=None):
+        if resource == "bookfile":
+            return []
+        if resource == "history":
+            return {"records": [], "totalRecords": 0}
+        if resource == "manualimport":
+            folder = self.local / params["folder"].removeprefix("/chaptarr/dl/")
+            return [{"path": params["folder"] + "/" + path.name, "quality": {"quality": {"id": 1}}}
+                    for path in folder.iterdir() if path.is_file()]
+        raise AssertionError(resource)
+
     def post_command(self, name, **kwargs):
-        return {"id": 11, "body": {"path": kwargs["path"]}}
+        return {"id": 11}
 
     def get_command(self, id_):
         return {"id": id_, "status": "started"}
 
 
-class Unreachable:
+class Unreachable(StillRunning):
     def post_command(self, name, **kwargs):
         raise requests.ConnectionError("Chaptarr is restarting")
 
 
 def test_unfinished_import_becomes_pending(staged):
     local, config, item = staged
-    result = postprocess.process_imports(Context(config=config, slskd=None, readarr=StillRunning()), [item])[7]
-    assert isinstance(result, dict)
+    result = postprocess.process_imports(Context(config=config, slskd=None, readarr=StillRunning(local)), [item])[7]
+    assert result["phase"] == "importing"
     assert result["command_id"] == 11
     assert result["readarr_path"].startswith("/chaptarr/dl/rsoul_audiobooks/")
-    assert all(os.path.exists(p) for p in result["files"])  # nothing moved to failed_imports
+    assert all(os.path.exists(p) for p in result["files"])
 
 
 def test_unreachable_readarr_becomes_pending_without_command(staged):
     local, config, item = staged
-    result = postprocess.process_imports(Context(config=config, slskd=None, readarr=Unreachable()), [item])[7]
-    assert isinstance(result, dict) and result["command_id"] is None
+    result = postprocess.process_imports(Context(config=config, slskd=None, readarr=Unreachable(local)), [item])[7]
+    assert result["phase"] == "submission_unknown" and result["command_id"] is None
+    assert result["before_ids"] == []
+    assert len(result["attempts"]) == 1
 
 
 def pending(tmp_path, command_id=5, files_exist=True, **extra):
+    """A recorded pre-submit manifest; a missing file never invents proof."""
+    import hashlib
+    from pathlib import Path
     folder = tmp_path / "staged"
     folder.mkdir(exist_ok=True)
     f = folder / "01.m4b"
+    data = (Path(REPO) / "tests/fixtures/silence.m4b").read_bytes()
     if files_exist:
-        f.write_bytes(b"x")
-    return dict({"folder": "staged", "local_dir": str(folder), "readarr_path": "/c/staged", "files": [str(f)], "command_id": command_id, "submits": 1, "since": time.time()}, **extra)
+        f.write_bytes(data)
+    manifest = [{"name": f.name, "source_path": str(f), "stage_path": str(f), "readarr_path": "/c/staged/01.m4b",
+                 "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}]
+    return dict({"schema": 2, "phase": "importing" if command_id is not None else "submission_unknown",
+                 "folder": "staged", "local_dir": str(folder), "readarr_path": "/c/staged", "files": [str(f)],
+                 "command_id": command_id, "submits": 1, "since": time.time() - 1,
+                 "book_id": 7, "edition_id": 20, "media_type": "audiobook", "before_ids": [], "manifest": manifest,
+                 "intended_identity": {"book_id": 7, "title": "Book", "author_id": 3, "author_name": "Author", "media_type": "audiobook"},
+                 "attempts": [{"command_id": command_id, "before_ids": []}]}, **extra)
 
 
 class Commands:
+    ver_uri = "/api/v1"
+
     def __init__(self, command=None, error=None, post_error=None, on_get=None):
         self.command, self.error, self.post_error, self.on_get = command, error, post_error, on_get
-        self.posted = []
+        self.posted, self.bookfiles, self.events = [], [], []
+
+    def get_book(self, book_id):
+        return {"id": book_id, "title": "Book", "authorId": 3, "mediaType": "audiobook"}
+
+    def get_author(self, author_id):
+        return {"id": author_id, "authorName": "Author"}
+
+    def _get(self, resource, ver_uri=None, params=None):
+        if resource == "bookfile":
+            return list(self.bookfiles)
+        if resource == "history":
+            return {"records": list(self.events), "totalRecords": len(self.events)}
+        raise AssertionError(resource)
+
+    def publish(self, p):
+        from datetime import datetime, timezone
+        for entry in p["manifest"]:
+            file_id = len(self.bookfiles) + 1
+            output = f"/server-library/imported-{file_id}.m4b"
+            self.bookfiles.append({"id": file_id, "bookId": 7, "authorId": 3, "path": output,
+                                   "size": entry["size"], "mediaType": "audiobook"})
+            self.events.append({"id": file_id, "bookId": 7, "authorId": 3, "eventType": "bookFileImported",
+                                "date": datetime.now(timezone.utc).isoformat(),
+                                "data": {"FileId": str(file_id), "ImportedPath": output, "DroppedPath": entry["readarr_path"]}})
+            if os.path.exists(entry["stage_path"]):
+                os.remove(entry["stage_path"])
 
     def get_command(self, id_):
         if self.on_get:
@@ -187,7 +255,7 @@ class Commands:
     def post_command(self, name, **kwargs):
         if self.post_error:
             raise self.post_error
-        self.posted.append(kwargs["path"])
+        self.posted.append((name, kwargs))
         return {"id": 99}
 
 
@@ -198,55 +266,65 @@ def http_404():
 
 
 def test_pending_still_running(tmp_path):
-    assert postprocess.check_pending_import(Commands({"status": "started"}), pending(tmp_path)) is None
+    result = postprocess.check_pending_import(Commands({"status": "started"}), pending(tmp_path))
+    assert result["phase"] == "importing"
 
 
-def test_pending_finished_and_files_moved(tmp_path):
+def test_pending_finished_with_complete_correlated_output(tmp_path):
     p = pending(tmp_path)
-    readarr = Commands({"status": "completed", "result": "successful"}, on_get=lambda: os.remove(p["files"][0]))
+    readarr = Commands({"status": "completed", "result": "successful"})
+    readarr.publish(p)
     assert postprocess.check_pending_import(readarr, p) is True
 
 
-def test_pending_finished_unsuccessful(tmp_path):
+def test_pending_finished_unsuccessful_retains_inputs(tmp_path):
     p = pending(tmp_path)
-    assert postprocess.check_pending_import(Commands({"status": "completed", "result": "unsuccessful"}), p) is False
-    assert not os.path.exists(p["files"][0])  # moved to failed_imports
-    assert (tmp_path / "failed_imports" / "staged" / "01.m4b").exists()
+    result = postprocess.check_pending_import(Commands({"status": "completed", "result": "unsuccessful"}), p)
+    assert result["phase"] == "needs_review"
+    assert os.path.exists(p["files"][0])
+    assert not (tmp_path / "failed_imports").exists()
 
 
-def test_pending_readarr_unreachable_waits(tmp_path):
-    assert postprocess.check_pending_import(Commands(error=requests.ConnectionError("down")), pending(tmp_path)) is None
+def test_pending_readarr_unreachable_retains_unknown_submission(tmp_path):
+    result = postprocess.check_pending_import(Commands(error=requests.ConnectionError("down")), pending(tmp_path))
+    assert result["phase"] == "submission_unknown"
 
 
-def test_pending_command_forgotten_files_gone_counts_as_done(tmp_path):
-    assert postprocess.check_pending_import(Commands(error=http_404()), pending(tmp_path, files_exist=False)) is True
+def test_pending_command_forgotten_files_gone_requires_output_proof(tmp_path):
+    result = postprocess.check_pending_import(Commands(error=http_404()), pending(tmp_path, files_exist=False))
+    assert result["phase"] == "submission_unknown"
 
 
-def test_pending_command_forgotten_files_present_is_resubmitted(tmp_path):
+def test_pending_command_forgotten_is_not_blindly_resubmitted(tmp_path):
     readarr = Commands(error=http_404())
     result = postprocess.check_pending_import(readarr, pending(tmp_path))
-    assert result["command_id"] == 99 and result["submits"] == 2
-    assert readarr.posted == ["/c/staged"]
+    assert result["command_id"] == 5 and result["submits"] == 1
+    assert result["phase"] == "submission_unknown"
+    assert readarr.posted == []
 
 
-def test_pending_never_submitted_is_submitted(tmp_path):
+def test_pending_missing_submission_receipt_is_not_blindly_resubmitted(tmp_path):
     readarr = Commands()
     result = postprocess.check_pending_import(readarr, pending(tmp_path, command_id=None, submits=0))
-    assert result["command_id"] == 99
+    assert result["command_id"] is None
+    assert result["phase"] == "submission_unknown"
+    assert readarr.posted == []
 
 
-def test_pending_gives_up_after_a_day(tmp_path):
+def test_pending_active_command_after_a_day_retains_inputs(tmp_path):
     p = pending(tmp_path, since=time.time() - 25 * 3600)
-    assert postprocess.check_pending_import(Commands({"status": "started"}), p) is False
-    # Not left untracked in staging: moved to failed_imports like any failed import
-    assert not os.path.exists(p["files"][0])
-    assert (tmp_path / "failed_imports" / "staged" / "01.m4b").exists()
+    result = postprocess.check_pending_import(Commands({"status": "started"}), p)
+    assert result["phase"] == "importing" and result["overdue"]
+    assert os.path.exists(p["files"][0])
+    assert not (tmp_path / "failed_imports").exists()
 
 
-def test_pending_gives_up_after_three_submits(tmp_path):
+def test_pending_unknown_after_old_retry_limit_retains_inputs(tmp_path):
     p = pending(tmp_path, command_id=None, submits=3)
-    assert postprocess.check_pending_import(Commands(), p) is False
-    assert (tmp_path / "failed_imports" / "staged" / "01.m4b").exists()
+    result = postprocess.check_pending_import(Commands(), p)
+    assert result["phase"] == "submission_unknown"
+    assert os.path.exists(p["files"][0])
+    assert not (tmp_path / "failed_imports").exists()
 
 
 def test_pending_import_is_saved_and_finished_next_run(tmp_path, monkeypatch):
@@ -257,8 +335,9 @@ def test_pending_import_is_saved_and_finished_next_run(tmp_path, monkeypatch):
     state.add_task(done)
     p = pending(tmp_path)
 
-    # Run 1: the import doesn't finish in time
-    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items: {7: p})
+    # Run 1: the durable import transaction has not finished yet. This isolates
+    # workflow persistence; actual proof is exercised by the run-2 follow-up.
+    monkeypatch.setattr(workflow.postprocess, "process_imports", lambda ctx, items, **kwargs: {7: p})
     ctx = Context(config=config, slskd=None, readarr=None, config_dir=str(tmp_path), state=state)
     results = workflow._RunResults(ctx, [])
     results.on_complete(done)
@@ -267,7 +346,6 @@ def test_pending_import_is_saved_and_finished_next_run(tmp_path, monkeypatch):
     saved = StateManager(str(tmp_path)).get_items()
     assert saved[0]["extra"]["import_pending"]["command_id"] == 5
 
-    # Run 2: the follow-up finds it finished; it is not treated as a download to resume
     class Orchestrator:
         def resume_tasks(self, persisted):
             raise AssertionError("a pending import must not be resumed as a download")
@@ -278,7 +356,8 @@ def test_pending_import_is_saved_and_finished_next_run(tmp_path, monkeypatch):
         def get_backend(self, name):
             return None
 
-    readarr = Commands({"status": "completed", "result": "successful"}, on_get=lambda: os.path.exists(p["files"][0]) and os.remove(p["files"][0]))
+    readarr = Commands({"status": "completed", "result": "successful"})
+    readarr.publish(p)
     ctx2 = Context(config=config, slskd=None, readarr=readarr, config_dir=str(tmp_path), state=StateManager(str(tmp_path)), orchestrator=Orchestrator())
     summary = workflow.run_workflow(ctx2, [])
     assert summary["grabbed_count"] == 1
@@ -545,7 +624,7 @@ def test_health_records_how_the_last_run_went(tmp_path, monkeypatch):
     monkeypatch.setattr(health, "_last_beat", 0.0)
     assert module._main_with_status() == 0
     data = json.loads((tmp_path / "health.json").read_text())
-    assert data["last_run"] == {"search_failed": False, "grabbed": 2, "failed": 1, "still_downloading": 0, "pending_imports": 1, "unchecked_downloads": 0}
+    assert data["last_run"] == {"search_failed": False, "grabbed": 2, "failed": 1, "still_downloading": 0, "pending_imports": 1, "unchecked_downloads": 0, "needs_review": 0, "pending_cleanup": 0}
     assert data["state"] == "idle" and "last_success_at" in data
 
 
@@ -645,7 +724,7 @@ def test_half_moved_audiobook_is_put_back_together(tmp_path, monkeypatch):
     assert not (tmp_path / "rsoul_audiobooks" / "A" / "T").exists()
 
 
-def test_lock_unsupported_by_filesystem_runs_without_it(tmp_path, monkeypatch):
+def test_lock_unsupported_by_filesystem_refuses_unprotected_run(tmp_path, monkeypatch):
     from rsoul import locking
 
     calls = []
@@ -656,7 +735,8 @@ def test_lock_unsupported_by_filesystem_runs_without_it(tmp_path, monkeypatch):
 
     monkeypatch.setattr(locking.fcntl, "flock", flock)
     lock = locking.InstanceLock(str(tmp_path))
-    lock.acquire()  # warns, doesn't refuse to run
+    with pytest.raises(locking.LockUnavailable):
+        lock.acquire()
     assert lock._file is None  # no half-open lock left behind
     lock.release()  # must not raise
     assert calls == [locking.fcntl.LOCK_EX | locking.fcntl.LOCK_NB]
@@ -679,10 +759,12 @@ def test_unlock_failure_does_not_raise(tmp_path, monkeypatch):
     assert lock._file is None
 
 
-def test_pending_after_a_day_with_files_gone_counts_as_imported(tmp_path):
-    # Chaptarr imported (and moved the files) while R:soul couldn't reach it
+def test_pending_after_a_day_with_files_gone_requires_review(tmp_path):
+    # Vanishing source files during an outage do not identify their destination.
     p = pending(tmp_path, files_exist=False, since=time.time() - 25 * 3600)
-    assert postprocess.check_pending_import(Commands(error=requests.ConnectionError("down")), p) is True
+    result = postprocess.check_pending_import(Commands(error=requests.ConnectionError("down")), p)
+    assert result["phase"] == "needs_review"
+    assert result["before_ids"] == []
     assert not (tmp_path / "failed_imports").exists()
 
 

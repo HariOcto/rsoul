@@ -19,6 +19,7 @@ import configparser
 import json
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -33,6 +34,7 @@ from rsoul.config import Context, validate_config
 from rsoul.history import HistoryManager
 from rsoul.match import audiobook_folder_match
 from rsoul.orchestrator import DownloadOrchestrator
+from rsoul.outcomes import SearchIncomplete
 from rsoul.search import get_books
 from rsoul.state import StateManager
 from rsoul.utils import get_current_page
@@ -149,7 +151,10 @@ class Client:
 
 
 def backend(client=None, history=None, **config):
-    ctx = Context(config=make_config(**config), slskd=client or Client(), readarr=None, history=history)
+    storage = tempfile.TemporaryDirectory(prefix="rsoul-test-state-")
+    ctx = Context(config=make_config(**config), slskd=client or Client(), readarr=None, history=history,
+                  config_dir=storage.name, state=StateManager(storage.name))
+    ctx._test_storage = storage  # lifetime follows the real context/checkpoint store
     return SlskdBackend(ctx)
 
 
@@ -194,7 +199,8 @@ def test_single_file_audiobooks_from_one_folder_get_separate_tasks():
     result = b.search(target())[0]
     task = b.download(target(), result)
 
-    assert task.task_id == f"peer|{BOOK_FILE}"
+    assert task.task_id.startswith("slskd|")
+    assert task.extra["release_id"] == f"peer|{BOOK_FILE}"
     assert task.extra["expected_files"] == ["Brandon Sanderson - Mistborn - The Final Empire.m4b"]
     assert task.local_dir == "Audiobooks"
     assert len(client.transfers.records) == 1
@@ -224,38 +230,38 @@ def audiobook_item(local):
     return {"author_name": AUTHOR, "title": TITLE, "bookId": 7, "dir": "Mistborn", "filename": "01.mp3", "expected_files": ["01.mp3"], "backend_name": "slskd", "media_type": "audiobook", "source_id": "peer", "username": "peer"}
 
 
-def test_rejected_import_records_the_peer(tmp_path):
-    local = tmp_path / "dl"
-    history = HistoryManager(str(tmp_path))
-    ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=RejectingReadarr(), history=history)
-
-    assert postprocess.process_imports(ctx, [audiobook_item(local)]) == {7: False}
-    # Otherwise the next run finds, downloads and fails on the same folder again
-    assert history.is_failed("peer", TITLE)
-
-
-def test_files_left_after_a_reported_import_are_moved_away(tmp_path):
-    local = tmp_path / "dl"
-    history = HistoryManager(str(tmp_path))
-    ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=RejectingReadarr(result="successful"), history=history)
-
-    assert postprocess.process_imports(ctx, [audiobook_item(local)]) == {7: False}
-    staged = local / postprocess.AUDIOBOOK_STAGING_DIR / "Brandon Sanderson" / "Mistborn The Final Empire"
-    assert not (staged / "01.mp3").exists()
-    assert (local / "failed_imports" / "Mistborn The Final Empire" / "01.mp3").exists()
-    assert history.is_failed("peer", TITLE)
+def test_rejected_import_retains_evidence_without_blaming_the_peer(tmp_path):
+    from test_v11_imports import setup
+    ctx, item, server, penalties = setup(tmp_path)
+    server.result, server.action = "unsuccessful", "none"
+    result = postprocess.process_imports(ctx, [item])[item["bookId"]]
+    assert result["phase"] == "needs_review"
+    assert all(os.path.isfile(p) for p in result["files"])
+    assert ctx.state.get_tasks_for_orchestrator()[0]["extra"]["import_pending"]["phase"] == "needs_review"
+    assert penalties == []
 
 
-def test_pending_import_that_fails_records_the_peer(tmp_path, monkeypatch):
+def test_success_report_without_output_evidence_keeps_staged_files(tmp_path):
+    from test_v11_imports import setup
+    ctx, item, server, penalties = setup(tmp_path)
+    server.result, server.action = "successful", "none"
+    result = postprocess.process_imports(ctx, [item])[item["bookId"]]
+    assert result["phase"] == "needs_review"
+    assert all(os.path.isfile(p) for p in result["files"])
+    assert not (server.root / "failed_imports").exists()
+    assert penalties == []
+
+
+def test_confirmed_rejection_does_not_create_generic_peer_penalty(tmp_path, monkeypatch):
     history = HistoryManager(str(tmp_path))
     state = StateManager(str(tmp_path))
     state.items = [{"task_id": "peer|d", "backend_name": "slskd", "book_title": TITLE, "author_name": AUTHOR, "book_id": 7, "filename": "01.mp3", "extra": {"username": "peer", "import_pending": {"local_dir": "/x"}}}]
     ctx = Context(config=make_config(), slskd=None, readarr=None, config_dir=str(tmp_path), history=history, state=state)
-    monkeypatch.setattr(postprocess, "check_pending_import", lambda readarr, pending: False)
+    monkeypatch.setattr(postprocess, "check_pending_import", lambda readarr, pending, **kwargs: False)
 
     results = workflow._RunResults(ctx, [])
     assert workflow._follow_up_pending_imports(ctx, results) == 0
-    assert history.is_failed("peer", TITLE)
+    assert not history.is_failed("peer", TITLE)
     assert results.failed_imports == [(AUTHOR, TITLE)]
     assert state.get_items() == []
 
@@ -265,7 +271,7 @@ def test_pending_import_that_fails_records_the_peer(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dropped_download_is_cancelled_and_its_files_moved(tmp_path):
+def test_legacy_download_with_missing_sizes_is_retained_for_review(tmp_path):
     folder = tmp_path / "Mistborn"
     folder.mkdir()
     (folder / "01.mp3").write_bytes(b"chapter")  # finished before the rest was lost
@@ -289,11 +295,14 @@ def test_dropped_download_is_cancelled_and_its_files_moved(tmp_path):
         }
     ]
 
-    assert workflow._resume_persisted(ctx) == []
-    assert ctx.state.get_items() == []
-    assert transfers.cancelled == ["t2"]  # nothing keeps downloading unattended
-    assert (tmp_path / "failed_downloads" / "Mistborn" / "01.mp3").exists()
-    assert not folder.exists()  # a retry starts from a clean folder
+    resumed = workflow._resume_persisted(ctx)
+    assert len(resumed) == 1
+    assert resumed[0].status == DownloadStatus.PENDING
+    assert resumed[0].extra["needs_review"]
+    assert resumed[0].extra["failure_kind"] == "legacy_unverified"
+    assert len(ctx.state.get_items()) == 1
+    assert transfers.cancelled == []
+    assert (folder / "01.mp3").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -578,9 +587,8 @@ def test_search_stuck_in_progress_does_not_hang(monkeypatch):
     client = Client(responses=[{"username": "peer", "files": []}], search_state="InProgress")
     ctx = Context(config=make_config(search={"search_timeout": "5000"}), slskd=client, readarr=None)
 
-    results, search_id = slskd_backend._execute_search(ctx, "Brandon Sanderson - Mistborn", "main")
-    assert search_id == "s1"
-    assert len(results) == 1
+    with pytest.raises(SearchIncomplete, match="bounded wait expired"):
+        slskd_backend._execute_search(ctx, "Brandon Sanderson - Mistborn", "main")
     assert client.searches.state_calls < 100
 
 

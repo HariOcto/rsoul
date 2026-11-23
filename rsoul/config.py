@@ -112,6 +112,9 @@ ENV_PREFIX = "RSOUL__"
 
 # Settings that must be finite numbers >= 0 (0 disables a limit where documented)
 NON_NEGATIVE_SETTINGS = [
+    ("Download Settings", "completed_file_settle_time"),
+    ("Search Settings", "search_min_interval"),
+    ("Search Settings", "search_rate_limit_max_wait"),
     ("Slskd", "request_timeout"),
     ("Readarr", "request_timeout"),
     ("Readarr", "import_poll_timeout"),
@@ -132,6 +135,9 @@ NON_NEGATIVE_SETTINGS = [
     ("Search Settings", "min_title_jaccard"),
     ("Search Settings", "min_author_jaccard"),
     ("Search Settings", "audiobook_min_size_mb"),
+    ("Search Settings", "audiobook_min_bitrate_kbps"),
+    ("Search Settings", "audiobook_duration_tolerance"),
+    ("Postprocessing", "failed_retention_days"),
     ("General", "batch_delay"),
 ]
 # Settings read as whole numbers, which must be >= 0
@@ -148,6 +154,7 @@ NON_NEGATIVE_INT_SETTINGS = [
 # On/off settings. Read in the middle of a run, a typo in one of these would otherwise make
 # every search or import fail, and each book look as if nobody shared it.
 BOOLEAN_SETTINGS = [
+    ("General", "log_api_versions"),
     ("Readarr", "disable_sync"),
     ("Slskd", "delete_searches"),
     ("Backends", "slskd_enabled"),
@@ -159,10 +166,13 @@ BOOLEAN_SETTINGS = [
 # Settings read as whole numbers, which must be >= 1
 POSITIVE_INT_SETTINGS = [
     ("Search Settings", "number_of_books_to_grab"),
+    ("Search Settings", "wanted_scan_pages"),
+    ("Search Settings", "wanted_backlog_limit"),
+    ("Search Settings", "search_query_budget"),
 ]
-_SENSITIVE = ("api_key", "password", "token", "secret")
+_SENSITIVE = ("api_key", "password", "token", "secret", "webhook")
 # Sections the code reads that the sample config.ini doesn't contain
-_EXTRA_SECTIONS = {"general": "General"}
+_EXTRA_SECTIONS = {"general": "General", "notifications": "Notifications"}
 
 
 def _section_key(name: str) -> str:
@@ -250,6 +260,19 @@ def validate_config(config: configparser.ConfigParser) -> None:
     tag_check = config.get("Postprocessing", "audiobook_tag_check", fallback="reject").strip().lower()
     if tag_check not in ("reject", "warn", "off"):
         raise ValueError(f"Configuration Error: [Postprocessing] audiobook_tag_check = '{tag_check}' must be reject, warn or off")
+
+    for option in ("audiobook_abridged", "audiobook_booktrack", "audiobook_dramatized"):
+        value = config.get("Search Settings", option, fallback="allow").strip().lower()
+        if value not in ("allow", "reject"):
+            raise ValueError(f"Configuration Error: [Search Settings] {option} must be allow or reject")
+    unknown = config.get("Search Settings", "audiobook_unknown_recording", fallback="warn").strip().lower()
+    if unknown not in ("allow", "warn", "reject"):
+        raise ValueError("Configuration Error: audiobook_unknown_recording must be allow, warn or reject")
+    ids = config.get("Search Settings", "excluded_book_ids", fallback="")
+    if any(not value.strip().isdigit() for value in ids.split(",") if value.strip()):
+        raise ValueError("Configuration Error: excluded_book_ids must be comma-separated numeric IDs")
+    if method == "scan" and get_media_mode(config) != EBOOK:
+        logger.warning("Audiobook import_method=scan delegates selection to the server. v11 still requires complete correlated import evidence; targeted is recommended for explicit book/edition selection.")
 
     # Placeholders from the sample config (e.g. YOUR_READARR_API_KEY) were never replaced
     enabled_sections = ["Readarr"]
@@ -358,3 +381,4 @@ class Context:
     state: Any = None  # StateManager for resume functionality
     ledger: Any = None  # BookLedger: books R:soul imported, or searched for in vain
     orchestrator: Any = None  # DownloadOrchestrator for backend management
+    wanted_queue: Any = None  # Durable page cursor and unattempted wanted records

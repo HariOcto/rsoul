@@ -60,3 +60,9 @@ Test first using a small, dispensable book or a disposable Chaptarr library.
 
 - **Import verification against Chaptarr's real fields.** v10.2 required every new book file to report `bookId` and `editionId` matching the request. Chaptarr's `BookFileResource` (v0.9.1000) has no `editionId` at all, and reports `bookId` 0 when the file's edition isn't loaded, so every targeted import would have stayed unverified and pending. The proof is now the query itself: a new file ID under `bookfile?bookId=N` is a file attached to book N. `bookId`/`editionId` still fail the check where a server reports them and they contradict the request.
 - **Edition selection explains a refusal** by logging the editions it saw (ID, reading format, monitored, title), so a refused import can be fixed in Chaptarr.
+
+## v10.4: first real targeted imports (22 November)
+
+- Targeted imports work on Chaptarr: Canal Dreams, Consider Phlebas and Complicity (65 files) were imported for the wanted records and verified by their new book-file IDs.
+- **Audiobook records without an audio edition.** Chaptarr's audiobook records often carry only ebook or print editions from the metadata provider (The Algebraist: one ebook edition; Cleaning up: two print editions). v10.2 refused those, which left their downloads staged and pending for good. Chaptarr's manual import only checks that the edition belongs to the book; the medium comes from the record and the files. So when the record itself is an audiobook record, its one monitored edition (or its only edition) is now used. An audio edition still wins where there is one; several monitored or none monitored is still refused.
+- The import summary names the folder instead of "Author: Unknown" for targeted imports.

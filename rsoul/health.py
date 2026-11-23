@@ -89,6 +89,8 @@ def check(config_dir: str, now: Optional[float] = None) -> tuple:
     except (OSError, ValueError, KeyError, TypeError):
         return False, "no status written yet"
     age = now - updated
+    if data.get("persistence_error"):
+        return False, "durable recovery checkpoint failed; inspect the log and data volume"
     if age > max_age():
         return False, f"status is {age:.0f}s old (limit {max_age():.0f}s): R:soul looks stuck or isn't running"
     return True, f"{data.get('state', '?')}, updated {age:.0f}s ago"

@@ -5,7 +5,10 @@ Persists grab_list to disk so downloads can be resumed after interruption.
 Uses (username, filename) as composite key since slskd IDs are ephemeral.
 """
 
+import copy
+import hashlib
 import json
+import math
 import os
 import shutil
 import logging
@@ -13,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from .persistence import StatePersistenceError, atomic_write_json, fsync_directory
 
 if TYPE_CHECKING:
     pass
@@ -36,6 +40,7 @@ class StateManager:
         self.read_only = read_only
         self.filepath = Path(config_dir) / STATE_FILENAME
         self.items: List[Dict[str, Any]] = []
+        self.load_error = None
         # Imports finish on a background thread while the monitoring thread handles failures;
         # both update the state, so every change and save is serialized.
         self._lock = threading.RLock()
@@ -53,13 +58,15 @@ class StateManager:
             if not isinstance(items, list):
                 raise ValueError("expected a list of saved downloads")
         except ValueError as e:  # includes json.JSONDecodeError
-            kept = self._keep_damaged_copy(move=True)
+            kept = self._keep_damaged_copy(move=False)
             logger.error(f"State file is damaged ({e}); starting fresh." + (f" The damaged file was kept as {kept}" if kept else ""))
             self.items = []
+            self.load_error = f"The recovery state was damaged: {e}. Inspect the saved damaged copy before resuming mutations."
             return
         except Exception as e:
             logger.error(f"Error loading state file: {e}")
             self.items = []
+            self.load_error = f"Could not read recovery state: {e}"
             return
 
         self.items = [item for item in items if self._usable(item)]
@@ -67,6 +74,7 @@ class StateManager:
         if dropped:
             kept = self._keep_damaged_copy(move=False)
             logger.error(f"Ignoring {dropped} damaged entr{'y' if dropped == 1 else 'ies'} in the state file." + (f" A copy of the file was kept as {kept}" if kept else ""))
+            self.load_error = f"{dropped} damaged recovery entries need review; inspect the damaged copy before resuming mutations."
         logger.info(f"Loaded {len(self.items)} items from state file")
 
     @staticmethod
@@ -86,7 +94,7 @@ class StateManager:
             return isinstance(value, str) and (empty_ok or bool(value))
 
         def number(value: Any) -> bool:
-            return isinstance(value, (int, float)) and not isinstance(value, bool)
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
         files = extra.get("files", [])
         if not isinstance(files, list):
@@ -136,26 +144,62 @@ class StateManager:
             return ""
 
     def _save(self) -> None:
-        """Atomic write to disk using temp file + rename."""
+        """Commit a checkpoint, or fail before the caller performs its next mutation."""
         if self.read_only:
             return
         with self._lock:
-            try:
-                temp_path = self.filepath.with_suffix(".tmp")
+            if self.load_error:
+                raise StatePersistenceError(self.load_error)
+            atomic_write_json(self.filepath, self.items)
+            logger.debug(f"State saved: {len(self.items)} items")
 
-                with open(temp_path, "w") as f:
-                    json.dump(self.items, f, indent=2)
+    def ensure_writable(self) -> None:
+        """Preflight the actual durable store, without discarding pending work."""
+        if self.read_only:
+            raise StatePersistenceError("Recovery state is read-only; mutations are disabled")
+        self._save()
 
-                # Atomic swap
-                os.replace(temp_path, self.filepath)
-                logger.debug(f"State saved: {len(self.items)} items")
-
-            except Exception as e:
-                logger.error(f"Error saving state file: {e}")
+    def _commit(self, items) -> None:
+        previous = self.items
+        self.items = copy.deepcopy(items)
+        try:
+            self._save()
+        except Exception:
+            self.items = previous
+            raise
 
     def has_pending_state(self) -> bool:
         """Check if there's a saved state to resume."""
-        return len(self.items) > 0
+        with self._lock:
+            return len(self.items) > 0
+
+    def migrate_legacy_tasks(self) -> int:
+        """Give pre-task-ID records stable identities without losing their evidence."""
+        with self._lock:
+            converted = []
+            changed = 0
+            for old in self.items:
+                if "task_id" in old:
+                    converted.append(old)
+                    continue
+                raw = json.dumps(old, sort_keys=True, default=str).encode("utf-8")
+                extra = {k: copy.deepcopy(old[k]) for k in ("username", "files", "expected_files", "media_type") if k in old}
+                extra["file_dir"] = old.get("full_dir", "")
+                extra["legacy_state"] = copy.deepcopy(old)
+                extra.setdefault("media_type", "ebook")
+                converted.append({
+                    "task_id": "legacy-" + hashlib.sha256(raw).hexdigest()[:24],
+                    "backend_name": old.get("backend_name", "slskd"),
+                    "book_title": old.get("title", ""), "author_name": old.get("author_name", ""),
+                    "book_id": old.get("bookId", 0), "filename": old.get("filename", ""),
+                    "local_dir": old.get("dir", ""), "series_title": old.get("seriesTitle", ""),
+                    "extra": extra, "timestamp": old.get("timestamp", time.time()),
+                })
+                changed += 1
+            if changed:
+                self._commit(converted)
+                logger.warning("Migrated %s legacy task(s); unprovable completion will require review", changed)
+            return changed
 
     def add_item(self, item: Dict[str, Any]) -> None:
         """Add an item to state and persist.
@@ -177,8 +221,7 @@ class StateManager:
                 "backend_name": item.get("backend_name", "slskd"),
                 "timestamp": time.time(),
             }
-            self.items.append(state_item)
-            self._save()
+            self._commit(self.items + [state_item])
 
     def add_task(self, task: Any) -> None:
         """Add a DownloadTask to state and persist.
@@ -199,29 +242,30 @@ class StateManager:
                 "extra": task.extra,
                 "timestamp": time.time(),
             }
-            self.items.append(state_item)
-            self._save()
+            items = copy.deepcopy(self.items)
+            for index, item in enumerate(items):
+                if item.get("task_id") == task.task_id:
+                    state_item["timestamp"] = item.get("timestamp", state_item["timestamp"])
+                    items[index] = state_item
+                    break
+            else:
+                items.append(state_item)
+            self._commit(items)
 
     def update_task(self, task: Any) -> None:
         """Refresh a persisted task (current files, timers) before handing it to the next run."""
-        with self._lock:
-            for item in self.items:
-                if item.get("task_id") == task.task_id:
-                    item["extra"] = task.extra
-                    item["local_dir"] = getattr(task, "local_dir", item.get("local_dir", ""))
-                    item["filename"] = task.filename
-                    self._save()
-                    return
-            self.add_task(task)
+        self.add_task(task)
 
     def set_extra(self, task_id: str, extra: Dict[str, Any]) -> None:
         """Replace a saved task's extra data (e.g. a follow-up on a pending import)."""
         with self._lock:
-            for item in self.items:
+            items = copy.deepcopy(self.items)
+            for item in items:
                 if item.get("task_id") == task_id:
-                    item["extra"] = extra
-                    self._save()
+                    item["extra"] = copy.deepcopy(extra)
+                    self._commit(items)
                     return
+            raise StatePersistenceError(f"Cannot checkpoint missing task {task_id}; refusing an untracked mutation")
 
     def remove_task(self, task_id: str) -> None:
         """Remove a task by its task_id.
@@ -230,8 +274,7 @@ class StateManager:
             task_id: Unique task identifier
         """
         with self._lock:
-            self.items = [item for item in self.items if item.get("task_id") != task_id]
-            self._save()
+            self._commit([item for item in self.items if item.get("task_id") != task_id])
 
     def get_tasks_for_orchestrator(self) -> List[Dict[str, Any]]:
         """Get items formatted for orchestrator resume.
@@ -239,7 +282,8 @@ class StateManager:
         Returns:
             List of task data dicts for DownloadOrchestrator.resume_tasks()
         """
-        return [item for item in self.items if "task_id" in item]
+        with self._lock:
+            return copy.deepcopy([item for item in self.items if "task_id" in item])
 
     def remove_item(self, username: str, filename: str) -> None:
         """Remove an item by composite key (username, filename).
@@ -251,8 +295,7 @@ class StateManager:
         with self._lock:
             filename_basename = filename.split("\\")[-1] if "\\" in filename else filename
 
-            self.items = [item for item in self.items if not self._matches_composite_key(item, username, filename_basename)]
-            self._save()
+            self._commit([item for item in self.items if not self._matches_composite_key(item, username, filename_basename)])
 
     def _matches_composite_key(self, item: Dict[str, Any], username: str, filename_basename: str) -> bool:
         """Check if item matches the composite key."""
@@ -267,12 +310,17 @@ class StateManager:
     def clear(self) -> None:
         """Clear all state and delete file."""
         with self._lock:
-            self.items = []
+            self._commit([])
             if self.filepath.exists() and not self.read_only:
-                self.filepath.unlink()
+                try:
+                    self.filepath.unlink()
+                    fsync_directory(self.filepath.parent)
+                except OSError as exc:
+                    raise StatePersistenceError(f"Could not clear recovery state: {exc}") from exc
                 logger.info("State file deleted - all items processed")
 
     def get_items(self) -> List[Dict[str, Any]]:
         """Get all items from state."""
-        return self.items.copy()
+        with self._lock:
+            return copy.deepcopy(self.items)
 

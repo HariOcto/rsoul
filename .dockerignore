@@ -15,9 +15,15 @@ env
 *.patch
 *.zip
 # Runtime files that may exist in a checkout used for local runs
-grab_list_state.json
+grab_list_state.json*
 *.tmp
 failed_downloads.json
+book_ledger.json
+wanted_queue.json
+slskd_search_backoff.json
+diagnostics.json
+dry_run_report.txt
+.rsoul-import-journal
 failure_list.txt
 health.json
 .current_page.txt

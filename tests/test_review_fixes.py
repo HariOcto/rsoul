@@ -96,10 +96,13 @@ def test_resumed_audiobook_counts_chapters_already_on_disk(tmp_path):
                 {
                     "username": "peer",
                     "directories": [
-                        {"directory": "@@s\\Mistborn", "files": [{"id": "a", "filename": "@@s\\Mistborn\\03.mp3", "size": 1000, "state": "InProgress"}]}
+                        {"directory": "@@s\\Mistborn", "files": [{"id": "a", "filename": "@@s\\Mistborn\\03.mp3", "size": 1000, "state": "InProgress", "bytesTransferred": 400}]}
                     ],
                 }
             ]
+
+        def get_downloads(self, username):
+            return self.get_all_downloads()[0]
 
         def get_download(self, username, id):
             return {"state": "InProgress", "bytesTransferred": 400}
@@ -117,10 +120,13 @@ def test_resumed_audiobook_counts_chapters_already_on_disk(tmp_path):
             "book_id": 7,
             "filename": "01.mp3",
             "local_dir": "Mistborn",
-            "extra": {"username": "peer", "file_dir": "@@s\\Mistborn", "media_type": "audiobook", "expected_files": ["01.mp3", "02.mp3", "03.mp3"]},
+            "extra": {"username": "peer", "file_dir": "@@s\\Mistborn", "media_type": "audiobook", "expected_files": ["01.mp3", "02.mp3", "03.mp3"],
+                      "files": [{"filename": f"@@s\\Mistborn\\{name}", "size": 1000, "id": id_}
+                                for name, id_ in [("01.mp3", "cleared-1"), ("02.mp3", "cleared-2"), ("03.mp3", "a")]]},
         }
     )
-    assert resumed.extra["offline_bytes"] == 2000
+    assert len(resumed.extra["manifest"]) == 3
+    assert resumed.extra["progress"]["files_complete"] == 2
     assert resumed.bytes_transferred == 2400
     assert round(resumed.progress_percent) == 80
 
@@ -279,7 +285,7 @@ def test_queue_timer_started_at_zero():
     assert o.check_timeouts(t, now=300) is not None
 
 
-# 8. Failed imports are moved using R:soul's own path, not Chaptarr's
+# 8. Command failure keeps local files; mapping helpers use R:soul's path
 
 
 def test_to_local_path():
@@ -287,7 +293,7 @@ def test_to_local_path():
     assert postprocess.to_local_path("/elsewhere/A", "/chaptarr/dl", "/rsoul/dl") == "/elsewhere/A"
 
 
-def test_failed_import_folder_is_moved_locally(tmp_path):
+def test_failed_import_command_retains_ambiguous_local_files(tmp_path):
     local = tmp_path / "dl"
     book_dir = local / "rsoul_audiobooks" / "Author" / "Title"
     book_dir.mkdir(parents=True)
@@ -297,12 +303,11 @@ def test_failed_import_folder_is_moved_locally(tmp_path):
         def get_command(self, id_):
             return {"id": 1, "status": "completed", "message": "No files found are eligible for import", "body": {"path": "/chaptarr/dl/rsoul_audiobooks/Author/Title"}}
 
-    postprocess.monitor_imports(Client(), [{"id": 1}], "/chaptarr/dl", str(local))
+    result = postprocess.monitor_imports(Client(), [{"id": 1}], "/chaptarr/dl", str(local))
 
-    assert not book_dir.exists()
-    # In <download_dir>/failed_imports like every other failed import, not inside the staging area
-    assert (local / "failed_imports" / "Title" / "01.mp3").exists()
-    assert not (local / "rsoul_audiobooks" / "Author").exists()
+    assert result == {1: False}  # A command outcome alone never proves content failure.
+    assert (book_dir / "01.mp3").read_bytes() == b"x"
+    assert not (local / "failed_imports").exists()
 
 
 # 9. Folders named without the series part of the title still match

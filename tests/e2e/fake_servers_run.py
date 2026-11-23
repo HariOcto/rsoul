@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -26,9 +28,10 @@ LOG = {"chaptarr": [], "slskd": []}
 BOOK1_DIR = "@@alice\\Audiobooks\\Brandon Sanderson\\Mistborn - The Final Empire (2006) [Michael Kramer]"
 BOOK2_DIR = "@@alice\\Audiobooks\\Brandon Sanderson\\The Way of Kings\\CD1"
 DECOY_DIR = "@@bob\\Audiobooks\\Someone Else\\The Final Empire"
-CH = {BOOK1_DIR: [(f"{i:02d} - Chapter {i}.mp3", 1000 + i) for i in range(1, 13)],
-      BOOK2_DIR: [(f"{i:02d}.mp3", 2000) for i in range(1, 6)],
-      DECOY_DIR: [(f"{i:02d}.mp3", 3000) for i in range(1, 4)]}
+SILENCE = (Path(REPO) / "tests" / "fixtures" / "silence.mp3").read_bytes()
+CH = {BOOK1_DIR: [(f"{i:02d} - Chapter {i}.mp3", len(SILENCE)) for i in range(1, 13)],
+      BOOK2_DIR: [(f"{i:02d}.mp3", len(SILENCE)) for i in range(1, 6)],
+      DECOY_DIR: [(f"{i:02d}.mp3", len(SILENCE)) for i in range(1, 4)]}
 
 # ------------------------------------------------------------------ fake slskd
 # A finished download that belongs to another tool sharing slskd (e.g. Soularr for music);
@@ -64,7 +67,7 @@ def advance():
                 leaf = t["filename"].rsplit("\\", 1)[0].split("\\")[-1]  # ${SOURCE_DIRECTORY}
                 os.makedirs(os.path.join(DL, leaf), exist_ok=True)
                 with open(os.path.join(DL, leaf, t["filename"].rsplit("\\", 1)[1]), "wb") as f:
-                    f.write(b"\0" * t["size"])
+                    f.write(SILENCE)
 
 class Slskd(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -139,6 +142,7 @@ class Slskd(BaseHTTPRequestHandler):
 BOOKS = {1: {"id": 1, "title": "Mistborn: The Final Empire", "authorId": 10, "mediaType": "audiobook", "monitored": True},
          2: {"id": 2, "title": "The Way of Kings", "authorId": 10, "mediaType": "audiobook", "monitored": True}}
 commands = {}
+bookfiles, events = [], []
 
 class Chaptarr(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -153,7 +157,17 @@ class Chaptarr(BaseHTTPRequestHandler):
             recs = [b for b in BOOKS.values() if q.get("mediaType", ["audiobook"])[0] == b["mediaType"]]
             return self.send(200, {"page": 1, "pageSize": 10, "totalRecords": len(recs), "records": recs})
         if p == "/author/10": return self.send(200, {"id": 10, "authorName": "Brandon Sanderson"})
-        if p == "/edition": return self.send(200, [])
+        if p == "/system/status": return self.send(200, {"version": "v11-test-fixture"})
+        if p == "/edition": return self.send(200, [{"id": 11, "monitored": True, "readingFormatId": 2}])
+        if p == "/book": return self.send(200, list(BOOKS.values()))
+        if p == "/bookfile": return self.send(200, bookfiles)
+        if p == "/history": return self.send(200, {"records": events, "totalRecords": len(events)})
+        if p == "/manualimport":
+            folder = q["folder"][0]
+            return self.send(200, [{"path": str(f), "quality": {"quality": {"id": 1, "name": "MP3"}}}
+                                  for f in Path(folder).glob("*.mp3")])
+        m = re.fullmatch(r"/book/(\d+)", p)
+        if m: return self.send(200, BOOKS[int(m.group(1))])
         m = re.fullmatch(r"/command/(\d+)", p)
         if m:
             c = commands[int(m.group(1))]
@@ -163,16 +177,25 @@ class Chaptarr(BaseHTTPRequestHandler):
         u = urlparse(self.path); n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n))
         LOG["chaptarr"].append(("POST", u.path, data))
         cid = len(commands) + 1
-        path = data.get("path", "")
-        audio = [f for f in os.listdir(path) if f.endswith(".mp3")] if os.path.isdir(path) else []
-        ok = len(audio) > 0  # Chaptarr: audio extension -> audiobook import
+        sources = [f["path"] for f in data.get("files", [])]
+        path = data.get("path", "") or (os.path.dirname(sources[0]) if sources else "")
+        if not sources and os.path.isdir(path):
+            sources = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".mp3")]
+        ok = bool(sources) and all(os.path.isfile(f) for f in sources)
         if ok:  # like Chaptarr, move the imported files into the library
-            dest = os.path.join(LIBRARY, os.path.basename(path))
+            dest = os.path.join(LIBRARY, "Mistborn The Final Empire")
             os.makedirs(dest, exist_ok=True)
-            for f in audio:
-                os.replace(os.path.join(path, f), os.path.join(dest, f))
+            for source in sources:
+                output = os.path.join(dest, os.path.basename(source))
+                size = os.path.getsize(source)
+                os.replace(source, output)
+                file_id = len(bookfiles) + 100
+                bookfiles.append({"id": file_id, "bookId": 1, "authorId": 10, "mediaType": "audiobook", "path": output, "size": size})
+                events.append({"id": file_id, "bookId": 1, "authorId": 10, "eventType": "bookFileImported",
+                               "date": datetime.now(timezone.utc).isoformat(),
+                               "data": {"FileId": str(file_id), "DroppedPath": source, "ImportedPath": output}})
         commands[cid] = {"id": cid, "name": data["name"], "status": "completed", "result": "successful" if ok else "unsuccessful",
-                         "message": f"Imported {len(audio)} files" if ok else "Failed to import", "body": {"path": path}}
+                         "message": f"Imported {len(sources)} files" if ok else "Failed to import", "body": {"path": path}}
         self.send(201, dict(commands[cid], status="queued"))
 
 def serve(handler):
@@ -238,6 +261,7 @@ if STALL["on"]:
     print("  import commands:", len([c for c in LOG["chaptarr"] if c[0] == "POST"]))
     print("  cancelled transfers:", sum(t["state"] == "Completed, Cancelled" for t in transfers.values()))
     print("  leftovers moved to failed_downloads:", {d: len(os.listdir(os.path.join(fd, d))) for d in os.listdir(fd)} if os.path.isdir(fd) else "none")
+    print("  failed-download chapters preserved:", len(list(Path(fd).rglob("*.mp3"))))
     print("  local download folder still has files:", [d for d in os.listdir(DL) if d not in ("failed_downloads",)])
     STALL["on"] = False
     main_mod.main()
@@ -250,14 +274,16 @@ browses = [c for c in LOG["slskd"] if c[0] == "POST" and "/directory" in c[1]]
 print(f"run took {elapsed:.1f}s")
 print("wanted list filtered to audiobooks:", all(c[2].get("mediaType") == ["audiobook"] for c in wanted))
 print("folders browsed:", [c[1] for c in browses])
-print("import commands:", [(c[2]["name"], c[2]["path"].replace(DL, "<dl>")) for c in posts])
+print("import commands:", [(c[2]["name"], (c[2].get("path") or os.path.dirname(c[2]["files"][0]["path"])).replace(DL, "<dl>")) for c in posts])
 imported_dir = os.path.join(LIBRARY, "Mistborn The Final Empire")
 print("book 1 imported files:", len(os.listdir(imported_dir)) if os.path.isdir(imported_dir) else "MISSING", "of 12")
 print("files left in staging:", sum(len(f) for _, _, f in os.walk(os.path.join(DL, "rsoul_audiobooks"))))
 print("decoy (other author) enqueued:", any(t["username"] == "bob" for t in transfers.values()))
 print("disc folder enqueued:", any("CD1" in t["filename"] for t in transfers.values()))
 print("state file left behind:", os.path.exists(os.path.join(CFG, "grab_list_state.json")))
-print("leftover download folders:", sorted(d for d in os.listdir(DL)))
+print("leftover download folders:", sorted(d for d in os.listdir(DL) if not d.startswith(".")))
+source_dir = Path(DL) / BOOK1_DIR.rsplit("\\", 1)[-1]
+print("source download folder empty:", not source_dir.exists() or not list(source_dir.iterdir()))
 print("config.ini in data folder:", os.path.exists(os.path.join(CFG, "config.ini")))
 print("foreign slskd transfer kept:", "soularr-1" in transfers)
 print("cleared all finished transfers:", any(c == ("DELETE", "/api/v0/transfers/downloads/all/completed") for c in LOG["slskd"]))

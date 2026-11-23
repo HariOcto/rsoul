@@ -9,12 +9,15 @@ import configparser
 import os
 import sys
 import threading
+import tempfile
+import pytest
+import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rsoul import download as download_module
 from rsoul import postprocess, workflow
-from rsoul.backends.base import DownloadStatus, DownloadTarget, DownloadTask
+from rsoul.backends.base import BackendUnavailable, DownloadStatus, DownloadTarget, DownloadTask
 from rsoul.backends.slskd_backend import SlskdBackend
 from rsoul.config import Context
 from rsoul.match import audiobook_folder_match, is_disc_folder
@@ -75,11 +78,15 @@ class Users:
 class Client:
     def __init__(self, users=None, transfers=None):
         self.users = users or Users()
-        self.transfers = transfers
+        self.transfers = transfers if transfers is not None else ListTransfers([])
 
 
 def backend(client=None, **config):
-    return SlskdBackend(Context(config=make_config(**config), slskd=client or Client(), readarr=None))
+    storage = tempfile.TemporaryDirectory()
+    ctx = Context(config=make_config(**config), slskd=client or Client(), readarr=None,
+                  config_dir=storage.name, state=StateManager(storage.name))
+    ctx._test_storage = storage
+    return SlskdBackend(ctx)
 
 
 def target_dict(t):
@@ -203,11 +210,11 @@ def test_ebook_resume_uses_saved_id():
     assert task.extra["slskd_id"] == "new"
 
 
-def test_old_state_without_ids_prefers_active_record():
+def test_old_state_without_ids_keeps_ambiguous_records_for_review():
     records = [rec("new", "InProgress", done=5), rec("old", "Completed, Errored")]
     b = backend(Client(transfers=ListTransfers(records)))
-    task = b.reconcile_task(
-        {
+    with pytest.raises(BackendUnavailable, match="Several transfer records"):
+        b.reconcile_task({
             "task_id": "t",
             "book_title": "b",
             "author_name": "a",
@@ -215,9 +222,7 @@ def test_old_state_without_ids_prefers_active_record():
             "filename": "01.mp3",
             "local_dir": "Mistborn",
             "extra": {"username": "peer", "file_dir": D, "media_type": "audiobook", "expected_files": ["01.mp3"]},
-        }
-    )
-    assert task.status == DownloadStatus.DOWNLOADING
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +288,9 @@ def test_failed_download_leftovers_are_moved_aside(tmp_path):
     task = DownloadTask("t", "slskd", DownloadStatus.FAILED, TITLE, AUTHOR, 7, "01.mp3", local_dir="Mistborn")
     task.extra = {"expected_files": ["01.mp3", "02.mp3"]}
 
-    b.discard(task)
+    assert b.discard(task) is True
 
-    assert (tmp_path / "failed_downloads" / "Mistborn" / "01.mp3").exists()
+    assert list((tmp_path / "failed_downloads").glob("Mistborn-*/01.mp3"))
     assert (folder / "unrelated.epub").exists()
 
 
@@ -294,6 +299,9 @@ def test_workflow_discards_on_failure(tmp_path):
 
     class Backend:
         name = "slskd"
+
+        def cleanup(self, task):
+            return True
 
         def discard(self, task):
             calls.append(task.task_id)
@@ -327,8 +335,9 @@ def test_failed_audiobook_import_leaves_other_files(tmp_path):
         [{"author_name": "A", "title": "T", "bookId": 1, "dir": "MP3", "filename": "01.mp3", "expected_files": ["01.mp3", "02.mp3"], "backend_name": "slskd", "media_type": "audiobook"}],
     )
 
-    assert result == {1: False}
-    assert (tmp_path / "failed_imports" / "MP3" / "01.mp3").exists()
+    assert result[1]["phase"] == "needs_review"
+    assert (shared / "01.mp3").exists()
+    assert not (tmp_path / "failed_imports").exists()
     assert (shared / "other-book.mp3").exists()
 
 
@@ -350,7 +359,7 @@ def test_percent_progress_is_not_a_stall():
 # ---------------------------------------------------------------------------
 
 
-def test_missing_chapter_counts_as_failed_import(tmp_path):
+def test_missing_chapter_remains_pending_for_review(tmp_path):
     (tmp_path / "Mistborn").mkdir()
     ctx = Context(config=make_config(slskd={"download_dir": str(tmp_path)}), slskd=None, readarr=None, config_dir=str(tmp_path))
     results = workflow._RunResults(ctx, [])
@@ -361,25 +370,19 @@ def test_missing_chapter_counts_as_failed_import(tmp_path):
     results.wait_for_imports()
 
     assert results.completed_tasks == []
-    assert results.failed_imports == [(AUTHOR, TITLE)]
+    assert results.failed_imports == []
+    assert results.pending_imports == [(AUTHOR, TITLE)]
 
 
-def test_unsuccessful_import_command_counts_as_failed(tmp_path):
-    local = tmp_path / "dl"
-    (local / "Mistborn").mkdir(parents=True)
-    (local / "Mistborn" / "01.mp3").write_bytes(b"x")
-
-    class Readarr:
-        def post_command(self, name, **kwargs):
-            return {"id": 1, "body": {"path": kwargs["path"]}}
-
-        def get_command(self, id_):
-            # What Readarr/Chaptarr report when nothing could be imported
-            return {"id": 1, "status": "completed", "result": "unsuccessful", "message": "", "body": {"path": "/elsewhere"}}
-
-    ctx = Context(config=make_config(slskd={"download_dir": str(local)}), slskd=None, readarr=Readarr())
-    item = {"author_name": AUTHOR, "title": TITLE, "bookId": 7, "dir": "Mistborn", "filename": "01.mp3", "expected_files": ["01.mp3"], "backend_name": "slskd", "media_type": "audiobook"}
-    assert postprocess.process_imports(ctx, [item]) == {7: False}
+def test_unsuccessful_import_command_retains_real_audio_and_journal(tmp_path):
+    from test_v11_imports import setup
+    ctx, item, server, penalties = setup(tmp_path)
+    server.result, server.action = "unsuccessful", "none"
+    outcome = postprocess.process_imports(ctx, [item])[item["bookId"]]
+    assert outcome["phase"] == "needs_review"
+    assert "unsuccessful" in outcome["reason"]
+    assert all(os.path.isfile(path) for path in outcome["files"])
+    assert len(server.posts) == 1 and penalties == []
 
 
 def test_import_command_timeout(monkeypatch):
@@ -441,7 +444,7 @@ def test_max_active_downloads(tmp_path):
 def test_slow_import_does_not_block_monitoring(monkeypatch, tmp_path):
     second_polled = threading.Event()
 
-    def slow_import(ctx, items):
+    def slow_import(ctx, items, **kwargs):
         # Would deadlock (and time out) if monitoring waited for this import
         assert second_polled.wait(timeout=5), "monitoring was blocked by the import"
         return {items[0]["bookId"]: True}
@@ -662,18 +665,27 @@ def test_import_monitor_retries_transient_errors(monkeypatch):
     assert postprocess.monitor_imports(Readarr(), [{"id": 1}]) == {1: True}
 
 
-def test_import_thread_error_does_not_abort_the_run(monkeypatch, tmp_path):
-    def broken_import(ctx, items):
+def test_import_thread_checkpoint_error_halts_future_mutations(monkeypatch, tmp_path):
+    from rsoul.persistence import StatePersistenceError
+    def broken_import(ctx, items, **kwargs):
         return {items[0]["bookId"]: True}
 
     monkeypatch.setattr(workflow.postprocess, "process_imports", broken_import)
 
     class BrokenState:
+        def update_task(self, task):
+            pass
+
+        def get_tasks_for_orchestrator(self):
+            return []
+
         def remove_task(self, task_id):
-            raise OSError("disk full")
+            raise StatePersistenceError("disk full")
 
     ctx = Context(config=make_config(), slskd=None, readarr=None, config_dir=str(tmp_path), state=BrokenState())
     results = workflow._RunResults(ctx, [])
     results.on_complete(DownloadTask("t", "fake", DownloadStatus.COMPLETED, "b", "a", 1, "f"))
-    results.wait_for_imports()  # must not raise
+    with pytest.raises(StatePersistenceError, match="disk full"):
+        results.wait_for_imports()
+    assert isinstance(ctx.fatal_state_error, StatePersistenceError)
     assert len(results.completed_tasks) == 1

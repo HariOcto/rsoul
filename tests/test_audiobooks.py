@@ -1,6 +1,7 @@
 import configparser
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -15,6 +16,7 @@ from rsoul.match import audiobook_folder_match, clean_audiobook_name
 from rsoul.search import get_books
 from rsoul import postprocess
 from rsoul.config import Context
+from rsoul.state import StateManager
 
 MB = 1024 * 1024
 
@@ -232,7 +234,9 @@ def no_sleep(monkeypatch):
 
 def make_backend(slskd, **search_settings):
     config = make_config(**search_settings)
-    ctx = Context(config=config, slskd=slskd, readarr=None)
+    storage = tempfile.TemporaryDirectory(prefix="rsoul-test-state-")
+    ctx = Context(config=config, slskd=slskd, readarr=None, config_dir=storage.name, state=StateManager(storage.name))
+    ctx._test_storage = storage
     return SlskdBackend(ctx)
 
 
@@ -298,25 +302,30 @@ def test_audiobook_download_enqueues_whole_folder():
     task = backend.download(audiobook_target(), result)
 
     assert task is not None
-    assert task.task_id == f"peer|{directory}"
+    assert task.task_id.startswith("slskd|")
+    assert task.extra["release_id"] == f"peer|{directory}"
     assert len(task.extra["files"]) == 8
     assert len(task.extra["expected_files"]) == 8
     assert task.extra["media_type"] == "audiobook"
     assert task.local_dir == "Mistborn - The Final Empire"
 
 
-def test_audiobook_download_cancels_when_files_missing():
+def test_audiobook_partial_registration_keeps_durable_intent():
     backend = make_backend(FakeSlskd(register_count=5))
     result, _ = _audiobook_result(backend)
 
     task = backend.download(audiobook_target(), result)
 
-    assert task is None
-    # (the transfer list is checked more than once for late arrivals; this fake keeps listing them)
-    assert len(set(backend.client.transfers.cancelled)) == 5
+    assert task is not None
+    assert task.status == DownloadStatus.PENDING
+    assert task.extra["enqueue"]["phase"] == "unknown"
+    assert len(task.extra["manifest"]) == 8
+    assert sum(bool(f.get("id")) for f in task.extra["files"]) == 5
+    assert backend.client.transfers.cancelled == []
+    assert backend.ctx.state.get_tasks_for_orchestrator()[0]["task_id"] == task.task_id
 
 
-def test_reconcile_audiobook_all_on_disk(tmp_path):
+def test_reconcile_legacy_disk_files_without_sizes_remains_unverified(tmp_path):
     backend = make_backend(FakeSlskd())
     backend.config["Slskd"]["download_dir"] = str(tmp_path)
     folder = tmp_path / "Mistborn - The Final Empire"
@@ -339,7 +348,9 @@ def test_reconcile_audiobook_all_on_disk(tmp_path):
     )
 
     assert task is not None
-    assert task.status == DownloadStatus.COMPLETED
+    assert task.status == DownloadStatus.PENDING
+    assert task.extra["needs_review"]
+    assert task.extra["failure_kind"] == "legacy_unverified"
 
 
 def test_reconcile_audiobook_fails_when_files_lost(tmp_path):
@@ -358,7 +369,9 @@ def test_reconcile_audiobook_fails_when_files_lost(tmp_path):
             "extra": {"username": "peer", "file_dir": "x", "media_type": "audiobook", "expected_files": ["01.mp3"]},
         }
     )
-    assert task is None
+    assert task is not None
+    assert task.status == DownloadStatus.PENDING
+    assert task.extra["failure_kind"] == "legacy_unverified"
 
 
 # ---------------------------------------------------------------------------
@@ -367,37 +380,68 @@ def test_reconcile_audiobook_fails_when_files_lost(tmp_path):
 
 
 class FakeImportClient:
+    ver_uri = "/api/v1"
+
     def __init__(self):
         self.commands = []
+        self.bookfiles = []
+        self.events = []
+
+    def get_book(self, book_id):
+        return {"id": 7, "authorId": 11, "title": TITLE, "mediaType": "audiobook", "foreignBookId": "mistborn-work"}
+
+    def get_author(self, author_id):
+        return {"id": 11, "authorName": AUTHOR, "foreignAuthorId": "sanderson-author"}
+
+    def _get(self, resource, ver_uri=None, params=None):
+        if resource == "bookfile":
+            return list(self.bookfiles)
+        if resource == "history":
+            return {"records": list(self.events), "totalRecords": len(self.events)}
+        if resource == "book":
+            return [self.get_book(7)]
+        raise AssertionError(resource)
 
     def post_command(self, name, **kwargs):
         self.commands.append((name, kwargs))
         return {"id": len(self.commands)}
 
     def get_command(self, id_):
-        return {"id": id_, "status": "completed", "message": "Imported 1 book", "body": {"path": self.commands[id_ - 1][1]["path"]}}
+        return {"id": id_, "status": "completed", "result": "successful", "message": "Imported 1 book", "body": {"path": self.commands[id_ - 1][1]["path"]}}
 
 
 def test_audiobook_import_moves_folder_and_scans_book_folder(tmp_path):
+    from datetime import datetime, timezone
+    from pathlib import Path
     local = tmp_path / "downloads"
     source = local / "Mistborn - The Final Empire"
     source.mkdir(parents=True)
     names = [f"{i:02d}.mp3" for i in range(1, 4)]
+    audio = (Path(__file__).parent / "fixtures" / "silence.mp3").read_bytes()
     for n in names:
-        (source / n).write_bytes(b"audio")
+        (source / n).write_bytes(audio)
 
     config = make_config()
     config["Slskd"]["download_dir"] = str(local)
     config["Slskd"]["readarr_download_dir"] = "/chaptarr/downloads"
-    book_dir = local / postprocess.AUDIOBOOK_STAGING_DIR / "Brandon Sanderson" / "Mistborn The Final Empire"
+    config["Readarr"].update(import_method="scan", import_poll_timeout="0")
     staged = []
 
     class ImportingClient(FakeImportClient):
         """Like Chaptarr: the import moves the files out of the download folder."""
 
         def post_command(self, name, **kwargs):
+            book_dir = local / kwargs["path"].removeprefix("/chaptarr/downloads/")
             staged.extend(sorted(os.listdir(book_dir)))
             for n in os.listdir(book_dir):
+                file_id = 100 + len(self.bookfiles)
+                destination = f"/library/{file_id}.mp3"
+                size = (book_dir / n).stat().st_size
+                self.bookfiles.append({"id": file_id, "bookId": 7, "authorId": 11, "mediaType": "audiobook", "path": destination, "size": size})
+                self.events.append({"id": file_id, "bookId": 7, "authorId": 11,
+                                    "date": datetime.now(timezone.utc).isoformat(), "eventType": "bookFileImported",
+                                    "data": {"FileId": str(file_id), "DroppedPath": kwargs["path"] + "/" + n,
+                                             "ImportedPath": destination, "Size": str(size)}})
                 os.remove(book_dir / n)
             return super().post_command(name, **kwargs)
 
@@ -423,24 +467,29 @@ def test_audiobook_import_moves_folder_and_scans_book_folder(tmp_path):
 
     assert result == {7: True}
     assert staged == names
-    assert not source.exists()
-    assert client.commands == [
-        ("DownloadedBooksScan", {"path": os.path.join("/chaptarr/downloads", postprocess.AUDIOBOOK_STAGING_DIR, "Brandon Sanderson", "Mistborn The Final Empire")})
-    ]
+    assert not any(source.iterdir())
+    assert len(client.commands) == 1 and client.commands[0][0] == "DownloadedBooksScan"
+    # Every operation receives a unique staging directory; the scan is scoped to
+    # that exact book operation, and all three inputs have correlated output proof.
+    assert client.commands[0][1]["path"].startswith("/chaptarr/downloads/rsoul_audiobooks/Brandon Sanderson/Mistborn The Final Empire (")
+    assert len(client.bookfiles) == len(client.events) == 3
 
 
 def test_audiobook_import_with_missing_files_is_not_imported(tmp_path):
+    from pathlib import Path
     local = tmp_path / "downloads"
     source = local / "Mistborn - The Final Empire"
     source.mkdir(parents=True)
-    (source / "01.mp3").write_bytes(b"audio")
+    audio = (Path(__file__).parent / "fixtures" / "silence.mp3").read_bytes()
+    (source / "01.mp3").write_bytes(audio)
 
     config = make_config()
     config["Slskd"]["download_dir"] = str(local)
+    config["Slskd"]["readarr_download_dir"] = "/chaptarr/downloads"
     client = FakeImportClient()
     ctx = Context(config=config, slskd=None, readarr=client)
 
-    postprocess.process_imports(
+    result = postprocess.process_imports(
         ctx,
         [
             {
@@ -457,7 +506,10 @@ def test_audiobook_import_with_missing_files_is_not_imported(tmp_path):
     )
 
     assert client.commands == []
-    assert (local / "failed_imports" / source.name / "01.mp3").exists()
+    assert result[7]["phase"] == "needs_review"
+    assert (source / "01.mp3").read_bytes() == audio
+    assert not (local / "failed_imports").exists()
+    assert list((local / ".rsoul-import-journal").glob("*.json"))
 
 
 # ---------------------------------------------------------------------------

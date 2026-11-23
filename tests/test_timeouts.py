@@ -277,6 +277,12 @@ def test_deadline_hands_back_unfinished_tasks(clock):
 
 
 class HandoffBackend(ScriptedBackend):
+    def cleanup(self, task):
+        return True  # This scripted backend has no external transfer records.
+
+    def discard(self, task):
+        return True  # This scripted backend owns no filesystem payloads.
+
     def reconcile_task(self, task_data):
         task = make_task(task_data["task_id"], book_id=task_data["book_id"])
         task.extra = task_data["extra"]
@@ -337,7 +343,7 @@ def test_handoff_persists_unfinished_and_next_run_resumes_and_searches(clock, tm
     orch2 = RecordingStartOrchestrator([backend2], ctx2, {2: make_task("t-book2", book_id=2)})
     ctx2.orchestrator = orch2
     imported = []
-    def fake_import(ctx, items):
+    def fake_import(ctx, items, **kwargs):
         imported.extend(items)
         return {item["bookId"]: True for item in items}
 

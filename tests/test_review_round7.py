@@ -329,7 +329,7 @@ def test_report_says_a_matching_folder_could_not_be_listed(tmp_path):
     "client, reason",
     [
         (share("@@s\\Audiobooks", ["Frank Herbert - Dune - Part 2 of 4.m4b"]), "incomplete (part 1, 3, 4 of 4 missing)"),
-        (share(DUNE_DIR, ["01.mp3", "02.m4a"], size=CHAPTER), "spread over several audio formats"),
+        (share(DUNE_DIR, ["01.mp3", "02.m4a"], size=CHAPTER), "omits numbered chapters present in another format"),
         (share(DUNE_DIR, ["01.mp3"], size=1 * MB), "below audiobook_min_size_mb"),
         (share(DUNE_DIR, ["Dune Messiah.m4b", "Children of Dune.m4b"]), "several other books"),
     ],

@@ -62,6 +62,7 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]], use_le
     redownload_days = ctx.config.getfloat("Search Settings", "redownload_after_days", fallback=30)
     not_found_days = ctx.config.getfloat("Search Settings", "not_found_retry_days", fallback=1)
     resting: List[str] = []
+    duplicates: List[str] = []
     media_mode = get_media_mode(ctx.config)
     skipped = getattr(ctx, "_skipped_wanted_ids", set())
     ctx._skipped_wanted_ids = skipped
@@ -122,10 +123,9 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]], use_le
                 continue
             duplicate = record_with_files(ctx, book)
             if duplicate:
-                logger.warning(
-                    f"Skipping {label}: Chaptarr already has files for another record of this title (book {duplicate['id']}). "
-                    "Unmonitor or remove the duplicate record there to stop it showing up as wanted."
-                )
+                # Collected into one line per run (below): these come back every run until the
+                # duplicate is dealt with in Chaptarr, and one warning each buried the log
+                duplicates.append(f"{author.get('authorName', '?')} - {book.get('title', '?')} (book {book.get('id')}, files on book {duplicate['id']})")
                 skipped.add(book.get("id"))
                 continue
             if ledger:
@@ -166,6 +166,11 @@ def build_targets(ctx: "Context", download_targets: List[Dict[str, Any]], use_le
                 editions=editions,
                 media_type=media_type,
             )
+        )
+    if duplicates:
+        logger.warning(
+            f"Skipping {len(duplicates)} wanted record(s): Chaptarr already has files for another record of this title. "
+            "Unmonitor or remove these duplicate records there to stop them showing up as wanted: " + "; ".join(duplicates)
         )
     if resting:
         logger.info(f"Not searching again yet for {len(resting)} book(s) that were not found in the last {not_found_days:g} day(s) (not_found_retry_days): " + "; ".join(resting))
@@ -783,8 +788,9 @@ def run_workflow(ctx: "Context", download_targets: List[Dict[str, Any]]) -> Dict
         i.get("extra", {}).get("import_pending", {}).get("phase") in ("needs_review", "partial", "identity_changed")]
     for item in needs_review:
         pending_info = item.get("extra", {}).get("import_pending") or item.get("extra", {}).get("recovery_review") or {}
-        logger.warning("Needs review: %s — %s; %s", item.get("author_name"), item.get("book_title"),
-            pending_info.get("reason", pending_info.get("last_error", "completion could not be proved")))
+        book_id = (item.get("extra", {}).get("import_pending") or {}).get("book_id") or item.get("book_id")
+        logger.warning("Needs review: %s — %s (book %s); %s. Inspect with: python -m rsoul.recover --book %s", item.get("author_name"), item.get("book_title"),
+            book_id, pending_info.get("reason", pending_info.get("last_error", "completion could not be proved")), book_id)
     if pending:
         logger.info("Imports awaiting confirmation: %s (including %s needing review)", len(pending), len(needs_review))
     return {

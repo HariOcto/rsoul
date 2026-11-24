@@ -346,7 +346,7 @@ def test_title_segment_match_cases():
 
 
 def _import_ctx(tmp_path, moves_files):
-    from test_v11_imports import setup
+    from test_import_transaction import setup
     from rsoul import postprocess
     ctx, item, server, _ = setup(tmp_path)
     server.action = "all" if moves_files else "none"

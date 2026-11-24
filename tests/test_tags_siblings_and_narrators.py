@@ -15,7 +15,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import MB, Client, backend, make_config, sample_config
+from test_download_cleanup_and_retries import MB, Client, backend, make_config, sample_config
 
 from rsoul import audiotags, postprocess
 from rsoul import download as download_module

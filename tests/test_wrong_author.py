@@ -148,7 +148,7 @@ def test_minimum_running_time(monkeypatch, seconds, minutes, rejected):
 
 def test_the_setting_is_validated():
     from rsoul.config import validate_config
-    from test_review_round3 import make_config
+    from test_download_cleanup_and_retries import make_config
     with pytest.raises(ValueError, match="audiobook_min_duration_minutes"):
         validate_config(make_config(search={"audiobook_min_duration_minutes": "-5"}))
 

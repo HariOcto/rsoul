@@ -15,7 +15,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import MB, Client, PagedReadarr, Transfers, backend, make_config, paged_ctx
+from test_download_cleanup_and_retries import MB, Client, PagedReadarr, Transfers, backend, make_config, paged_ctx
 
 from rsoul import download as download_module
 from rsoul import dryrun
@@ -380,7 +380,7 @@ def test_dry_run_leaves_a_damaged_state_file_alone(tmp_path):
 # backend also tries names with their brackets stripped)
 # ---------------------------------------------------------------------------
 
-from test_review_round6 import NAMES  # noqa: E402
+from test_other_book_names_and_dry_run import NAMES  # noqa: E402
 
 OTHER_BOOKS = [(title, series, name) for title, series, name, same_book in NAMES if not same_book]
 

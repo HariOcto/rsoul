@@ -1200,5 +1200,11 @@ def audiobook_folder_match(
     # Best match first; the configured format order only breaks ties
     matches = sorted(offered.values(), key=lambda c: (-c["score"], allowed.index(c["extension"]), -c["total_size"]))
     for match in matches:
-        logger.info(f"Audiobook folder match: {match['directory']} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
+        if match["file_based"]:
+            # The folder's name did not match; the files' names did. Say which, so a generic
+            # folder ("Audiobooks\\Iain M Banks") scoring 1.000 is not mistaken for a folder match.
+            basename = split_slskd_path(match["files"][0]["filename"])[1]
+            logger.info(f"Audiobook file match: {match['directory']}\\{basename} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
+        else:
+            logger.info(f"Audiobook folder match: {match['directory']} [{match['extension']}, {len(match['files'])} files] (ratio: {match['score']:.3f}) from {username}")
     return matches

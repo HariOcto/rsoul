@@ -1,8 +1,8 @@
-"""v11: operator-decided recovery of imports that an earlier version left without an outcome.
+"""Operator-decided recovery of imports that an early draft left without an outcome.
 
 Replaces the automatic resubmission of an earlier draft, which an outside review showed
 could repeat an import Chaptarr had already accepted (queued or running, response lost) and
-let recovered files skip v11's audio and recording-policy validation.
+let recovered files skip the normal audio and recording-policy validation.
 """
 
 import io
@@ -17,7 +17,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_v11_imports import Server, audio, setup
+from test_import_transaction import Server, audio, setup
 
 from rsoul import import_transaction, postprocess, recover
 
@@ -26,7 +26,7 @@ STAGE = "rsoul_audiobooks/Correct Author/Intended Work"
 
 
 class CommandServer(Server):
-    """v11's fake Chaptarr, plus the command list."""
+    """The fake Chaptarr, plus the command list."""
 
     def __init__(self, root):
         super().__init__(root)
@@ -39,7 +39,7 @@ class CommandServer(Server):
 
 
 def legacy(tmp_path, names=None, writer=audio, schema=None):
-    """A task whose import v10.3/v10.4 saved as not confirmed, files in the staging folder."""
+    """A task whose import an early draft saved as not confirmed, files in the staging folder."""
     ctx, item, _, _ = setup(tmp_path)
     root = tmp_path / "downloads"
     server = CommandServer(root)
@@ -51,14 +51,14 @@ def legacy(tmp_path, names=None, writer=audio, schema=None):
         if (root / "peer-folder" / name).exists():
             os.remove(root / "peer-folder" / name)
         writer(stage / name, i + 1)
-    pending = {  # v10.3/v10.4 pending_import_record
+    pending = {  # an early draft's pending_import_record
         "folder": STAGE, "local_dir": str(stage), "readarr_path": "/remote/" + STAGE,
         "files": [str(stage / n) for n in names], "command_id": None, "submits": 0,
         "since": time.time() - 3600, "method": "targeted", "book_id": 42, "media_type": "audiobook",
         "edition_id": None, "before_ids": None,
     }
     if schema:
-        pending = import_transaction._migrate_legacy(pending)  # already migrated to the v11 journal format
+        pending = import_transaction._migrate_legacy(pending)  # already migrated to the journal format
     task = ctx.state.get_tasks_for_orchestrator()[0]
     ctx.state.set_extra(task["task_id"], dict(task["extra"], import_pending=pending, expected_files=names))
     return ctx, server, root
@@ -170,7 +170,7 @@ def test_an_unreadable_history_blocks_only_until_it_is_readable_again(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Review finding 2: recovered files go through v11's ordinary validation
+# Review finding 2: recovered files go through the ordinary validation
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +236,7 @@ def test_a_missing_staged_file_blocks(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Records already migrated to the v11 journal format are recoverable too
+# Records already migrated to the journal format are recoverable too
 # ---------------------------------------------------------------------------
 
 

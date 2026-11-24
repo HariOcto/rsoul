@@ -15,7 +15,7 @@ from rsoul.backends import DownloadTask, DownloadStatus
 from rsoul.persistence import StatePersistenceError
 from rsoul.state import StateManager
 from rsoul.workflow import _RunResults, _follow_up_pending_imports, _resume_persisted
-from test_v11_imports import audio
+from test_import_transaction import audio
 
 
 class ImportServer:

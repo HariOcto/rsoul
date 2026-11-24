@@ -23,7 +23,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_v11_imports import run, saved_pending, setup, writer
+from test_import_transaction import run, saved_pending, setup, writer
 
 from rsoul import audiotags, import_transaction, postprocess
 from rsoul.backends.slskd_backend import _generate_fallback_queries

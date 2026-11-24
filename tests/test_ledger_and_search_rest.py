@@ -18,8 +18,8 @@ from rsoul.outcomes import SearchIncomplete
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import MB, Client, make_config
-from test_review_round10 import THRESHOLDS, Chaptarr, wanted
+from test_download_cleanup_and_retries import MB, Client, make_config
+from test_duplicates_and_shared_folders import THRESHOLDS, Chaptarr, wanted
 
 from rsoul import display, workflow
 from rsoul import download as download_module

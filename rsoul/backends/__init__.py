@@ -88,7 +88,7 @@ def create_backends_from_config(ctx: "Context") -> List[DownloadBackend]:
             # Override priority based on config order
             backend._config_priority = i  # type: ignore
             backends.append(backend)
-            logger.info(f"Loaded backend: {backend_name} (priority {i})")
+            logger.debug(f"Loaded backend: {backend_name} (priority {i})")
         except Exception as e:
             logger.error(f"Failed to create backend {backend_name}: {e}")
 

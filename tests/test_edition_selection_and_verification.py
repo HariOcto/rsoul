@@ -1,4 +1,4 @@
-"""v10.2 regression tests: never turn a targeted import into a folder scan;
+"""Never turn a targeted import into a folder scan;
 verify the actual destination of new files; handle recovery, cleanup and ledger IDs safely.
 """
 import configparser
@@ -14,7 +14,7 @@ from rsoul.backends.base import DownloadStatus, DownloadTask
 from rsoul.config import Context
 from rsoul.ledger import BookLedger
 from rsoul.state import StateManager
-from test_review_round12 import Chaptarr, NUTTALL, QUALITY, STAGED, run_import
+from test_targeted_imports import Chaptarr, NUTTALL, QUALITY, STAGED, run_import
 
 
 def test_edition_type_is_structured_and_untyped_is_not_audio():
@@ -223,8 +223,8 @@ def test_disappeared_targeted_files_do_not_masquerade_as_success_after_command_4
 
 
 def test_run_workflow_does_not_redownload_a_book_awaiting_targeted_verification(tmp_path, monkeypatch):
-    from test_review_round11 import ctx_for
-    from test_review_round10 import wanted
+    from test_ledger_and_search_rest import ctx_for
+    from test_duplicates_and_shared_folders import wanted
 
     ctx = ctx_for(tmp_path)
     task = DownloadTask("t", "slskd", DownloadStatus.COMPLETED, "The Trafalgar Gambit", NUTTALL, 4020, "book.mp3")

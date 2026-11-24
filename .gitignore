@@ -12,3 +12,5 @@ __pycache__/
 temp.html
 test.ini
 *.html
+.DS_Store
+*.patch

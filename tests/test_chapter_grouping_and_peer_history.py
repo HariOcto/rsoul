@@ -16,7 +16,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import AUTHOR, LIBRARY, MB, Client, RejectingReadarr, Transfers, audiobook_item, backend, make_config
+from test_download_cleanup_and_retries import AUTHOR, LIBRARY, MB, Client, RejectingReadarr, Transfers, audiobook_item, backend, make_config
 
 from rsoul import download as download_module
 from rsoul import postprocess

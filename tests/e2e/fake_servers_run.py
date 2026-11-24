@@ -157,7 +157,7 @@ class Chaptarr(BaseHTTPRequestHandler):
             recs = [b for b in BOOKS.values() if q.get("mediaType", ["audiobook"])[0] == b["mediaType"]]
             return self.send(200, {"page": 1, "pageSize": 10, "totalRecords": len(recs), "records": recs})
         if p == "/author/10": return self.send(200, {"id": 10, "authorName": "Brandon Sanderson"})
-        if p == "/system/status": return self.send(200, {"version": "v11-test-fixture"})
+        if p == "/system/status": return self.send(200, {"version": "test-fixture"})
         if p == "/edition": return self.send(200, [{"id": 11, "monitored": True, "readingFormatId": 2}])
         if p == "/book": return self.send(200, list(BOOKS.values()))
         if p == "/bookfile": return self.send(200, bookfiles)

@@ -375,7 +375,7 @@ def test_missing_chapter_remains_pending_for_review(tmp_path):
 
 
 def test_unsuccessful_import_command_retains_real_audio_and_journal(tmp_path):
-    from test_v11_imports import setup
+    from test_import_transaction import setup
     ctx, item, server, penalties = setup(tmp_path)
     server.result, server.action = "unsuccessful", "none"
     outcome = postprocess.process_imports(ctx, [item])[item["bookId"]]

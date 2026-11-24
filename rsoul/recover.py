@@ -1,9 +1,10 @@
-"""Operator-decided recovery of imports that an earlier version left without an outcome.
+"""Operator-decided recovery of imports that are stuck without a proven outcome.
 
-v10.2 to v10.4 saved a targeted import that was not confirmed with no command ID and a
-submit count of 0. That covers two very different cases: the import could not be prepared
-(no edition, nothing was sent), or the POST was sent and only its response was lost. The
-saved record cannot tell them apart, so v11 never resubmits such an import on its own.
+Early drafts of audiobook support (before the import journal) saved a targeted import that
+was not confirmed with no command ID and a submit count of 0. That covers two very different
+cases: the import could not be prepared (no edition, nothing was sent), or the POST was sent
+and only its response was lost. The saved record cannot tell them apart, so R:soul never
+resubmits such an import on its own.
 
 This command lets the operator decide, book by book, after looking at the evidence:
 
@@ -11,6 +12,13 @@ This command lets the operator decide, book by book, after looking at the eviden
     python -m rsoul.recover --config-dir /data --book 6744      # evidence for one book
     python -m rsoul.recover --config-dir /data --book 6744 --apply
     python -m rsoul.recover --config-dir /data --book 6744 --discard
+    python -m rsoul.recover --config-dir /data --book 6744 --confirm
+
+--confirm is for a journaled import set aside for review (needs_review, submission_unknown) that
+Chaptarr did in fact complete: R:soul could not prove it (lost command response, new files
+not tied to the staged ones), but Chaptarr's history names every staged file as imported since
+staging and the book has files. It archives the record, notes the import in the book ledger
+and removes the task; it moves no files. --book N on its own shows whether that is the case.
 
 --discard is for an import that is not worth recovering (wrong recording or broken files).
 It works on a saved import that is set aside for review, has an
@@ -37,17 +45,18 @@ application lock and refuses if it can't.
 - the saved inventories agree: the files the pending import lists, the expected files, and
   the original download manifest or transfer records name the same files, with no duplicates
   and no conflicting sizes;
-- v11's own transaction constructor accepts the files: every one present, a regular file on
+- the import transaction's own constructor accepts the files: every one present, a regular file on
   the download mount, of the size the original download had where that is known.
 
-Then it records the decision (with the evidence and the old record) and creates a fresh v11
-transaction at the validating phase, with server paths derived from the *current* mapping.
+Then it records the decision (with the evidence and the old record) and creates a fresh
+import transaction at the validating phase, with server paths derived from the *current* mapping.
 The next normal run does what it does for any new download: audio, fragment, recording-policy
 and tag validation, staging into a fresh folder, a baseline, the import and verification.
 Nothing is imported by this command itself.
 """
 
 import argparse
+import json
 import configparser
 import copy
 import ntpath
@@ -205,7 +214,10 @@ def evidence(client: Any, item: dict, server_paths: List[str], server_folders: L
     book_id = pending.get("book_id") or item.get("book_id")
     since = float(pending.get("since") or 0)
     report: Dict[str, Any] = {"book_id": book_id, "title": item.get("book_title"), "since": since,
-                              "commands": [], "history_imports": [], "blocking": [], "notes": []}
+                              "commands": [], "history_imports": [], "blocking": [], "notes": [],
+                              # what keeps the evidence from being read or settled; unlike "blocking", an import
+                              # that evidently happened is not in here (--confirm relies on that difference)
+                              "unclear": []}
     try:
         commands = client.get_command()
         if not isinstance(commands, list):
@@ -229,6 +241,7 @@ def evidence(client: Any, item: dict, server_paths: List[str], server_folders: L
             label = f"Command {command.get('id')} ({command.get('name')}) for these files"
             if status in ACTIVE:
                 report["blocking"].append(f"{label} is still {status}")
+                report["unclear"].append(f"{label} is still {status}")
             elif status == "completed":
                 # "completed" is the command's lifecycle, not the import's outcome: only an
                 # explicit unsuccessful result shows that nothing was imported
@@ -237,29 +250,42 @@ def evidence(client: Any, item: dict, server_paths: List[str], server_folders: L
             elif status in FINISHED:
                 if result not in ("", "unsuccessful"):
                     report["blocking"].append(f"{label} ended {status} with result '{result}'")
+                    report["unclear"].append(f"{label} ended {status} with result '{result}'")
             else:
                 report["blocking"].append(f"{label} has an unknown status '{status or 'none'}'")
+                report["unclear"].append(f"{label} has an unknown status '{status or 'none'}'")
         if not report["commands"]:
             report["notes"].append("No command in Chaptarr's command list names these files (the list only holds recent commands)")
     except Unclear as exc:
         report["blocking"].append(str(exc))
+        report["unclear"].append(str(exc))
     except Exception as exc:
         report["blocking"].append(f"Chaptarr's command list cannot be read: {exc}")
+        report["unclear"].append(f"Chaptarr's command list cannot be read: {exc}")
 
     events, error = import_identity.history_rows(client, book_id, since)
     if error:
         report["blocking"].append(f"Chaptarr's history cannot be read completely: {error}")
+        report["unclear"].append(f"Chaptarr's history cannot be read completely: {error}")
     for event in events:
         if str(event.get("bookId")) != str(book_id) or _kind(event.get("eventType")) not in IMPORT_KINDS:
             continue
         stamp = import_identity._event_time(event.get("date"))
         if stamp is None:
             report["blocking"].append(f"An import event for this book has an unreadable date ({event.get('date')!r})")
+            report["unclear"].append(f"An import event for this book has an unreadable date ({event.get('date')!r})")
             continue
         if stamp < since:
             continue  # each event's own date counts, not the page it was on
         data = {str(k).casefold(): v for k, v in event["data"].items()} if isinstance(event.get("data"), dict) else {}
-        report["history_imports"].append({"date": event.get("date"), "dropped": data.get("droppedpath"), "imported": data.get("importedpath")})
+        sources = data.get("sourcepaths")
+        if isinstance(sources, str):
+            try:
+                sources = json.loads(sources)
+            except ValueError:
+                sources = None
+        report["history_imports"].append({"date": event.get("date"), "dropped": data.get("droppedpath"), "imported": data.get("importedpath"),
+                                          "sources": [p for p in sources if isinstance(p, str)] if isinstance(sources, list) else []})
     if report["history_imports"]:
         report["blocking"].append(f"{len(report['history_imports'])} import event(s) for this book since the files were staged")
 
@@ -267,11 +293,12 @@ def evidence(client: Any, item: dict, server_paths: List[str], server_folders: L
     report["book_files_now"] = None if rows is None else len(rows)
     if rows is None:
         report["blocking"].append("The book's files cannot be read from Chaptarr")
+        report["unclear"].append("The book's files cannot be read from Chaptarr")
     return report
 
 
 def plan(item: dict, local_root: str, server_root: str) -> Dict[str, Any]:
-    """Reconcile the inventory and build the fresh transaction through v11's own constructor.
+    """Reconcile the inventory and build the fresh transaction through the import transaction's own constructor.
     Returns {'inventory', 'old_server_paths', 'new', 'blocking'}; touches nothing on disk."""
     pending = item["extra"]["import_pending"]
     extra = copy.deepcopy(item.get("extra") or {})
@@ -306,7 +333,7 @@ def plan(item: dict, local_root: str, server_root: str) -> Dict[str, Any]:
         work["files"] = extra["files"]
     fresh = new_transaction(work, local_root, server_root, "targeted")
     if fresh.get("phase") != "validating":
-        blocking.append(fresh.get("reason") or "v11 does not accept these files as a new import")
+        blocking.append(fresh.get("reason") or "R:soul does not accept these files as a new import")
         return result
     for entry in fresh["manifest"]:
         size = found["sizes"].get(entry["name"])
@@ -715,6 +742,164 @@ def discard(client: Any, state: Any, book: int, local_root: str, server_root: st
     return 0
 
 
+# Phases --confirm accepts. "partial" is left out on purpose: some of its files were imported
+# and some were not, so calling it done would lose the rest of the book.
+CONFIRMABLE = {"needs_review", "submission_unknown"}
+
+
+def _staged_server_paths(item: dict) -> tuple:
+    """(server paths of the staged files, the staged server folder(s), the file names)."""
+    pending = item["extra"]["import_pending"]
+    manifest = [e for e in pending.get("manifest") or [] if isinstance(e, dict)]
+    names = [e.get("name") or _name(e.get("stage_path") or e.get("readarr_path")) for e in manifest] or \
+            [_name(p) for p in pending.get("files") or []]
+    folder = (pending.get("readarr_path") or "").rstrip("/\\")
+    paths = [e.get("readarr_path") for e in manifest if e.get("readarr_path")]
+    if not paths and folder:
+        paths = [f"{folder}/{n}" for n in names if n]
+    folders = sorted({folder} | {p.replace("\\", "/").rsplit("/", 1)[0] for p in paths if "/" in p.replace("\\", "/")} - {""})
+    return paths, folders, [n for n in names if n]
+
+
+def _tail(path: str, parts: int = 2) -> str:
+    """The folder and file name, case-folded: still comparable when the root mapping changed."""
+    components = [p for p in _server_path_key(path).split("/") if p]
+    return "/".join(components[-parts:]).casefold()
+
+
+def import_proof(report: dict, staged_paths: List[str]) -> Dict[str, Any]:
+    """Does Chaptarr's history show every staged file imported since staging?
+
+    A file counts when an import event dated after staging names it as the dropped path or,
+    for a conversion, among the source paths. The exact server path is compared first; failing
+    that, its folder and file name (the root mapping may have changed since). Returns
+    {'covered': [...], 'missing': [...]}."""
+    seen_full, seen_tail = set(), set()
+    for event in report.get("history_imports", []):
+        for path in [event.get("dropped")] + list(event.get("sources") or []):
+            if isinstance(path, str) and path.strip():
+                seen_full.add(_server_path_key(path))
+                seen_tail.add(_tail(path))
+    covered, missing = [], []
+    for path in staged_paths:
+        (covered if _server_path_key(path) in seen_full or _tail(path) in seen_tail else missing).append(path)
+    return {"covered": covered, "missing": missing}
+
+
+def confirm(client: Any, state: Any, book: int, local_root: str, config_dir: str, out, apply: bool = True, ledger: Any = None) -> int:
+    """Close a review item whose import Chaptarr evidently completed.
+
+    The saved import is kept for review when R:soul could not prove the outcome itself (the
+    command's response was lost, or the new book files could not be tied to the staged ones).
+    --apply and --discard both refuse once Chaptarr's history shows an import, so such an item
+    could never leave review. This decides it from the other side, and only when the evidence
+    is complete:
+    - Chaptarr's command list, history and book files are all readable, and no import command
+      for the staged files is still queued, running or of unknown status;
+    - every staged file is named by an import event dated after staging;
+    - the book has files in Chaptarr now.
+    Then the saved record is archived (recover_archive.jsonl), the import is noted in the book
+    ledger and the task is removed. No file is moved or deleted: anything left in the staging
+    folder is listed for the operator to delete once the book looks right in Chaptarr.
+    """
+    tasks = state.get_tasks_for_orchestrator()
+    selected = [t for t in tasks
+                if str(t.get("book_id")) == str(book) or str(((t.get("extra") or {}).get("import_pending") or {}).get("book_id")) == str(book)]
+    if len(selected) != 1:
+        out.write(f"Expected one saved task for book {book}, found {len(selected)}. Nothing changed.\n")
+        return 1
+    item = selected[0]
+    extra = item.get("extra") or {}
+    pending = extra.get("import_pending")
+    if not isinstance(pending, dict):
+        out.write(f"Book {book} has no saved import (it is still downloading). Nothing changed.\n")
+        return 1
+    if "operator_discard" in extra or pending.get("operator_discard"):
+        out.write(f"Book {book} has an operator discard in progress; finish it with --discard. Nothing changed.\n")
+        return 1
+    phase = pending.get("phase") or ("submission_unknown" if not pending.get("schema") else "")
+    out.write(f"\nBook {book}: {item.get('book_title')} ({phase or 'no phase'})\n")
+    if pending.get("reason"):
+        out.write(f"  saved reason: {pending['reason']}\n")
+    if phase not in CONFIRMABLE:
+        out.write(f"  Only {', '.join(sorted(CONFIRMABLE))} can be confirmed"
+                  + (" (a partial import still lacks files)" if phase == "partial" else "") + ". Nothing changed.\n")
+        return 1
+    if pending.get("book_id") and item.get("book_id") and str(pending["book_id"]) != str(item["book_id"]):
+        out.write("  The saved task and its import name different books. Nothing changed.\n")
+        return 1
+
+    paths, folders, names = _staged_server_paths(item)
+    blocking: List[str] = []
+    if not paths:
+        blocking.append("The saved import does not say which files were staged")
+    report = evidence(client, item, paths, folders)
+    blocking += report["unclear"]
+    proof = import_proof(report, paths) if paths else {"covered": [], "missing": []}
+    for c in report.get("commands", []):
+        out.write(f"  command {c['id']} {c['name']}: {c['status']}/{c['result']}\n")
+    for e in report.get("history_imports", []):
+        out.write(f"  history import {e['date']}: {e['dropped'] or ', '.join(e['sources']) or '?'} -> {e['imported']}\n")
+    out.write(f"  files on the book now: {report.get('book_files_now')}\n")
+    out.write(f"  staged files named by an import since staging: {len(proof['covered'])} of {len(paths)}\n")
+    if not report["history_imports"]:
+        blocking.append("Chaptarr's history shows no import for this book since the files were staged")
+    elif proof["missing"]:
+        shown = ", ".join(_name(p) for p in proof["missing"][:5]) + (" ..." if len(proof["missing"]) > 5 else "")
+        blocking.append(f"{len(proof['missing'])} staged file(s) are not named by any import since staging: {shown}")
+    if report.get("book_files_now") == 0:
+        blocking.append("The book has no files in Chaptarr now")
+
+    stage_dir = inventory(item)["stage_dir"]
+    leftovers = []
+    if stage_dir and local_root and _inside(local_root, stage_dir):
+        leftovers = [os.path.join(stage_dir, n) for n in names if os.path.isfile(os.path.join(stage_dir, n))]
+
+    for block in blocking:
+        out.write(f"  BLOCKS CONFIRM: {block}\n")
+    if blocking:
+        out.write("  Nothing changed.\n")
+        return 1
+    if not apply:
+        out.write("  -> Chaptarr shows this import complete; close it with --confirm\n")
+        return 0
+    if getattr(state, "read_only", False):
+        out.write("  The saved state is read-only. Nothing changed.\n")
+        return 1
+
+    _archive(config_dir, {"at": time.time(), "action": "confirm", "book_id": book, "task": copy.deepcopy(item),
+                          "evidence": {k: report[k] for k in ("commands", "history_imports", "book_files_now", "notes")},
+                          "leftover_files": leftovers})
+    if ledger is None:
+        from .ledger import BookLedger
+        ledger = BookLedger(config_dir)
+    ledger.note_imported(pending.get("book_id") or item.get("book_id"), item.get("author_name", ""), item.get("book_title", ""),
+                         pending.get("media_type") or extra.get("media_type", "ebook"))
+    if state.remove_task(item["task_id"]) is False:
+        out.write("  The record is archived, but the task could not be removed from the saved state; rerun --confirm.\n")
+        return 3
+    out.write(f"  Confirmed as imported. The saved record is archived in {os.path.join(config_dir, 'recover_archive.jsonl')}.\n")
+    if leftovers:
+        out.write("  These staged files are still on disk and were left alone; delete them once the book looks right in Chaptarr:\n")
+        for path in leftovers:
+            out.write(f"    {path}\n")
+    return 0
+
+
+def review_items(state_items: List[dict]) -> List[dict]:
+    """Saved imports set aside for review that are not legacy candidates for --apply."""
+    legacy_ids = {i.get("task_id") for i in candidates(state_items)}
+    found = []
+    for item in state_items:
+        extra = item.get("extra") or {}
+        pending = extra.get("import_pending")
+        if item.get("task_id") in legacy_ids or not isinstance(pending, dict):
+            continue
+        if pending.get("phase") in CONFIRMABLE | {"partial", "identity_changed"} or extra.get("recovery_review"):
+            found.append(item)
+    return found
+
+
 def _load_config(config_dir: str) -> configparser.ConfigParser:
     from .config import apply_env_overrides, validate_config
     config = configparser.ConfigParser(interpolation=None)
@@ -735,7 +920,7 @@ def _client(config: configparser.ConfigParser) -> Any:
 
 
 def main(argv: Optional[List[str]] = None, client: Any = None, state: Any = None, out=None,
-         local_root: Optional[str] = None, server_root: Optional[str] = None) -> int:
+         local_root: Optional[str] = None, server_root: Optional[str] = None, ledger: Any = None) -> int:
     out = out or sys.stdout
     parser = argparse.ArgumentParser(prog="python -m rsoul.recover", description=__doc__.split("\n\n")[0])
     parser.add_argument("--config-dir", default=os.environ.get("RSOUL_CONFIG_DIR", "/data"))
@@ -743,10 +928,12 @@ def main(argv: Optional[List[str]] = None, client: Any = None, state: Any = None
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--apply", action="store_true", help="turn the record into a fresh, validated import for the next run")
     action.add_argument("--discard", action="store_true", help="archive the record, set its files aside in failed_imports, remove the task")
+    action.add_argument("--confirm", action="store_true",
+                        help="close a review item that Chaptarr's history shows imported: archive the record, note it in the ledger, remove the task")
     args = parser.parse_args(argv)
-    if (args.apply or args.discard) and args.book is None:
-        parser.error("--apply and --discard need --book")
-    changing = args.apply or args.discard
+    if (args.apply or args.discard or args.confirm) and args.book is None:
+        parser.error("--apply, --discard and --confirm need --book")
+    changing = args.apply or args.discard or args.confirm
 
     lock = None
     mutation_started = False
@@ -775,6 +962,9 @@ def main(argv: Optional[List[str]] = None, client: Any = None, state: Any = None
         if args.discard:
             mutation_started = True  # discard reports its own checkpoints and partial moves
             return discard(client, state, args.book, local_root, server_root, args.config_dir, out)
+        if args.confirm:
+            mutation_started = True  # the archive is written before the task is removed
+            return confirm(client, state, args.book, local_root, args.config_dir, out, apply=True, ledger=ledger)
 
         snapshot = state.get_tasks_for_orchestrator()
         for saved in snapshot:
@@ -790,6 +980,20 @@ def main(argv: Optional[List[str]] = None, client: Any = None, state: Any = None
         if args.book is not None:
             items = [i for i in items if str(i.get("book_id")) == str(args.book)
                      or str((i.get("extra") or {}).get("import_pending", {}).get("book_id")) == str(args.book)]
+        review = review_items(snapshot)
+        if args.book is not None and not items:
+            mine = [i for i in review if str(i.get("book_id")) == str(args.book)
+                    or str((i.get("extra") or {}).get("import_pending", {}).get("book_id")) == str(args.book)]
+            if mine:
+                # a journaled review item: show whether Chaptarr already finished it (read-only)
+                return confirm(client, state, args.book, local_root, args.config_dir, out, apply=False)
+        if args.book is None and review:
+            out.write("Saved imports set aside for review:\n")
+            for item in review:
+                pending_info = (item.get("extra") or {}).get("import_pending") or {}
+                book_id = pending_info.get("book_id") or item.get("book_id")
+                out.write(f"  book {book_id}: {item.get('author_name')} - {item.get('book_title')} "
+                          f"({pending_info.get('phase', 'review')}); inspect with --book {book_id}\n")
         if not items:
             out.write("No saved import without an outcome" + (f" for book {args.book}" if args.book is not None else "") + ".\n")
             return 0 if args.book is None else 1

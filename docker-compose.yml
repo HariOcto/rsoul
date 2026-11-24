@@ -25,7 +25,9 @@ services:
       # - /path/to/stacks/downloads:/stacks-downloads
       #Select where you are storing your config file. Leave "/data" since thats where the script expects the config file to be
       - /path/to/config/dir:/data
-    image: mephistopheles1/rsoul:latest
+    # This fork's image (upstream's mephistopheles1/rsoul has no audiobook support).
+    # Pin a release tag; branch tags such as :audiobook-support change with every push.
+    image: ghcr.io/hariocto/rsoul:0.1.0-beta.1
 
   # Uncomment to run FlareSolverr for DDoS-Guard bypass (used by Stacks backend)
   # flaresolverr:

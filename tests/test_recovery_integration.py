@@ -1,4 +1,4 @@
-"""Cross-module v11 recovery regressions from the independent safety review.
+"""Cross-module recovery regressions from the independent safety review.
 
 External APIs are simulated; queues and recovery journals use real disk writes.
 """
@@ -249,3 +249,23 @@ def test_cli_adopts_sidecar_only_work_even_when_no_books_are_wanted(tmp_path, mo
     assert len(recovered) == 1
     assert recovered[0]["task_id"] == "sidecar-task"
     assert recovered[0]["extra"]["import_pending"]["phase"] == "submission_unknown"
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_repeat_runs_keep_the_startup_report_out_of_the_info_log(tmp_path, monkeypatch, caplog, capsys, repeat):
+    # run.sh sets RSOUL_REPEAT_RUN after the container's first run: the banner and the config
+    # lines are the same every 5 minutes, so later runs log them at debug level only
+    import logging
+    module = _main_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("RSOUL__SEARCH_SETTINGS__NUMBER_OF_BOOKS_TO_GRAB", "10")
+    if repeat:
+        monkeypatch.setenv("RSOUL_REPEAT_RUN", "1")
+    else:
+        monkeypatch.delenv("RSOUL_REPEAT_RUN", raising=False)
+    monkeypatch.setattr(module, "get_books", lambda *args, **kwargs: [])
+    with caplog.at_level(logging.INFO):
+        module.main()
+    info = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    shown = any(m.startswith("Environment override:") for m in info) and any(m.startswith("Media mode:") for m in info)
+    assert shown is (not repeat)
+    assert ("READARR SOUL" in capsys.readouterr().out) is (not repeat)

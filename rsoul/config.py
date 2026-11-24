@@ -273,7 +273,7 @@ def validate_config(config: configparser.ConfigParser) -> None:
     if any(not value.strip().isdigit() for value in ids.split(",") if value.strip()):
         raise ValueError("Configuration Error: excluded_book_ids must be comma-separated numeric IDs")
     if method == "scan" and get_media_mode(config) != EBOOK:
-        logger.warning("Audiobook import_method=scan delegates selection to the server. v11 still requires complete correlated import evidence; targeted is recommended for explicit book/edition selection.")
+        logger.warning("Audiobook import_method=scan delegates selection to the server. R:soul still requires complete correlated import evidence; targeted is recommended for explicit book/edition selection.")
 
     # Placeholders from the sample config (e.g. YOUR_READARR_API_KEY) were never replaced
     enabled_sections = ["Readarr"]

@@ -17,7 +17,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import MB, Client, Transfers, make_config
+from test_download_cleanup_and_retries import MB, Client, Transfers, make_config
 
 from rsoul import download as download_module
 from rsoul import postprocess, workflow
@@ -204,7 +204,10 @@ def test_title_that_already_has_files_under_another_record_is_skipped(tmp_path, 
     records = [{"id": 1, "title": "Salvation", "mediaType": "audiobook", "hasFiles": True}, {"id": 2, "title": "Salvation", "mediaType": "audiobook", "hasFiles": False}]
     with caplog.at_level(logging.WARNING):
         assert built(tmp_path, [wanted(2, "Salvation"), wanted(5, "Salvation Lost")], records) == [5]
-    assert "already has files for another record of this title (book 1)" in caplog.text
+    assert "already has files for another record of this title" in caplog.text
+    assert "Isaac Asimov - Salvation (book 2, files on book 1)" in caplog.text
+    # one summary line per run, not one warning per duplicate
+    assert sum("another record of this title" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_the_ebook_of_an_audiobook_is_not_a_duplicate(tmp_path):

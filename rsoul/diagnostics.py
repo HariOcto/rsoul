@@ -12,7 +12,9 @@ from .version import __version__, BUILD_ID, STATE_SCHEMA
 logger = logging.getLogger(__name__)
 
 
-def report_versions(ctx):
+def report_versions(ctx, quiet=False):
+    """quiet: log the summary at debug level (repeat runs of the container; nothing new)."""
+    log = logger.debug if quiet else logger.info
     report = {"rsoul": __version__, "build": BUILD_ID, "python": platform.python_version(),
               "import_journal_schema": STATE_SCHEMA, "readarr": {"version": "unknown"}, "slskd": {"version": "unknown"}}
     if ctx.config.getboolean("General", "log_api_versions", fallback=True):
@@ -31,9 +33,9 @@ def report_versions(ctx):
                     report["slskd"] = {k: version[k] for k in ("version", "current", "full") if isinstance(version.get(k), str)}
             except Exception as exc:
                 logger.info("slskd version unavailable: %s", type(exc).__name__)
-    logger.info("R:soul %s (%s); Python %s; Readarr/Chaptarr %s; slskd %s", __version__, BUILD_ID,
+    log("R:soul %s (%s); Python %s; Readarr/Chaptarr %s; slskd %s", __version__, BUILD_ID,
         report["python"], report["readarr"].get("version", "unknown"), report["slskd"].get("version", "unknown"))
-    logger.info("Import capabilities are verified per transaction: explicit identity, complete manifest, and source/output correlation; missing evidence remains pending")
+    log("Import capabilities are verified per transaction: explicit identity, complete manifest, and source/output correlation; missing evidence remains pending")
     if not getattr(ctx.state, "read_only", False):
         try:
             atomic_write_json(Path(ctx.config_dir) / "diagnostics.json", report)

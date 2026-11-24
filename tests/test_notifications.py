@@ -16,7 +16,7 @@ import pytest
 from rsoul import import_transaction, notify, postprocess
 from rsoul.persistence import StatePersistenceError
 from rsoul.state import StateManager
-from test_v11_imports import run, saved_pending, setup, writer
+from test_import_transaction import run, saved_pending, setup, writer
 
 
 class Response:

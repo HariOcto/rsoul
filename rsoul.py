@@ -88,8 +88,12 @@ def main():
     health.configure(config_dir)
     health.write_status("running", run_started_at=time.time(), persistence_error=None, version=__version__)
     try:
-        # Print banner
-        print_startup_banner()
+        # run.sh sets RSOUL_REPEAT_RUN after the first run of the container: the banner and the
+        # startup report are then the same every 5 minutes, so they go to the debug level
+        repeat_run = os.environ.get("RSOUL_REPEAT_RUN") == "1"
+        startup_log = logger.debug if repeat_run else logger.info
+        if not repeat_run:
+            print_startup_banner()
 
         # Load Config
         # Disable interpolation to make storing logging formats in the config file much easier
@@ -123,9 +127,9 @@ def main():
 
         # Setup Logging
         setup_logging(config)
-        logger.info(f"Configuration from: {config_source}")
+        startup_log(f"Configuration from: {config_source}")
         for line in env_overrides:
-            logger.info(f"Environment override: {line}")
+            startup_log(f"Environment override: {line}")
 
         # Validate Config
         validate_config(config)
@@ -147,7 +151,7 @@ def main():
         page_size = config.getint("Search Settings", "number_of_books_to_grab", fallback=10)
 
         media_mode = get_media_mode(config)
-        logger.info(f"Media mode: {media_mode}")
+        startup_log(f"Media mode: {media_mode}")
 
         # Initialize Clients
         slskd = None
@@ -174,14 +178,14 @@ def main():
         ctx = Context(config=config, slskd=slskd, readarr=readarr, config_dir=config_dir, history=history_manager, state=state_manager)
         ctx.ledger = BookLedger(config_dir, read_only=dry_run)
         if not dry_run:
-            report_versions(ctx)
+            report_versions(ctx, quiet=True) if repeat_run else report_versions(ctx)
 
         # Initialize backends and orchestrator
         backends = create_backends_from_config(ctx)
         if backends:
             orchestrator = DownloadOrchestrator(backends, ctx)
             ctx.orchestrator = orchestrator
-            logger.info(f"Initialized {len(backends)} backend(s): {[b.name for b in backends]}")
+            startup_log(f"Initialized {len(backends)} backend(s): {[b.name for b in backends]}")
         else:
             logger.warning("No backends available - downloads will fail")
 

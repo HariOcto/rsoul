@@ -1,4 +1,4 @@
-"""v11 durability, scheduling, API errors and restart integration regressions."""
+"""Durability, scheduling, API errors and restart integration regressions."""
 import copy
 import json
 import os
@@ -242,7 +242,7 @@ def test_foreground_checkpoint_failure_latches_before_join(tmp_path, monkeypatch
 
 
 def test_import_writer_observes_foreground_fatal_before_moving(tmp_path):
-    from test_v11_imports import setup
+    from test_import_transaction import setup
     from rsoul import import_transaction as transaction
     ctx, item, server, _ = setup(tmp_path)
     pending = transaction.new_transaction(item, str(server.root), '/remote', 'targeted')

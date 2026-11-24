@@ -556,3 +556,16 @@ def test_both_mode_builds_targets_per_book_media_type(tmp_path):
     assert by_id[1].allowed_filetypes == ["m4b", "mp3"]
     assert by_id[2].media_type == "ebook"
     assert by_id[2].allowed_filetypes == ["epub", "azw3", "mobi"]
+
+
+def test_file_match_in_a_generic_folder_logs_the_file_that_matched(caplog):
+    # "Audiobooks\Iain M Banks" holding one "Author - Title.mp3": the file's name matched,
+    # not the folder's, and the log line should say which file
+    import logging
+    target = {"book": {"id": 1, "title": "Look to Windward", "seriesTitle": "Culture"}, "author": {"authorName": "Iain M. Banks"}}
+    files = [{"filename": "Audio books Sorting\\TE_Audiobooks_I\\Iain M Banks\\Iain M. Banks - Look to windward (Culture 7).mp3", "size": 300_000_000}]
+    with caplog.at_level(logging.INFO, logger="rsoul.match"):
+        matches = audiobook_folder_match(target, files, "peer", ["m4b", "mp3"], [], 0.5)
+    assert len(matches) == 1 and matches[0]["file_based"]
+    assert "Audiobook file match: Audio books Sorting\\TE_Audiobooks_I\\Iain M Banks\\Iain M. Banks - Look to windward (Culture 7).mp3" in caplog.text
+    assert "Audiobook folder match:" not in caplog.text

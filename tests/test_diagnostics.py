@@ -139,3 +139,14 @@ def test_missing_config_directory_is_not_created(tmp_path, monkeypatch, capsys):
     code, report = call_report(tmp_path / "absent", monkeypatch, capsys)
     assert code == 0 and report["pending"] == []
     assert snapshot(tmp_path) == before
+
+
+def test_version_is_semver_and_matches_the_changelog():
+    import re
+    from pathlib import Path
+    from rsoul.version import BUILD_ID, __version__
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", __version__)
+    assert match, f"{__version__!r} is not a Semantic Versioning string"
+    assert BUILD_ID == ("pre-release" if match.group(4) else "release")
+    changelog = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert re.search(r"^## \[(.+?)\]", changelog, re.M).group(1) == __version__, "the newest CHANGELOG entry must be this version"

@@ -1,4 +1,4 @@
-"""Operator conveniences added to v11 from an outside suggestion list, each opt-in or behaviour-neutral
+"""Operator conveniences added from an outside suggestion list, each opt-in or behaviour-neutral
 by default: webhook notifications, a clear cross-device staging error, a narrator tie-break between
 audio editions, following submitted imports together, a configurable bitrate floor, an optional
 running-time check, optional retention for quarantine folders, and an evidence-checked --discard."""
@@ -16,7 +16,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_v11_recover import STAGE, legacy, pending as saved_pending, run
+from test_recover_apply import STAGE, legacy, pending as saved_pending, run
 
 from rsoul import import_identity, import_transaction, notify, postprocess, recover
 from rsoul.backends.base import DownloadTarget
@@ -238,7 +238,7 @@ def test_running_time_check_when_switched_on():
 
 @pytest.mark.parametrize("option", ["audiobook_min_bitrate_kbps", "audiobook_duration_tolerance"])
 def test_new_search_settings_are_validated(option):
-    from test_review_round3 import make_config
+    from test_download_cleanup_and_retries import make_config
     config = make_config(search={option: "-1"})
     with pytest.raises(ValueError, match=option):
         validate_config(config)

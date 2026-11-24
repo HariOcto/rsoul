@@ -231,7 +231,7 @@ def audiobook_item(local):
 
 
 def test_rejected_import_retains_evidence_without_blaming_the_peer(tmp_path):
-    from test_v11_imports import setup
+    from test_import_transaction import setup
     ctx, item, server, penalties = setup(tmp_path)
     server.result, server.action = "unsuccessful", "none"
     result = postprocess.process_imports(ctx, [item])[item["bookId"]]
@@ -242,7 +242,7 @@ def test_rejected_import_retains_evidence_without_blaming_the_peer(tmp_path):
 
 
 def test_success_report_without_output_evidence_keeps_staged_files(tmp_path):
-    from test_v11_imports import setup
+    from test_import_transaction import setup
     ctx, item, server, penalties = setup(tmp_path)
     server.result, server.action = "successful", "none"
     result = postprocess.process_imports(ctx, [item])[item["bookId"]]

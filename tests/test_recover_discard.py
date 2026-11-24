@@ -15,8 +15,8 @@ import pytest
 from rsoul import import_transaction, postprocess, recover
 from rsoul.persistence import StatePersistenceError
 from rsoul.state import StateManager
-from test_v11_imports import setup
-from test_v11_recover import CommandServer, STAGE, legacy, pending, run
+from test_import_transaction import setup
+from test_recover_apply import CommandServer, STAGE, legacy, pending, run
 
 
 def discard(ctx, server, tmp_path):

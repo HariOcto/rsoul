@@ -20,7 +20,7 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round3 import make_config
+from test_download_cleanup_and_retries import make_config
 
 from rsoul import postprocess
 from rsoul.config import Context, validate_config

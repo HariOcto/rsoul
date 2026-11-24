@@ -1,4 +1,4 @@
-"""v11 selection and recording safeguards using real audio fixtures.
+"""Selection and recording safeguards using real audio fixtures.
 
 The slskd integration cases use the existing test client's directory and search
 responses. Audio inspection and tag parsing use the installed Mutagen library
@@ -287,7 +287,7 @@ def test_recording_policy_does_not_allow_invalid_audio_by_default(tmp_path):
 # The original externally reported selection regressions also run through the
 # backend so that format partitioning and complete-directory selection are tested.
 def test_backend_selection_regressions(monkeypatch):
-    from test_review_round3 import Client, make_config
+    from test_download_cleanup_and_retries import Client, make_config
     from rsoul.backends import slskd_backend
     from rsoul.backends.base import DownloadTarget
     from rsoul.backends.slskd_backend import SlskdBackend
@@ -326,7 +326,7 @@ def test_backend_selection_regressions(monkeypatch):
     ("Prologue", ["Prologue.mp3"], True),
 ])
 def test_a_title_folder_cannot_hide_fragment_only_files(monkeypatch, title, names, accepted):
-    from test_review_round3 import Client, make_config
+    from test_download_cleanup_and_retries import Client, make_config
     from rsoul.backends import slskd_backend
     from rsoul.backends.base import DownloadTarget
     from rsoul.backends.slskd_backend import SlskdBackend
@@ -346,7 +346,7 @@ def test_a_title_folder_cannot_hide_fragment_only_files(monkeypatch, title, name
 
 def _searched_releases(monkeypatch, title, author, listings, search_files=None):
     """Run a real backend search against isolated fake server responses."""
-    from test_review_round3 import Client, make_config
+    from test_download_cleanup_and_retries import Client, make_config
     from rsoul.backends import slskd_backend
     from rsoul.backends.base import DownloadTarget
     from rsoul.backends.slskd_backend import SlskdBackend

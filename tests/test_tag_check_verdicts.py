@@ -16,12 +16,12 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from test_review_round8 import BROWN, HERBERT, Chaptarr, audio_file, run_import
+from test_tags_siblings_and_narrators import BROWN, HERBERT, Chaptarr, audio_file, run_import
 
 from rsoul.audiotags import AGREE, MISMATCH, UNCLEAR, UNTAGGED, check_audiobook_tags, judge_text, named_books
 from rsoul.config import Context
 from rsoul.library import author_series, sibling_titles
-from test_review_round3 import make_config
+from test_download_cleanup_and_retries import make_config
 
 DUNE_BOOKS = ["Dune Messiah", "Children of Dune"]
 RED_RISING_BOOKS = ["Red Rising", "Morning Star"]

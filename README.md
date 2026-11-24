@@ -1,30 +1,33 @@
-# R:soul v11
+<p align="center">
+<img src="rsoul.png" align="center" width="296" height="345" alt="R:soul logo">
+</p>
+<h1 align="center">R:soul — audiobook fork</h1>
 
 R:soul connects Readarr or Chaptarr to slskd, with an optional Stacks backend for ebooks. It searches wanted books, tracks downloads across restarts, checks their contents, and submits imports for the intended book.
 
-This completed v11 includes complete import verification, durable operation journals, restart integrity, audiobook matching, service backoff, wanted scheduling, safe operator recovery/discard, and the corrections from the uploaded v11 review. See [V11_CHANGES_AND_UPGRADE.txt](V11_CHANGES_AND_UPGRADE.txt) for every change and its reason, and [V11_VALIDATION.txt](V11_VALIDATION.txt) for executed checks. The build identifies itself as `11 (v11)`.
+This repository is a fork of **R:soul**, the ebook downloader that bridges Readarr with Soulseek and Stacks (GitHub shows the original repository as "forked from" at the top of this page). R:soul is itself a fork of [Soularr](https://github.com/mrusse/soularr) by mrusse, originally written for Lidarr. All credit for the original design and code goes to those projects; see [Credits and license](#credits-and-license).
+
+> **0.1.0-beta.1 is a pre-release** of this fork, which adds audiobook support for Chaptarr to the ebook-only R:soul: folder and file matching for audiobooks, verified imports that survive restarts and lost API responses, and operator tools for imports that need review. It has been run against a real Chaptarr/slskd setup, but not across many configurations. Back up your `/data` directory before upgrading. See [CHANGELOG.md](CHANGELOG.md) for what is new.
 
 ## Installation and upgrade
 
-Use Python 3.11 or 3.12, or build the supplied Dockerfile. This is a source release; an existing public `latest` image does not automatically contain it.
-
-For a direct upgrade from the pinned `HariOcto/rsoul` `audiobook-support` revision at commit `612a90e5e32f6250c9c7b77d8a6a84278e815e5b` (v10.3), use `rsoul-github-to-v11.patch` and the included [APPLY_V11_FROM_GITHUB.txt](APPLY_V11_FROM_GITHUB.txt). No v10.4 or earlier v11 patch is needed first. Apply this cumulative patch to that exact base; do not layer it over an older v11 draft. The remote branch may have moved.
+Use Python 3.11 or 3.12, or build the supplied Dockerfile.
 
 ```bash
 python -m pip install -r requirements.txt
-python rsoul.py --version
+python rsoul.py --version          # R:soul 0.1.0-beta.1 (pre-release)
 python rsoul.py --config-dir /path/to/config
 ```
 
 For a local container image, run from this source directory:
 
 ```bash
-docker build -t rsoul:v11 .
+docker build -t rsoul:0.1.0-beta.1 .
 ```
 
 Stop the old rsoul container before replacing it. Back up its persistent `/data` directory and preserve the same download mount. Keep API keys and existing path mappings. Start one instance with the new image. Do not run old and new versions concurrently against the same data volume. An OS lock is required; inability to acquire or support it stops mutations.
 
-Existing download and import state is retained and migrated conservatively. A v10.4 task with insufficient evidence of completeness may need manual review. Old source-ban entries remain on disk but cannot silently ban a different author, medium, or backend under v11's scoped queries.
+Existing download and import state is retained and migrated conservatively. A task from an earlier draft with insufficient evidence of completeness may need manual review. Old source-ban entries remain on disk but cannot silently ban a different author, medium, or backend under the new scoped queries.
 
 Legacy pending imports are never automatically submitted again, even when an old record has no command ID and says zero submissions: that does not prove the server never accepted a request. They can still reconcile to success when their saved evidence accounts for the complete import. Otherwise they remain protected for review.
 
@@ -86,7 +89,7 @@ A successful command response is insufficient. Verification requires all manifes
 
 MP3-to-M4B conversion is accepted only when server history links **every input** to the committed output and the output record/path/size agree. If a server cannot provide that evidence and the output cannot otherwise be proven, the import remains pending or needs review. It is not marked successful by file count alone.
 
-A lost POST response has an unknown outcome. v11 checks existing evidence and does not blindly submit another command. Interrupted staging replays its saved manifest without overwriting collisions. Active commands do not expire into destructive cleanup. Partial imports, changed identities and uncertain outcomes retain their files and journals.
+A lost POST response has an unknown outcome. R:soul checks existing evidence and does not blindly submit another command. Interrupted staging replays its saved manifest without overwriting collisions. Active commands do not expire into destructive cleanup. Partial imports, changed identities and uncertain outcomes retain their files and journals.
 
 These checks are evidence checks, not a guarantee about the literary completeness of an arbitrary recording. Audio container validation checks every selected file's stream information and metadata; it does not decode every audio sample or compare spoken content with the printed book.
 
@@ -183,7 +186,7 @@ Useful persistent files:
 
 Standalone import callers can create sidecar journals under the download mount's `.rsoul-import-journal` directory; normal workflow uses the central task state. Recoverable sidecars are adopted on startup. Never delete a journal to force a retry while its remote operation may still be running.
 
-For a `needs_review` task, inspect its reason, the actual Chaptarr record/history, command status and retained file paths. Correct a known record/path/permission issue before proceeding. If a command receipt was lost, verify what happened server-side before arranging another import. v11 deliberately does not erase or automatically requeue ambiguous work. Resolved imports with sufficient evidence are recognized on a subsequent run.
+For a `needs_review` task, inspect its reason, the actual Chaptarr record/history, command status and retained file paths. Correct a known record/path/permission issue before proceeding. If a command receipt was lost, verify what happened server-side before arranging another import. R:soul deliberately does not erase or automatically requeue ambiguous work. Resolved imports with sufficient evidence are recognized on a subsequent run.
 
 Correcting a problem on a `needs_review` transaction does not automatically restart staging or submit a new import. Transient pre-submission states such as `validating`, `staging`, and `staged` can retry their recorded step; an uncertain or review-required operation needs reconciliation first. The diagnostic command summarizes central saved state; it does not query live services or scan standalone sidecar journals.
 
@@ -193,7 +196,17 @@ Per-book transfer logs report queued/downloading state, completed versus expecte
 
 Recovery inspection uses `python -m rsoul.recover --config-dir /data` or `--book YOUR_BOOK_ID` and reads live service evidence. With the normal instance stopped, `--apply` can create a fresh validating transaction for an eligible legacy import, and `--discard` can quarantine its proven owned files. They require a specific book and cannot be combined. Malformed targets, unknown outcomes, active overlapping scans/imports, or unclear ownership block the decision. Windows drive/UNC and POSIX ancestry are checked using path components.
 
-A discard saves exact destinations before moves. An interrupted discard remains protected from automatic imports/cleanup and must be inspected and retried explicitly; its journal must not be erased to force progress. See [V11_CHANGES_AND_UPGRADE.txt](V11_CHANGES_AND_UPGRADE.txt) for the complete stopped-instance procedure and mapping requirements. Neither recovery action deletes a Chaptarr library record.
+`--confirm` closes an import that was set aside for review (`needs_review` or `submission_unknown`) when Chaptarr did in fact complete it: R:soul could not prove the outcome itself, but Chaptarr's history names every staged file as imported since staging and the book has files. Run `--book YOUR_BOOK_ID` first to see the evidence; `--confirm` (instance stopped) then archives the record to `recover_archive.jsonl`, notes the import in the book ledger and removes the task. It moves and deletes nothing; leftover staged files are listed for you to delete. Partial imports are never confirmed. The `Needs review` log line names the book ID to use.
+
+A discard saves exact destinations before moves. An interrupted discard remains protected from automatic imports/cleanup and must be inspected and retried explicitly; its journal must not be erased to force progress. Neither recovery action deletes a Chaptarr library record.
+
+`--apply`, `--discard` and `--confirm` change saved state, so the normal instance must be stopped; they take the application lock and refuse otherwise. Back up `/data` first and run them with the same image, environment, user and mounts as the normal service. A stopped container cannot be entered with `docker exec`; for a Compose service named `rsoul`:
+
+```bash
+docker compose run --rm --no-deps --entrypoint python rsoul -m rsoul.recover --config-dir /data --book YOUR_BOOK_ID --confirm
+```
+
+On TrueNAS, use the app's equivalent one-off or maintenance runtime. Listing and `--book` inspection only read, and can run while R:soul is running.
 
 ### Dry run
 
@@ -211,8 +224,16 @@ python -m pytest -q tests
 bash -n run.sh
 ```
 
-The suite includes valid audio fixtures, corruption/wrong-record cases, restart and failed-write recovery, lost API responses, partial imports, conversion evidence, rate limits and local fake HTTP services using the real clients. CI runs Python 3.11 and 3.12 before image publication. See the release notes for the exact checks run on this source bundle and remaining deployment limitations.
+The suite includes valid audio fixtures, corruption/wrong-record cases, restart and failed-write recovery, lost API responses, partial imports, conversion evidence, rate limits and local fake HTTP services using the real clients. CI runs Python 3.11 and 3.12 before image publication. The tests use controlled local services; they do not prove every deployed Chaptarr/Readarr/slskd combination, and audio checks are structural, not spoken-content verification.
 
-## Attribution
+## Credits and license
 
-R:soul is derived from the Readarr Soul/Soularr project and retains its bundled license. It is not affiliated with Readarr, Chaptarr, Soularr or Stacks. Use the source license and upstream attribution files included with this release.
+- **R:soul** — the original Readarr ↔ Soulseek/Stacks downloader this fork is based on, including its pluggable backends, matching and import workflow for ebooks. The logo is R:soul's.
+- **[Soularr](https://github.com/mrusse/soularr)** by mrusse — the Lidarr ↔ Soulseek script R:soul was forked from.
+- **[slskd](https://github.com/slskd/slskd)** and its Python client [slskd-api](https://pypi.org/project/slskd-api/), which R:soul uses to talk to Soulseek.
+
+**This fork** is maintained by [HariOcto](https://github.com/HariOcto) and adds audiobook support for Chaptarr. It has been modified from upstream R:soul since November 2026; [CHANGELOG.md](CHANGELOG.md) lists the changes. It is not an official R:soul release: please report problems with it in this repository, not upstream.
+
+R:soul, and this fork with it, is free software under the **GNU General Public License v3** (see [LICENSE](LICENSE)). You may redistribute and modify it under those terms; it comes with no warranty.
+
+> **Note**: This project is **not** affiliated with Readarr, Chaptarr, Soularr or Stacks. Please do not contact those teams for support regarding this script.

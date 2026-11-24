@@ -29,6 +29,8 @@ while true; do
     wait "$child"
     status=$?
     child=""
+    # Later runs skip the banner and log the unchanged startup report at debug level only
+    export RSOUL_REPEAT_RUN=1
     case "$status" in
         0) ;;
         2) echo "R:soul finished, but searching for new books failed (exit status 2); see the log above." >&2 ;;

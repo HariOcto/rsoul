@@ -1,4 +1,4 @@
-"""v11 transfer/search contracts: real state/history IO, fake external services.
+"""Transfer/search contracts: real state/history IO, fake external services.
 
 These tests never contact slskd or Readarr. Filesystem sizes, persisted restart data,
 HTTP exceptions and the actual backend/orchestrator are exercised directly.

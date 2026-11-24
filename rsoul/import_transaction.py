@@ -355,7 +355,7 @@ def recover_staging(pending, persist=None):
         except OSError as exc:
             if getattr(exc, "errno", None) == errno.EXDEV:
                 # Retrying can't help: the download and staging folders are on different
-                # filesystems, and v11 never copies and deletes in place of an atomic move.
+                # filesystems, and R:soul never copies and deletes in place of an atomic move.
                 return _retain(pending, "needs_review", "Staging needs a move across filesystems (EXDEV): keep the download folder and "
                                "its staging folder on the same mount; files and manifest are retained for operator recovery. "
                                "Correct the mounts, then inspect with python -m rsoul.recover before --apply; review does not resume automatically", persist)

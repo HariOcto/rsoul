@@ -239,6 +239,47 @@ def history_rows(client: Any, book_id: Any, since: float) -> tuple:
         return collected, f"import history unavailable: {exc}"
 
 
+def readable_exclusions(data: dict) -> Optional[list]:
+    """ExcludedSourcePaths of a history receipt: [] when absent, the list of paths when readable,
+    None when present in any other form.
+
+    Chaptarr writes the field only when something was excluded, always as a JSON list of path
+    strings (HistoryService.cs, BookFileImported). An empty string, "null", an object, or a list
+    with anything but non-empty strings is not something it writes, so it is not read as
+    "nothing excluded"."""
+    if "excludedsourcepaths" not in data:
+        return []
+    value = data["excludedsourcepaths"]
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, list) or not all(isinstance(p, str) and p.strip() for p in value):
+        return None
+    return value
+
+
+def input_size_agrees(data: dict, entry: dict) -> bool:
+    """A plain import receipt's Size against the file R:soul staged.
+
+    On BookFileImported Chaptarr records the size of the file it picked up (BookInfo.Size,
+    falling back to the imported file, then 0), so it is compared with the staged input, not
+    the library file, which tagging may change. A Size of 0 or none is no evidence either way;
+    an unreadable one, or one that differs from the staged file's, means another file."""
+    raw = data.get("size")
+    if raw in (None, ""):
+        return True
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return False
+    if size == 0:
+        return True
+    staged = entry.get("size")
+    return not (isinstance(staged, int) and not isinstance(staged, bool) and staged > 0) or size == staged
+
+
 def verify_import_evidence(client: Any, pending: dict) -> dict:
     """Correlate every immutable input with fresh files on the wanted record.
 
@@ -321,13 +362,10 @@ def verify_import_evidence(client: Any, pending: dict) -> dict:
         if not isinstance(row.get("size"), (int, float)) or isinstance(row["size"], bool) or row["size"] <= 0:
             continue
         output_id = str(row["id"])
-        excluded = data.get("excludedsourcepaths")
-        if isinstance(excluded, str):
-            try:
-                excluded = json.loads(excluded)
-            except ValueError:
-                continue
-        if excluded and (not isinstance(excluded, list) or any(path_key(s) in inputs for s in excluded)):
+        excluded = readable_exclusions(data)
+        if excluded is None:
+            continue  # present but not a list of paths: what was left out is unknown
+        if any(path_key(s) in inputs for s in excluded):
             continue
         source_paths = data.get("sourcepaths")
         if isinstance(source_paths, str):
@@ -375,6 +413,8 @@ def verify_import_evidence(client: Any, pending: dict) -> dict:
             sources = [path_key(data.get("droppedpath"))]
             if sources[0] not in inputs:
                 continue
+            if not input_size_agrees(data, inputs[sources[0]]):
+                continue  # the receipt is for a file of another size than the one staged
         for source in sources:
             matches[source] = output_id
             output_sources.setdefault(output_id, set()).add(source)

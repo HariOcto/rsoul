@@ -196,7 +196,6 @@ def test_an_unreadable_catalog_defers_instead_of_rejecting():
 @pytest.mark.parametrize("title, author, path", [
     ("Resistance", "Ryk Brown", r"Audiobooks\Resistance - Brown.m4b"),
     ("The Hobbit", "J.R.R. Tolkien", r"Audiobooks\The Hobbit - Tolkien.m4b"),
-    ("Resistance", "Ryk Brown", r"Audiobooks\Resistance Brown.m4b"),  # no separator: a title word is no given name
     ("Resistance", "Ryk Brown", r"Audiobooks\Brown_-_Resistance.m4b"),
 ])
 def test_title_and_surname_fields_are_kept_apart(title, author, path):

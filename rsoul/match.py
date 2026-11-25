@@ -775,9 +775,21 @@ _NAME_CONNECTORS = {
 # Particles that belong to a surname ("Le Guin", "van Vogt", "de Camp")
 _SURNAME_PARTICLES = {"le", "la", "de", "du", "des", "van", "von", "der", "den", "del", "della", "di", "da", "ter", "ten", "st"}
 # Field separators inside one folder or file name: "Title - Author", "Author_-_Title", "A; B", "A & B"
-_FIELD_SPLIT = re.compile(r"\s+[-\u2013\u2014]+\s+|_+-+_+|\s+[-\u2013\u2014]+(?=[^\W\d_])|(?<=[^\W_])[-\u2013\u2014]+\s+|[;|&+]|\(|\)|\[|\]")
+_DASH_SPLIT = re.compile(r"\s+[-\u2013\u2014]+\s+|_+-+_+|\s+[-\u2013\u2014]+(?=[^\W\d_])|(?<=[^\W_])[-\u2013\u2014]+\s+")
+_NAME_SPLIT = re.compile(r"[;|&+]|\(|\)|\[|\]")
+# A list of people credited together: "Ryk Brown & Scott Brown", "Brown, Ryk and Scott Brown"
+_CO_CREDIT_JOIN = re.compile(r"\s*(?:[&+;,]|\b(?:and|und|et|y|with|mit)\b)\s*", re.IGNORECASE)
+
+
+def _credit_list(part: str) -> bool:
+    """True if a name field is nothing but people joined as co-credits (no brackets, no title)."""
+    if re.search(r"[()\[\]{}:|]", part) or re.search(r"\d", part):
+        return False
+    pieces = [p for p in _CO_CREDIT_JOIN.split(part) if p and p.strip()]
+    return len(pieces) >= 2 and all(1 <= len(re.findall(r"[^\W\d_]+", p)) <= 5 for p in pieces)
 
 FULL, BARE, CONFLICT, NONE = "full", "bare", "conflict", "none"
+AMBIGUOUS = "ambiguous"  # a mention that may be the author or another person; counts for neither
 
 
 def _plain(text: str) -> str:
@@ -802,19 +814,30 @@ def _split_author(author_name: str) -> Tuple[List[str], List[str]]:
     return words[:start], words[start:]
 
 
-def _fields(candidate: str) -> List[List[str]]:
+# An audio extension at the end of a name, or between names joined with spaces ("01.mp3 02.mp3")
+_AUDIO_SUFFIX = re.compile(r"\.(m4b|m4a|mp3|aac|flac|ogg|opus|wma|wav|aax|aa)(?=\s|$)", re.IGNORECASE)
+
+
+def _fields(candidate: str) -> List[Tuple[List[str], bool, int, int, bool]]:
     """The words of every name field: path segments, then "Title - Author" parts, "&" lists ...
-    A comma stays as its own token so "Brown, Ryk" can be read surname-first."""
+    A comma stays as its own token so "Brown, Ryk" can be read surname-first. Each field comes
+    with whether it is part of a file name (a segment ending in an audio extension), the index of
+    its path segment (0 = outermost folder), the index of its dash-separated part within the
+    segment, and whether that part is a list of co-credited people ("Ryk Brown & Scott Brown")."""
     fields = []
-    for segment in re.split(r"[\\/]", candidate or ""):
-        segment = re.sub(r"\.(m4b|m4a|mp3|aac|flac|ogg|opus|wma|wav|aax|aa)$", "", segment.strip(), flags=re.IGNORECASE)
-        for part in _FIELD_SPLIT.split(segment):
-            tokens = []
-            for raw in re.findall(r"[^\W_]+|,", part):
-                tokens.append(raw if raw == "," else _plain(raw))
-            tokens = [t for t in tokens if t]
-            if tokens:
-                fields.append(tokens)
+    for index, segment in enumerate(re.split(r"[\\/]", candidate or "")):
+        segment = segment.strip()
+        is_file = bool(_AUDIO_SUFFIX.search(segment))
+        segment = _AUDIO_SUFFIX.sub("", segment)
+        for part_index, dash_part in enumerate(_DASH_SPLIT.split(segment)):
+            credits = _credit_list(dash_part)
+            for part in _NAME_SPLIT.split(dash_part):
+                tokens = []
+                for raw in re.findall(r"[^\W_]+|,", part):
+                    tokens.append(raw if raw == "," else _plain(raw))
+                tokens = [t for t in tokens if t]
+                if tokens:
+                    fields.append((tokens, is_file, index, part_index, credits))
     return fields
 
 
@@ -844,6 +867,14 @@ def _classify(person: List[str], given: List[str], narrators: List[List[str]], s
 
 
 def author_mentions_detail(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> Dict[str, int]:
+    """Count the author's surname mentions by kind (see _mentions)."""
+    counts = {FULL: 0, BARE: 0, CONFLICT: 0, "narrator": 0, AMBIGUOUS: 0}
+    for _, kind in _mentions(author_name, candidate, title, narrators):
+        counts[kind] += 1
+    return counts
+
+
+def _mentions(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> List[Tuple[tuple, str]]:
     """Count the author's surname mentions in a name or path by what they show.
 
     full      the author's first name (or its initial) with the surname: "Ryk Brown", "Brown, Ryk", "C. Nuttall"
@@ -852,22 +883,27 @@ def author_mentions_detail(author_name: str, candidate: str, title: str = "", na
               "Brown, Scott", "Michael F. Hamilton", "Anne Le Guin"
     narrator  a narrator Chaptarr lists for the book, who happens to share the surname
 
-    Name words are read within one field only (a path segment, or one side of " - "), and the
-    book's own title words never count as a given name ("Resistance Brown" is title + author).
+    ambiguous a file name with a title word where a given name would stand ("Carrie King.m4b" for
+              Stephen King's Carrie): title + surname, or a person called Carrie King
+    Name words are read within one field only (a path segment, or one side of " - "). A directory
+    is read as written: "Audiobooks\\Carrie King\\Carrie" names Carrie King, not Stephen King,
+    even though the book is called Carrie. Separated file names stay clear ("Carrie - King.m4b").
     """
     given, surname = _split_author(author_name)
-    counts = {FULL: 0, BARE: 0, CONFLICT: 0, "narrator": 0}
+    found: List[Tuple[tuple, str]] = []  # ((segment, dash part, co-credit list?), kind)
     if not surname:
-        return counts
+        return found
     narrator_words = [w for w in (_person_words(n) for n in narrators) if w]
-    stop = set(_plain(title).split()) - set(given) - set(surname)
+    title_stop = set(_plain(title).split()) - set(given) - set(surname)
     last, particles = surname[-1], set(surname[:-1])
-    for tokens in _fields(candidate):
+    for tokens, is_file, seg, part, credits in _fields(candidate):
+        segment = (seg, part, credits)
+        stop = title_stop if is_file else set()
         for j, token in enumerate(tokens):
             if token != last:
                 continue
             if not given:
-                counts[FULL] += 1  # one-name authors: nothing to compare
+                found.append((segment, FULL))  # one-name authors: nothing to compare
                 continue
             # The surname's own particles ("Le" Guin) belong to it, written before or, in the
             # "Guin, Ursula K. Le" form, after the given names
@@ -887,21 +923,51 @@ def author_mentions_detail(author_name: str, candidate: str, title: str = "", na
                     k += 1
                 while after and after[-1] in particles:
                     after.pop()
-            counts[_classify(before or after, given, narrator_words, surname)] += 1
-    return counts
+            if not before and not after and stop:
+                # A title word where a given name would stand ("Carrie King.m4b", "King, Carrie.m4b"
+                # for Stephen King's Carrie): title + surname, or a person called Carrie King.
+                # Neither reading is evidence for the author.
+                beside = [tokens[start - 1]] if start > 0 else []
+                if j + 2 < len(tokens) and tokens[j + 1] == ",":
+                    beside.append(tokens[j + 2])
+                if any(w in stop and _is_name_word(w, set()) for w in beside):
+                    found.append((segment, AMBIGUOUS))
+                    continue
+            found.append((segment, _classify(before or after, given, narrator_words, surname)))
+    return found
 
 
 def author_verdict(author_name: str, candidate: str, title: str = "", narrators: Sequence[str] = ()) -> str:
     """FULL, BARE, CONFLICT or NONE for a whole name or path.
 
-    A conflicting person is decisive unless the same path also names the author in full
-    (a co-credit); a bare surname never outweighs it ("Audiobooks\\Brown\\Scott Brown").
+    A conflicting person is decisive unless the author is named in full in a more specific path
+    segment below it (the file itself says whose it is), or right beside it in a list of people
+    credited together ("Ryk Brown & Scott Brown", "Ryk Brown and Scott Brown"). Other neighbours
+    in the same segment are no co-credit: "Correct Author - Wrong Author" and "Correct Author
+    (Wrong Author Remix)" name another person. The author named in a parent folder does not
+    clear another person below it: "Audiobooks\\Ryk Brown\\Scott Brown\\Resistance" is Scott Brown's.
+    A bare surname never outweighs a conflict ("Audiobooks\\Brown\\Scott Brown"), nor does an
+    ambiguous file name ("Audiobooks\\King\\Carrie King.m4b") count as the author.
     """
-    counts = author_mentions_detail(author_name, candidate, title, narrators)
-    if counts[CONFLICT] and not counts[FULL]:
-        return CONFLICT
+    found = _mentions(author_name, candidate, title, narrators)
+    counts = {FULL: 0, BARE: 0, CONFLICT: 0, "narrator": 0, AMBIGUOUS: 0}
+    for _, kind in found:
+        counts[kind] += 1
+    if counts[CONFLICT]:
+        conflicts = [where for where, kind in found if kind == CONFLICT]
+        fulls = [where for where, kind in found if kind == FULL]
+        deepest = max(c[0] for c in conflicts)
+
+        def cleared(conflict):
+            seg, part, credits = conflict
+            return any(f[0] > deepest for f in fulls) or (
+                credits and any(f[0] == seg and f[1] == part for f in fulls))
+        if not all(cleared(c) for c in conflicts):
+            return CONFLICT
     if counts[FULL]:
         return FULL
+    if counts[AMBIGUOUS]:
+        return NONE  # "Carrie King.m4b" may be another person: only the author in full settles it
     if counts[BARE]:
         return BARE
     return NONE
@@ -1121,9 +1187,12 @@ def audiobook_folder_match(
             offered[identity] = candidate
 
     for (directory, ext), files in groups.items():
-        if music_library(directory) and author_verdict(author_name, directory, book_title, narrators) != FULL:
+        if music_library(directory) and author_verdict(author_name, directory, book_title, narrators) != FULL and not any(
+                author_verdict(author_name, directory + "\\" + split_slskd_path(f["filename"])[1], book_title, narrators) == FULL for f in files):
             # "Music\\Japanese\\tacica\\2022 - singularity" for Ryk Brown's Singularity: an album
-            # with the book's title, found because one song's name contains the surname
+            # with the book's title, found because one song's name contains the surname. The
+            # author named in full in a file name ("Music\\Ryk Brown - Resistance.m4b") keeps the
+            # folder in play; audiobook_evidence() then applies the music-library rule to it.
             note("music library folders", directory)
             continue
         if is_disc_folder(directory):

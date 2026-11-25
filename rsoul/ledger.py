@@ -82,14 +82,19 @@ class BookLedger:
         entry.update({"author": author, "title": title, "media_type": media_type})
         return entry
 
-    def note_imported(self, book_id: Any, author: str, title: str, media_type: str = "") -> None:
-        """R:soul downloaded this book and Readarr/Chaptarr imported it."""
+    def note_imported(self, book_id: Any, author: str, title: str, media_type: str = "", basis: Optional[str] = None) -> None:
+        """R:soul downloaded this book and Readarr/Chaptarr imported it. basis records how an
+        operator-confirmed import was established ("verified" or "operator: history only")."""
         if book_id is None:
             return
         with self._lock:
             entry = self._entry(book_id, author, title, media_type)
             entry["imported_at"] = datetime.now().isoformat(timespec="seconds")
             entry.pop("not_found_at", None)
+            if basis:
+                entry["import_basis"] = basis
+            else:
+                entry.pop("import_basis", None)
             self._save()
 
     def note_not_found(self, book_id: Any, author: str, title: str, media_type: str = "") -> None:

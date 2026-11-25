@@ -853,9 +853,13 @@ def audiobook_tags_contradict(ctx: Any, book_download: dict, local_download_dir:
     try:
         title = book_download.get("title", "")
         author_name = book_download.get("author_name", "")
-        folder = os.path.join(local_download_dir, book_download.get("dir", ""))
-        names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
-        paths = [os.path.join(folder, name) for name in names if os.path.isfile(os.path.join(folder, name))]
+        if book_download.get("local_paths"):
+            # The exact files about to be imported (they may sit in two folders mid-staging)
+            paths = [p for p in book_download["local_paths"] if os.path.isfile(p)]
+        else:
+            folder = os.path.join(local_download_dir, book_download.get("dir", ""))
+            names = book_download.get("expected_files") or [f["filename"].split("\\")[-1] for f in book_download.get("files", [])]
+            paths = [os.path.join(folder, name) for name in names if os.path.isfile(os.path.join(folder, name))]
         if not paths:
             return ""
 

@@ -500,21 +500,28 @@ def _source_item(value):
 
 
 def _revalidate_owned(client, value, config):
-    """Run validate_inputs on the files a transaction owns, at their current place."""
+    """Run validate_inputs on the files a transaction owns, at their current place.
+
+    Each file is either at its source or already staged; an interrupted staging run leaves some
+    in each, and that is a normal state the staging step finishes later. All files are checked
+    together, at their own paths, as one complete set."""
     root = value.get("download_root", "")
     shadow = copy.deepcopy(value)
-    folders = set()
-    for entry in shadow.get("manifest") or []:
+    manifest = shadow.get("manifest") or []
+    if not manifest or not root:
+        return "The transaction lists no files inside the download mount"
+    for entry in manifest:
         here = next((p for p in (entry.get("stage_path"), entry.get("source_path")) if p and os.path.isfile(p) and not os.path.islink(p)), None)
         if not here:
             return f"{entry.get('name')} is neither staged nor at its source"
+        if not _inside(root, here):
+            return f"{entry.get('name')} is outside the download mount"
         entry["source_path"] = here
-        folders.add(os.path.dirname(here))
-    if len(folders) != 1 or not root or not _inside(root, next(iter(folders))):
-        return "The owned files are not in one folder inside the download mount"
     item = _source_item(value)
-    item["dir"] = os.path.relpath(next(iter(folders)), root)
-    item["expected_files"] = [e["name"] for e in shadow["manifest"]]
+    source_dir = value.get("source_dir") or os.path.dirname(manifest[0]["source_path"])
+    item["dir"] = os.path.relpath(source_dir, root) if _inside(root, source_dir) else ""
+    item["expected_files"] = [e["name"] for e in manifest]
+    item["local_paths"] = [e["source_path"] for e in manifest]
     item["filename"] = item["expected_files"][0] if item["expected_files"] else ""
     error = validate_inputs(SimpleNamespace(config=config, readarr=client), item, shadow)
     for key in ("audio_validation", "recording_policy"):
@@ -699,10 +706,13 @@ def _catalog_narrators(ctx, item):
 def _evidence_problem(ctx, item, source, names, title):
     """The search-time evidence decision again, on the peer's folder, with the same inputs
     (the book's title and its narrators from the catalog). "" when the files may be imported."""
-    from .match import CONFLICT, audiobook_evidence, author_verdict, music_library
+    from .match import AMBIGUOUS, CONFLICT, FULL, audiobook_evidence, author_mentions_detail, author_verdict, music_library
     author = item.get("author_name", "")
     ext = os.path.splitext(names[0])[1].lstrip(".") if names else ""
     path = source + "\\" + " ".join(names[:3])
+    if author_mentions_detail(author, path, title)[AMBIGUOUS] and author_verdict(author, path, title) != FULL:
+        # Search rejects these; a download queued by an earlier build is held the same way
+        return f"The file names ({', '.join(names[:3])}) may name another person with the author's surname"
     if audiobook_evidence(author, path, ext, (), title, directory=source):
         return ""
     narrators = _catalog_narrators(ctx, item)  # only needed when nothing else shows it
@@ -753,7 +763,7 @@ def validate_inputs(ctx, item, pending):
         if not policy.allowed:
             return "Recording policy rejected these inputs: " + "; ".join(policy.reasons)
         from .postprocess import audiobook_tags_contradict
-        wrong_book = audiobook_tags_contradict(ctx, item, pending["download_root"])
+        wrong_book = audiobook_tags_contradict(ctx, dict(item, local_paths=paths), pending["download_root"])
         if wrong_book:
             return "Audio tags identify another work: " + wrong_book
     else:

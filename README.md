@@ -7,7 +7,7 @@ R:soul connects Readarr or Chaptarr to slskd, with an optional Stacks backend fo
 
 This repository is a fork of **R:soul**, the ebook downloader that bridges Readarr with Soulseek and Stacks (GitHub shows the original repository as "forked from" at the top of this page). R:soul is itself a fork of [Soularr](https://github.com/mrusse/soularr) by mrusse, originally written for Lidarr. All credit for the original design and code goes to those projects; see [Credits and license](#credits-and-license).
 
-> **0.1.0-beta.1 is a pre-release** of this fork, which adds audiobook support for Chaptarr to the ebook-only R:soul: folder and file matching for audiobooks, verified imports that survive restarts and lost API responses, and operator tools for imports that need review. It has been run against a real Chaptarr/slskd setup, but not across many configurations. Back up your `/data` directory before upgrading. See [CHANGELOG.md](CHANGELOG.md) for what is new.
+> **0.1.0-beta.5 is a pre-release** of this fork, which adds audiobook support for Chaptarr to the ebook-only R:soul: folder and file matching for audiobooks, verified imports that survive restarts and lost API responses, and operator tools for imports that need review. It has been run against a real Chaptarr/slskd setup, but not across many configurations. Back up your `/data` directory before upgrading. See [CHANGELOG.md](CHANGELOG.md) for what is new.
 
 ## Installation and upgrade
 
@@ -15,14 +15,14 @@ Use Python 3.11 or 3.12, or build the supplied Dockerfile.
 
 ```bash
 python -m pip install -r requirements.txt
-python rsoul.py --version          # R:soul 0.1.0-beta.1 (pre-release)
+python rsoul.py --version          # R:soul 0.1.0-beta.5 (pre-release)
 python rsoul.py --config-dir /path/to/config
 ```
 
 For a local container image, run from this source directory:
 
 ```bash
-docker build -t rsoul:0.1.0-beta.1 .
+docker build -t rsoul:0.1.0-beta.5 .
 ```
 
 Stop the old rsoul container before replacing it. Back up its persistent `/data` directory and preserve the same download mount. Keep API keys and existing path mappings. Start one instance with the new image. Do not run old and new versions concurrently against the same data volume. An OS lock is required; inability to acquire or support it stops mutations.
@@ -196,7 +196,7 @@ Per-book transfer logs report queued/downloading state, completed versus expecte
 
 Recovery inspection uses `python -m rsoul.recover --config-dir /data` or `--book YOUR_BOOK_ID` and reads live service evidence. With the normal instance stopped, `--apply` can create a fresh validating transaction for an eligible legacy import, and `--discard` can quarantine its proven owned files. They require a specific book and cannot be combined. Malformed targets, unknown outcomes, active overlapping scans/imports, or unclear ownership block the decision. Windows drive/UNC and POSIX ancestry are checked using path components.
 
-`--confirm` closes an import that was set aside for review (`needs_review` or `submission_unknown`) when Chaptarr did in fact complete it: R:soul could not prove the outcome itself, but Chaptarr's history names every staged file as imported since staging and the book has files. Run `--book YOUR_BOOK_ID` first to see the evidence; `--confirm` (instance stopped) then archives the record to `recover_archive.jsonl`, notes the import in the book ledger and removes the task. It moves and deletes nothing; leftover staged files are listed for you to delete. Partial imports are never confirmed. The `Needs review` log line names the book ID to use.
+`--confirm` closes an import that was set aside for review (`needs_review` or `submission_unknown`) when Chaptarr did in fact complete it. It first applies the checks of normal reconciliation: every expected file is accounted for, the book still belongs to the intended author, title and medium, and no import command for the files is queued or running, under the saved or the current path mapping. Then the import verifier must prove every file imported. Where it cannot (for example, no pre-import file baseline was recorded) but Chaptarr's history links every file to an output that is on the book now, `--confirm --accept-history` closes it as your decision. Because no baseline is needed, history-only receipts must be complete: each must record the output's path, matching a file on the book now, and a size (on a plain import, the size of the file Chaptarr picked up, which must be the staged file's; on a conversion, the output's); a recorded file ID must be that file; conversion counts must agree and exclusion lists must be readable; one output cannot stand for several independently imported files; and an output on another book, author, edition or medium blocks; the archive and the book ledger record it as history-only, not verified. Run `--book YOUR_BOOK_ID` first to see which applies. Confirming archives the record to `recover_archive.jsonl`, notes the import in the book ledger and removes the task; it moves and deletes nothing, and lists leftover files for you to delete. Partial imports, conversions that exclude a requested file, and changed author or work identities are never confirmed. The `Needs review` log line names the book ID to use.
 
 A discard saves exact destinations before moves. An interrupted discard remains protected from automatic imports/cleanup and must be inspected and retried explicitly; its journal must not be erased to force progress. Neither recovery action deletes a Chaptarr library record.
 
